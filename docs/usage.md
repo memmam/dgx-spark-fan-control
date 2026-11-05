@@ -23,9 +23,11 @@ sudo dgx-fan-control set-state 12
 dgx-fan-control status
 ```
 
-State 12 requests the maximum common floor. The two fans can reach approximately
-**9000 and 13500 RPM** respectively. They accelerate under firmware control;
-setting a state does not instantly change their measured speed.
+State 12 requests that profile's maximum common floor. On EC 3.5.8 the two fans
+can reach approximately **9000 and 13500 RPM** in the firmware's RPM-mode
+control encoding. They accelerate under firmware control; setting a state does
+not instantly change their measured speed. EC 3.13.7 is expected to reject the
+write. See [compatibility](../README.md#compatibility).
 
 ### 2. Let the machine cool, then run your workload
 
@@ -43,7 +45,7 @@ pre-cooling temperature or guaranteed performance improvement.
 Run your training, inference, rendering, or other job as your normal user.
 The manual floor remains active throughout, even if the command that set it
 has already exited. A moderate boost is also available, for example
-`sudo dgx-fan-control set-state 3` for a 4500 RPM common floor.
+`sudo dgx-fan-control set-state 3` (4500 RPM on EC 3.5.8).
 
 ### 3. Return to NVIDIA automatic control
 
@@ -126,16 +128,25 @@ sudo journalctl -u dgx-fan-control.service -n 30
 ```
 
 Use `sudo systemctl enable dgx-fan-control.service` if you also want this at
-boot. This is **our performance curve**, not NVIDIA's factory curve:
+boot. This is **our performance curve**, not NVIDIA's factory curve. While the
+daemon is running it never selects state 0. Below 50°C it holds state 1, the
+first additive floor, because a clamp of 0 has been observed to latch with the
+fans stopped. Stopping the service still restores state 0 (NVIDIA's curve).
+Temperatures are unchanged from the original curve. The state numbers are the
+same on every profile; the kernel maps them through the table below.
 
-| Filtered hottest temperature | Target state | Common floor (RPM) |
-| ---: | ---: | ---: |
-| Below 50°C | 0 | Automatic / unset |
-| 50°C | 3 | 4,500 |
-| 55°C | 5 | 6,300 |
-| 60°C | 8 | 9,000 |
-| 65°C | 10 | 11,250 |
-| 70°C or above | 12 | 13,500 |
+| Filtered hottest temperature | Target state | EC 3.5.8 floor | EC 3.13.7 reported floor |
+| ---: | ---: | ---: | ---: |
+| Below 50°C, daemon running | 1 | 2,700 | 1,256 |
+| 50°C | 3 | 4,500 | 1,818 |
+| 55°C | 5 | 6,300 | 2,381 |
+| 60°C | 8 | 9,000 | 3,225 |
+| 65°C | 10 | 11,250 | 3,787 |
+| 70°C or above | 12 | 13,500 | 4,350 |
+
+The 3.13.7 column is the reported capability span, not a measured tachometer
+table. Floor writes on that firmware are expected to be rejected. If they are,
+there is no cooling device and this curve does not run.
 
 It samples every two seconds, smooths temperature with an exponential filter
 (`alpha=0.35`), rises by at most two states per sample, and falls by at most
@@ -151,7 +162,17 @@ of restarting indefinitely. See [troubleshooting](troubleshooting.md).
 
 ## Choose a fan floor
 
-| State | Common floor (RPM) | State | Common floor (RPM) |
+State 0 is automatic on every profile. State 12 is that profile's reported
+maximum. Values in between stay inside the reported range and never use a
+non-unset floor below the greater reported minimum.
+
+### EC 3.5.8
+
+These are the observed RPM-mode clamp values. The EC converts each one to PWM
+against fan 0's 1260–9000 range and fan 1's 1890–13500 range. States 1–8 step
+by 900; states 9–12 step by 1125. This table is unchanged.
+
+| State | Common floor | State | Common floor |
 | ---: | ---: | ---: | ---: |
 | 0 | Automatic / unset | 7 | 8,100 |
 | 1 | 2,700 | 8 | 9,000 |
@@ -161,10 +182,36 @@ of restarting indefinitely. See [troubleshooting](troubleshooting.md).
 | 5 | 6,300 | 12 | 13,500 |
 | 6 | 7,200 | | |
 
+### EC 3.13.7 (unverified, and likely unused)
+
+Both fans report 975–4350. That span matches `975 + 33.75 × level` for an ACPI
+level of 0–100. It is not the 3.5.8 control encoding, so those 900-RPM steps
+are not scaled onto it. States 1–12 divide the reported span:
+
+`floor(state) = 975 + (4350 - 975) * state / 12`
+
+| State | Reported floor | State | Reported floor |
+| ---: | ---: | ---: | ---: |
+| 0 | Automatic / unset | 7 | 2,943 |
+| 1 | 1,256 | 8 | 3,225 |
+| 2 | 1,537 | 9 | 3,506 |
+| 3 | 1,818 | 10 | 3,787 |
+| 4 | 2,100 | 11 | 4,068 |
+| 5 | 2,381 | 12 | 4,350 |
+| 6 | 2,662 | | |
+
+Public EC image diffs say this write is rejected because the override enable
+bit can no longer be set. The driver then does not register a cooling device.
+Do not treat this column as a measured RPM result. It is also unknown whether
+a future firmware that accepted the write would interpret the numbers as tach
+RPM or as the older PWM control encoding. ACPI level 0 on the 975–4350 scale
+has stopped fans, and level 20 has stalled one of them, when used as a target
+rather than as a floor. This table's low states have not been tried.
+
 The same minimum is requested for both channels; each fan saturates at its
 own maximum. Firmware can keep a fan above your chosen floor. Setting a lower
 state does not force RPM below firmware demand. `set-state 0` and `automatic`
-both remove the added floor.
+both remove the added floor when the EC still accepts floor writes.
 
 ## Read the fan RPMs
 

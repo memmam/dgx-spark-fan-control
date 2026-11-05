@@ -17,8 +17,24 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "kernel/dgx_ec_fan_control.c").read_text()
 
 
+def brace_block(source, token):
+    start = source.index(token)
+    open_at = source.index("{", start)
+    depth = 0
+    for index in range(open_at, len(source)):
+        depth += (source[index] == "{") - (source[index] == "}")
+        if depth == 0:
+            end = index + 1
+            line_end = source.find("\n", end)
+            semicolon = source.find(";", end)
+            if semicolon != -1 and (line_end == -1 or semicolon < line_end):
+                end = semicolon + 1
+            return source[start:end]
+    raise AssertionError(f"unclosed block starting at {token!r}")
+
+
 def c_function(name):
-    start = re.search(rf"static (?:int|void) {name}\([^;{{]*\)\s*\{{", SOURCE).start()
+    start = re.search(rf"static (?:int|void|bool) {name}\([^;{{]*\)\s*\{{", SOURCE).start()
     end = SOURCE.index("{", start) + 1
     depth = 1
     while depth:
@@ -101,6 +117,7 @@ static void dgx_ec_recovery_peer_put(struct ffa_device *peer) {
 static int mailbox = 8, changing_status, status_reads, invalid_rtc, invalid_header;
 static int oem_zero, oem_fail_at, retry_stuck, wedge_operation, ignore_write, repeat_wedge;
 static int stale_reply, overwrite_reply, reply_error, sender_busy, complete_on_oem;
+static int unsupported_after_write;
 static int last_operation = 4;
 static u16 physical_floor, reply_floor;
 static int pending_polls, stuck, submit_count, get_count, write_count;
@@ -128,7 +145,7 @@ static int exchange(struct ffa_device *dev, struct ffa_send_direct_data2 *messag
   } else {
    assert(address == 0x06000800 && length == 5);
    raw[0] = invalid_header ? 0x15 : overwrite_reply && get_count ? 0x10 : 7;
-   raw[1] = last_operation; raw[2] = reply_error && get_count;
+   raw[1] = last_operation; raw[2] = get_count ? reply_error : 0;
    put_unaligned_le16(physical_floor, raw + 3);
   }
   return 0;
@@ -137,6 +154,7 @@ static int exchange(struct ffa_device *dev, struct ffa_send_direct_data2 *messag
  if (raw[0] == 2) {
   memset(raw, 0, sizeof(*message));
   if (poll_state_override >= 0) { raw[0] = poll_state_override; return 0; }
+  if (unsupported_after_write && write_count > 0) { raw[0] = 0xff; return 0; }
   if (stuck || pending_polls > 0) { if (pending_polls > 0) pending_polls--; raw[0] = 2; return 0; }
   if (last_operation == 7 || last_operation == 1)
    memset(raw + 1, last_operation == 7 ? 0xa5 : 0xc1, last_operation == 7 ? 64 : 10);
@@ -159,7 +177,8 @@ static int exchange(struct ffa_device *dev, struct ffa_send_direct_data2 *messag
   if (value == UINT16_MAX && reject_auto_count > 0) {
    reject_auto_count--; memset(raw, 0, sizeof(*message)); raw[0] = 0x0a; return 0;
   }
-  if (!ignore_write) physical_floor = foreign_after_write ? 7777 : value;
+  if (!ignore_write && !unsupported_after_write)
+   physical_floor = foreign_after_write ? 7777 : value;
   write_count++;
   if (value != UINT16_MAX && write_timeout_once) { write_timeout_once = 0; pending_polls = 100; }
   if (value == UINT16_MAX && auto_timeout_once) { auto_timeout_once = 0; pending_polls = 100; }
@@ -179,7 +198,9 @@ int main(int argc, char **argv) {
  struct ffa_ops ops = {.msg_ops = &msg};
  struct ffa_device ffa = {.ops = &ops};
  oem_peer.ops = &ops; oem_peer.oem = 1;
- struct dgx_ec_fan_control_data data = {.ffa_dev = &ffa, .current_state = 3};
+ struct dgx_ec_fan_control_data data = {
+  .ffa_dev = &ffa, .current_state = 3, .profile = &dgx_ec_profiles[0]};
+ u16 floor = 0;
  struct thermal_cooling_device cdev = {.devdata = &data};
  unsigned long state = 999;
  physical_floor = reply_floor = 4500;
@@ -241,9 +262,10 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[1], "recovery_invalid_rtc")) { invalid_rtc = 1; expected = -EAGAIN; }
   if (!strcmp(argv[1], "recovery_invalid_header")) { invalid_header = 1; expected = -EAGAIN; }
   if (!strcmp(argv[1], "recovery_zero_oem")) { oem_zero = 1; expected = -EAGAIN; }
-  if (!strcmp(argv[1], "recovery_stale_reply")) { stale_reply = 1; expected = -ESTALE; }
-  if (!strcmp(argv[1], "recovery_overwritten_reply")) { overwrite_reply = 1; expected = -ESTALE; }
-  if (!strcmp(argv[1], "recovery_response_error")) { reply_error = 1; expected = -ESTALE; }
+  if (!strcmp(argv[1], "recovery_stale_reply")) { stale_reply = 1; expected = -EAGAIN; }
+  if (!strcmp(argv[1], "recovery_overwritten_reply")) { overwrite_reply = 1; expected = -EAGAIN; }
+  if (!strcmp(argv[1], "recovery_response_error")) { reply_error = 1; expected = -EAGAIN; }
+  if (!strcmp(argv[1], "recovery_unsupported")) { reply_error = 0xff; expected = -EOPNOTSUPP; }
   if (!strcmp(argv[1], "recovery_sender_busy")) { sender_busy = 1; expected = -EBUSY; }
   if (!strcmp(argv[1], "recovery_retry_stuck")) { retry_stuck = 1; expected = -ETIMEDOUT; }
   if (!strcmp(argv[1], "recovery_foreign_floor")) { physical_floor = 7777; expected = -ESTALE; }
@@ -369,9 +391,45 @@ int main(int argc, char **argv) {
    poll_state_override = value;
    assert(dgx_ec_set_cur_state(&cdev, 5) == (value == 1 ? -EREMOTEIO : -EBADMSG));
   }
+  poll_state_override = 0xff;
+  assert(dgx_ec_set_cur_state(&cdev, 5) == -EOPNOTSUPP);
   poll_state_override = -1; transport_error_once = -EAGAIN;
   assert(dgx_ec_set_cur_state(&cdev, 5) == -EAGAIN);
   assert(submit_count == 0 && write_count == 0);
+ } else if (!strcmp(argv[1], "confirm_358_read_only")) {
+  assert(!strcmp(dgx_ec_profiles[0].name, "EC 3.5.8"));
+  assert(dgx_ec_confirm_floor_control(&data, &floor) == 0);
+  assert(floor == 4500 && write_count == 0);
+ } else if (!strcmp(argv[1], "confirm_3137_unsupported")) {
+  data.profile = &dgx_ec_profiles[1];
+  data.current_state = 0;
+  physical_floor = reply_floor = UINT16_MAX;
+  unsupported_after_write = 1;
+  assert(!strcmp(data.profile->name, "EC 3.13.7"));
+  assert(data.profile->telemetry_if_floor_unsupported);
+  assert(dgx_ec_confirm_floor_control(&data, &floor) == -EOPNOTSUPP);
+  assert(write_count == 1 && physical_floor == UINT16_MAX && floor == UINT16_MAX);
+  assert(dgx_ec_bind_telemetry_only(data.profile, -EOPNOTSUPP));
+  assert(dgx_ec_bind_telemetry_only(data.profile, -EREMOTEIO));
+  assert(dgx_ec_bind_telemetry_only(data.profile, -EIO));
+  assert(!dgx_ec_bind_telemetry_only(data.profile, -ETIMEDOUT));
+  assert(!dgx_ec_bind_telemetry_only(data.profile, -ESTALE));
+  assert(!dgx_ec_bind_telemetry_only(&dgx_ec_profiles[0], -EOPNOTSUPP));
+ } else if (!strcmp(argv[1], "confirm_3137_accepted")) {
+  data.profile = &dgx_ec_profiles[1];
+  data.current_state = 0;
+  physical_floor = reply_floor = UINT16_MAX;
+  assert(dgx_ec_confirm_floor_control(&data, &floor) == 0);
+  assert(floor == UINT16_MAX && write_count == 1);
+  assert(dgx_ec_set_cur_state(&cdev, 12) == 0 && physical_floor == 4350);
+  assert(dgx_ec_set_cur_state(&cdev, 1) == 0 && physical_floor == 1256);
+  assert(physical_floor == dgx_ec_profiles[1].floors[1]);
+ } else if (!strcmp(argv[1], "confirm_3137_ec_error")) {
+  data.profile = &dgx_ec_profiles[1];
+  physical_floor = reply_floor = UINT16_MAX;
+  poll_state_override = 1;
+  assert(dgx_ec_confirm_floor_control(&data, &floor) == -EREMOTEIO);
+  assert(write_count == 0);
  } else { assert(!"unknown case"); }
  return 0;
 }
@@ -385,7 +443,8 @@ class KernelTransactionTests(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         root = Path(cls.temp.name)
         defines = "\n".join(re.findall(r"^#define DGX_EC_.*$", SOURCE, re.M))
-        table = re.search(r"static const u16 dgx_ec_floor_states\[\] = \{.*?\n\};", SOURCE, re.S)[0]
+        profile = brace_block(SOURCE, "struct dgx_ec_fan_profile {")
+        profiles = brace_block(SOURCE, "static const struct dgx_ec_fan_profile dgx_ec_profiles[]")
         data = re.search(r"struct dgx_ec_fan_control_data \{.*?\n\};", SOURCE, re.S)[0]
         trace = re.search(r"struct dgx_ec_trace \{.*?\n\};", SOURCE, re.S)[0]
         names = (
@@ -394,12 +453,14 @@ class KernelTransactionTests(unittest.TestCase):
             "dgx_ec_reconcile_floor", "dgx_ec_read_fixed", "dgx_ec_valid_rtc",
             "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_recover_pending",
             "dgx_ec_preflight", "dgx_ec_read_operation", "dgx_ec_write_lower_floor",
-            "dgx_ec_read_lower_floor",
+            "dgx_ec_read_lower_floor", "dgx_ec_bind_telemetry_only",
+            "dgx_ec_confirm_floor_control",
             "dgx_ec_restore_automatic_locked", "dgx_ec_restore_automatic",
             "dgx_ec_get_cur_state", "dgx_ec_set_cur_state",
         )
         source = root / "transactions.c"
-        source.write_text(SHIM + defines + "\n" + table + "\n" + trace + "\n" + data + "\n" +
+        source.write_text(SHIM + defines + "\n" + profile + "\n" + profiles + "\n" +
+                          trace + "\n" + data + "\n" +
                           "\n".join(c_function(name) for name in names) + MAIN)
         cls.binary = root / "transactions"
         subprocess.run(shlex.split(os.environ.get("CC", "cc")) + [
@@ -412,6 +473,8 @@ class KernelTransactionTests(unittest.TestCase):
             "zero_clamp",
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
+            "confirm_358_read_only", "confirm_3137_unsupported",
+            "confirm_3137_accepted", "confirm_3137_ec_error",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):

@@ -11,9 +11,15 @@
  * keeps it across a warm reboot.  Probe and every automatic restoration
  * clear it, so loading this module without the performance service stays on
  * the firmware curve.
+ *
+ * EC 3.13.7 reports a different capability span and is expected to reject
+ * floor commands. Probe then registers hwmon telemetry only. A mailbox
+ * timeout refuses the device: EC 3.5.8 control assumes the older SoC
+ * firmware this driver was validated with.
  */
 
 #include <linux/arm_ffa.h>
+#include <linux/build_bug.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dmi.h>
@@ -54,10 +60,7 @@
 #define DGX_EC_PACKET_SP_ESPI_READ_FAILED	0x05
 #define DGX_EC_PACKET_SP_MAILBOX_BUSY	0x0a
 #define DGX_EC_CAPABILITIES_REVISION	1U
-#define DGX_EC_EXPECTED_FAN0_MIN_RPM	1260U
-#define DGX_EC_EXPECTED_FAN0_MAX_RPM	9000U
-#define DGX_EC_EXPECTED_FAN1_MIN_RPM	1890U
-#define DGX_EC_EXPECTED_FAN1_MAX_RPM	13500U
+#define DGX_EC_FLOOR_STATE_COUNT	13U
 #define DGX_EC_LIMIT_UNSET		U16_MAX
 #define DGX_EC_LIMIT_STOPPED		0U
 #define DGX_EC_MAX_PLAUSIBLE_RPM	30000U
@@ -72,7 +75,9 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.4"
+#define DGX_EC_DRIVER_VERSION		"0.1.5"
+/* Family-7 mailbox status byte: success is 0x00, unsupported is 0xFF. */
+#define DGX_EC_STATUS_UNSUPPORTED	0xffU
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
@@ -82,21 +87,88 @@ static const uuid_t dgx_ec_oem_uuid =
 	UUID_INIT(0x884a63a0, 0x3285, 0x4120,
 		  0x83, 0xaa, 0xee, 0xc0, 0x08, 0xa0, 0xa5, 0x46);
 
-/* State zero is automatic.  All other states are additive common RPM floors. */
-static const u16 dgx_ec_floor_states[] = {
-	DGX_EC_LIMIT_UNSET,
-	2700U,
-	3600U,
-	4500U,
-	5400U,
-	6300U,
-	7200U,
-	8100U,
-	9000U,
-	10125U,
-	11250U,
-	12375U,
-	13500U,
+struct dgx_ec_fan_profile {
+	const char *name;
+	u16 fan0_min;
+	u16 fan0_max;
+	u16 fan1_min;
+	u16 fan1_max;
+	/*
+	 * Set when a rejected floor command should bind telemetry instead of
+	 * failing probe. EC 3.13.7 keeps the override handlers but they return
+	 * unsupported while their enable bit is clear, and host command 0xEB
+	 * can no longer set that bit.
+	 */
+	bool telemetry_if_floor_unsupported;
+	u16 floors[DGX_EC_FLOOR_STATE_COUNT];
+};
+
+/*
+ * State 0 is NVIDIA's curve (unset clamp). State 12 is that profile's
+ * reported maximum. Intermediate states are strictly increasing and stay
+ * inside the reported minima and the greater reported maximum.
+ *
+ * The 3.5.8 table is the observed RPM-mode contract. The EC converts those
+ * values to PWM against fan 0's 1260..9000 range and fan 1's 1890..13500
+ * range. It is not a tachometer scale, and it is not regenerated from the
+ * endpoints: state 1 is 2700, then 900 RPM steps through 9000, then 1125 RPM
+ * steps through 13500.
+ *
+ * The 3.13.7 table is used only if a floor write is actually accepted. Both
+ * fans report 975..4350, the same span as the ACPI target formula
+ * 975 + 33.75 * level (level 100 lands on 4350). That is not the 3.5.8
+ * control encoding, so the 900 RPM steps are not rescaled onto it. States
+ * 1..12 divide the reported span with integer arithmetic:
+ * min + (max - min) * state / 12. Whether a 3.13.7 write uses this scale, or
+ * works at all, is unverified. Public reports say the write is rejected.
+ */
+static const struct dgx_ec_fan_profile dgx_ec_profiles[] = {
+	{
+		.name = "EC 3.5.8",
+		.fan0_min = 1260,
+		.fan0_max = 9000,
+		.fan1_min = 1890,
+		.fan1_max = 13500,
+		.telemetry_if_floor_unsupported = false,
+		.floors = {
+			DGX_EC_LIMIT_UNSET,
+			2700U,
+			3600U,
+			4500U,
+			5400U,
+			6300U,
+			7200U,
+			8100U,
+			9000U,
+			10125U,
+			11250U,
+			12375U,
+			13500U,
+		},
+	},
+	{
+		.name = "EC 3.13.7",
+		.fan0_min = 975,
+		.fan0_max = 4350,
+		.fan1_min = 975,
+		.fan1_max = 4350,
+		.telemetry_if_floor_unsupported = true,
+		.floors = {
+			DGX_EC_LIMIT_UNSET,
+			1256U,
+			1537U,
+			1818U,
+			2100U,
+			2381U,
+			2662U,
+			2943U,
+			3225U,
+			3506U,
+			3787U,
+			4068U,
+			4350U,
+		},
+	},
 };
 
 struct dgx_ec_fan_capabilities {
@@ -120,6 +192,7 @@ struct dgx_ec_trace {
 
 struct dgx_ec_fan_control_data {
 	struct ffa_device *ffa_dev;
+	const struct dgx_ec_fan_profile *profile;
 	struct thermal_cooling_device *cooling_dev;
 	struct notifier_block reboot_notifier;
 	struct mutex lock; /* Serializes every packet transaction and state change. */
@@ -128,6 +201,7 @@ struct dgx_ec_fan_control_data {
 	u16 rpm[2];
 	u16 attempted_floor;
 	bool floor_uncertain;
+	bool control_supported;
 	bool telemetry_valid;
 	bool recovery_attempted;
 	bool recovery_unverified;
@@ -313,6 +387,15 @@ static int dgx_ec_wait_for_completion(struct dgx_ec_fan_control_data *data,
 		t->last_poll = state;
 		if (state == DGX_EC_PACKET_COMPLETE)
 			goto done;
+		/*
+		 * Success is status 0, which is also PACKET_COMPLETE. Pending is
+		 * the relay's own flag. 0xFF is the EC's unsupported-command
+		 * status and must not be reported as a malformed packet.
+		 */
+		if (state == DGX_EC_STATUS_UNSUPPORTED) {
+			ret = -EOPNOTSUPP;
+			goto done;
+		}
 		if (state == DGX_EC_PACKET_EC_ERROR) {
 			ret = -EREMOTEIO;
 			goto done;
@@ -503,12 +586,21 @@ static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
 		goto out;
 	valid |= 1U << 8;
 	stage = "reply-guard";
-	/* A shared response overwritten by another service is a refusal. Cached
-	 * success alone cannot authenticate a reply after firmware read failure.
+	/*
+	 * A shared response that does not match this read is a refusal, not an
+	 * ownership mismatch. EAGAIN lets the daemon retry after the recovery
+	 * cooldown. ESTALE stays reserved for reconcile's foreign floor. Status
+	 * 0xFF is the EC's unsupported command: do not retry it as if the buffer
+	 * were merely stale, and do not replay a timed-out setter.
 	 */
-	if ((final_status & 3) || final_header[0] != 7 || final_header[1] != 4 || final_header[2] ||
-	    memcmp(reply, final_header + 3, sizeof(reply))) {
-		ret = -ESTALE;
+	if (!(final_status & 3) && final_header[0] == 7 && final_header[1] == 4 &&
+	    final_header[2] == DGX_EC_STATUS_UNSUPPORTED) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if ((final_status & 3) || final_header[0] != 7 || final_header[1] != 4 ||
+	    final_header[2] || memcmp(reply, final_header + 3, sizeof(reply))) {
+		ret = -EAGAIN;
 		goto out;
 	}
 	*floor = get_unaligned_le16(reply);
@@ -690,9 +782,73 @@ static int dgx_ec_read_lower_floor(struct dgx_ec_fan_control_data *data,
 	return ret;
 }
 
+static const struct dgx_ec_fan_profile *
+dgx_ec_match_profile(const struct dgx_ec_fan_capabilities *capabilities)
+{
+	unsigned int i;
+
+	if (capabilities->revision != DGX_EC_CAPABILITIES_REVISION ||
+	    capabilities->unit_mode != 0)
+		return NULL;
+
+	for (i = 0; i < ARRAY_SIZE(dgx_ec_profiles); i++) {
+		const struct dgx_ec_fan_profile *profile = &dgx_ec_profiles[i];
+
+		if (le16_to_cpu(capabilities->fan0_min) == profile->fan0_min &&
+		    le16_to_cpu(capabilities->fan0_max) == profile->fan0_max &&
+		    le16_to_cpu(capabilities->fan1_min) == profile->fan1_min &&
+		    le16_to_cpu(capabilities->fan1_max) == profile->fan1_max)
+			return profile;
+	}
+
+	return NULL;
+}
+
+static int dgx_ec_profiles_valid(void)
+{
+	unsigned int i, state;
+
+	for (i = 0; i < ARRAY_SIZE(dgx_ec_profiles); i++) {
+		const struct dgx_ec_fan_profile *profile = &dgx_ec_profiles[i];
+		u16 floor_min = profile->fan0_min > profile->fan1_min ?
+			profile->fan0_min : profile->fan1_min;
+		u16 floor_max = profile->fan0_max > profile->fan1_max ?
+			profile->fan0_max : profile->fan1_max;
+		u16 previous = 0;
+
+		if (!profile->name || !profile->name[0] ||
+		    !profile->fan0_min || !profile->fan1_min ||
+		    profile->fan0_min > profile->fan0_max ||
+		    profile->fan1_min > profile->fan1_max ||
+		    profile->floors[0] != DGX_EC_LIMIT_UNSET ||
+		    profile->floors[DGX_EC_FLOOR_STATE_COUNT - 1] != floor_max)
+			return 0;
+
+		for (state = 1; state < DGX_EC_FLOOR_STATE_COUNT; state++) {
+			u16 floor = profile->floors[state];
+
+			if (floor < floor_min || floor > floor_max ||
+			    floor <= previous || floor == DGX_EC_LIMIT_UNSET ||
+			    floor == DGX_EC_LIMIT_STOPPED)
+				return 0;
+			previous = floor;
+		}
+	}
+
+	return 1;
+}
+
+/* EC error, eSPI status -EIO, or explicit 0xFF. Not a timeout or a foreign floor. */
+static bool dgx_ec_bind_telemetry_only(const struct dgx_ec_fan_profile *profile, int ret)
+{
+	return profile && profile->telemetry_if_floor_unsupported &&
+		(ret == -EOPNOTSUPP || ret == -EREMOTEIO || ret == -EIO);
+}
+
 static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 {
 	struct dgx_ec_fan_capabilities capabilities;
+	const struct dgx_ec_fan_profile *profile;
 	int ret;
 
 	ret = dgx_ec_read_operation(data,
@@ -701,24 +857,26 @@ static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
 	if (ret)
 		return ret;
 
-	if (capabilities.revision != DGX_EC_CAPABILITIES_REVISION ||
-	    capabilities.unit_mode != 0 ||
-	    le16_to_cpu(capabilities.fan0_min) !=
-		DGX_EC_EXPECTED_FAN0_MIN_RPM ||
-	    le16_to_cpu(capabilities.fan0_max) !=
-		DGX_EC_EXPECTED_FAN0_MAX_RPM ||
-	    le16_to_cpu(capabilities.fan1_min) !=
-		DGX_EC_EXPECTED_FAN1_MIN_RPM ||
-	    le16_to_cpu(capabilities.fan1_max) !=
-		DGX_EC_EXPECTED_FAN1_MAX_RPM)
+	profile = dgx_ec_match_profile(&capabilities);
+	if (!profile) {
+		dev_err(&data->ffa_dev->dev,
+			"unrecognized capabilities rev=%u unit_mode=%u fan0=%u..%u fan1=%u..%u\n",
+			capabilities.revision, capabilities.unit_mode,
+			le16_to_cpu(capabilities.fan0_min),
+			le16_to_cpu(capabilities.fan0_max),
+			le16_to_cpu(capabilities.fan1_min),
+			le16_to_cpu(capabilities.fan1_max));
+		dev_dbg(&data->ffa_dev->dev,
+			"unrecognized capabilities raw=%*ph\n",
+			(int)sizeof(capabilities), (u8 *)&capabilities);
 		return -EBADMSG;
+	}
 
+	data->profile = profile;
 	dev_info(&data->ffa_dev->dev,
-		 "pinned RPM capabilities fan0=%u..%u fan1=%u..%u\n",
-		 DGX_EC_EXPECTED_FAN0_MIN_RPM,
-		 DGX_EC_EXPECTED_FAN0_MAX_RPM,
-		 DGX_EC_EXPECTED_FAN1_MIN_RPM,
-		 DGX_EC_EXPECTED_FAN1_MAX_RPM);
+		 "pinned %s capabilities fan0=%u..%u fan1=%u..%u\n",
+		 profile->name, profile->fan0_min, profile->fan0_max,
+		 profile->fan1_min, profile->fan1_max);
 	return 0;
 }
 
@@ -755,24 +913,29 @@ static int dgx_ec_refresh(struct dgx_ec_fan_control_data *data)
 /* Called under lock, only after a complete, authenticated floor read. */
 static int dgx_ec_reconcile_floor(struct dgx_ec_fan_control_data *data, u16 floor)
 {
+	const u16 *floors;
 	unsigned int state;
+
+	if (!data->profile)
+		return -EBADMSG;
+	floors = data->profile->floors;
 
 	if (floor == DGX_EC_LIMIT_UNSET) {
 		data->current_state = 0;
-	} else if (floor == dgx_ec_floor_states[data->current_state]) {
+	} else if (floor == floors[data->current_state]) {
 		/* A completed request left the last confirmed floor intact. */
 	} else if (data->floor_uncertain && floor == data->attempted_floor) {
-		for (state = 1; state < ARRAY_SIZE(dgx_ec_floor_states); state++) {
-			if (floor == dgx_ec_floor_states[state])
+		for (state = 1; state < DGX_EC_FLOOR_STATE_COUNT; state++) {
+			if (floor == floors[state])
 				break;
 		}
-		if (state == ARRAY_SIZE(dgx_ec_floor_states))
+		if (state == DGX_EC_FLOOR_STATE_COUNT)
 			return -ESTALE;
 		data->current_state = state;
 	} else {
 		dev_warn_ratelimited(&data->ffa_dev->dev,
 			"floor ownership mismatch: observed=%#x confirmed=%#x\n",
-			floor, dgx_ec_floor_states[data->current_state]);
+			floor, floors[data->current_state]);
 		return -ESTALE;
 	}
 
@@ -790,10 +953,10 @@ static int dgx_ec_restore_automatic_locked(struct dgx_ec_fan_control_data *data)
 	if (ret)
 		return ret;
 	/*
-	 * Zero is not an owned floor.  The fan minima are 1260 and 1890 RPM,
-	 * and a clamp of 0 leaves both fans stopped until an EC power cycle.
-	 * Clearing it is what makes "module loaded, service stopped" the
-	 * NVIDIA curve rather than fans off.
+	 * Zero is not an owned floor.  Every accepted profile reports a
+	 * non-zero minimum, and a clamp of 0 leaves both fans stopped until
+	 * an EC power cycle.  Clearing it is what makes "module loaded,
+	 * service stopped" the NVIDIA curve rather than fans off.
 	 */
 	if (floor == DGX_EC_LIMIT_STOPPED) {
 		dev_warn(&data->ffa_dev->dev,
@@ -825,7 +988,7 @@ static int dgx_ec_restore_automatic(struct dgx_ec_fan_control_data *data,
 	mutex_lock(&data->lock);
 	for (attempt = 0; attempt < DGX_EC_RESTORE_ATTEMPTS; attempt++) {
 		ret = dgx_ec_restore_automatic_locked(data);
-		if (!ret || ret == -ESTALE)
+		if (!ret || ret == -ESTALE || ret == -EOPNOTSUPP)
 			break;
 		if (attempt + 1 < DGX_EC_RESTORE_ATTEMPTS)
 			msleep(DGX_EC_RESTORE_RETRY_MS);
@@ -882,7 +1045,7 @@ static const struct hwmon_chip_info dgx_ec_chip_info = {
 static int dgx_ec_get_max_state(struct thermal_cooling_device *cdev,
 				unsigned long *state)
 {
-	*state = ARRAY_SIZE(dgx_ec_floor_states) - 1;
+	*state = DGX_EC_FLOOR_STATE_COUNT - 1;
 	return 0;
 }
 
@@ -915,7 +1078,7 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 	int restore_ret;
 	int ret;
 
-	if (state >= ARRAY_SIZE(dgx_ec_floor_states))
+	if (!data->profile || state >= DGX_EC_FLOOR_STATE_COUNT)
 		return -EINVAL;
 
 	ret = mutex_lock_interruptible(&data->lock);
@@ -949,7 +1112,7 @@ static int dgx_ec_set_cur_state(struct thermal_cooling_device *cdev,
 	}
 
 apply:
-	target_floor = dgx_ec_floor_states[state];
+	target_floor = data->profile->floors[state];
 	ret = dgx_ec_write_lower_floor(data, target_floor);
 	if (ret)
 		goto failed_write;
@@ -967,7 +1130,7 @@ report:
 	if (!ret)
 		dev_info(&data->ffa_dev->dev,
 			 "cooling state=%lu lower floor=%#x\n", state,
-			 dgx_ec_floor_states[state]);
+			 data->profile->floors[state]);
 	goto unlock;
 
 failed_write:
@@ -1003,6 +1166,8 @@ static int dgx_ec_fan_control_suspend(struct device *dev)
 {
 	struct dgx_ec_fan_control_data *data = dev_get_drvdata(dev);
 
+	if (!data->control_supported)
+		return 0;
 	return dgx_ec_restore_automatic(data, "suspend");
 }
 
@@ -1015,11 +1180,63 @@ static DEFINE_SIMPLE_DEV_PM_OPS(dgx_ec_fan_control_pm_ops,
 				dgx_ec_fan_control_suspend,
 				dgx_ec_fan_control_resume);
 
+/*
+ * On EC 3.13.7 a successful capability read does not prove the floor slot
+ * still accepts commands. A constant unset read is what a removed override
+ * returns, so confirm with one documented unset write. That write does not
+ * raise a floor. 3.5.8 only reads here; its existing probe path is unchanged.
+ * *floor stays at the last successful read when a later write is rejected.
+ */
+static int dgx_ec_confirm_floor_control(struct dgx_ec_fan_control_data *data,
+					u16 *floor)
+{
+	u16 current;
+	int ret;
+
+	if (!data->profile)
+		return -EBADMSG;
+	ret = dgx_ec_read_lower_floor(data, floor);
+	if (ret || !data->profile->telemetry_if_floor_unsupported)
+		return ret;
+	current = *floor;
+	if (current != DGX_EC_LIMIT_UNSET && current != DGX_EC_LIMIT_STOPPED)
+		return 0;
+
+	ret = dgx_ec_write_lower_floor(data, DGX_EC_LIMIT_UNSET);
+	if (ret)
+		return ret;
+	ret = dgx_ec_read_lower_floor(data, floor);
+	if (ret)
+		return ret;
+	if (*floor != DGX_EC_LIMIT_UNSET)
+		return -EIO;
+	if (current == DGX_EC_LIMIT_STOPPED)
+		dev_warn(&data->ffa_dev->dev,
+			 "clearing zero lower clamp; restoring NVIDIA fan curve\n");
+	return 0;
+}
+
+static int dgx_ec_probe_failed(struct ffa_device *ffa_dev, int ret)
+{
+	/*
+	 * Poll exhaustion is -ETIMEDOUT. Submit status 0x05 (eSPI read failed),
+	 * reported elsewhere as a 54 ms timeout, is -EIO in this driver. Both
+	 * mean the mailbox did not complete. EC 3.13.7 floor rejection uses a
+	 * different errno and does not reach here when telemetry still reads.
+	 */
+	if (ret == -ETIMEDOUT || ret == -EIO)
+		return dev_err_probe(&ffa_dev->dev, ret,
+			"EC mailbox did not complete. EC 3.5.8 fan-floor support assumes SoC firmware 2.155.11; October SoC 2.158.15 (0x02009e0f) fails the first read-only query. On EC 3.5.8 the alternative is an ACPI cooling device of type Fan (max_state 100). The BIOS target is 975 + 33.75 * level RPM. Do not write a level below 30: level 0 stops both fans. This driver does not operate that ACPI device\n");
+	return dev_err_probe(&ffa_dev->dev, ret,
+			     "refusing fan-floor cooling device\n");
+}
+
 static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 {
 	struct dgx_ec_fan_control_data *data;
 	struct device *hwmon_dev;
-	u16 floor;
+	bool bind_control = true;
+	u16 floor = DGX_EC_LIMIT_UNSET;
 	int ret;
 
 	if (!dgx_ec_is_supported_platform())
@@ -1039,24 +1256,46 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	ret = dgx_ec_read_capabilities(data);
 	if (ret)
 		goto unlock;
-	ret = dgx_ec_read_lower_floor(data, &floor);
+	ret = dgx_ec_confirm_floor_control(data, &floor);
+	/*
+	 * Capability reads that time out never get here. A floor failure after
+	 * the 3.13.7 profile matched, including the enable-bit timeout, tries
+	 * telemetry before refusing the device. 3.5.8 still fails closed.
+	 */
+	if (ret && data->profile->telemetry_if_floor_unsupported &&
+	    (dgx_ec_bind_telemetry_only(data->profile, ret) || ret == -ETIMEDOUT)) {
+		dev_warn(&ffa_dev->dev,
+			 "%s floor control rejected (%d); registering hwmon telemetry only, no cooling device\n",
+			 data->profile->name, ret);
+		if (floor == DGX_EC_LIMIT_STOPPED)
+			dev_warn(&ffa_dev->dev,
+				 "zero lower clamp remains; floor write was rejected\n");
+		data->floor_uncertain = false;
+		bind_control = false;
+		ret = 0;
+	}
 	if (ret)
 		goto unlock;
-	if (floor == DGX_EC_LIMIT_STOPPED) {
+	if (bind_control && floor == DGX_EC_LIMIT_STOPPED) {
 		ret = dgx_ec_restore_automatic_locked(data);
 		if (ret)
 			goto unlock;
-	} else if (floor != DGX_EC_LIMIT_UNSET) {
+	} else if (bind_control && floor != DGX_EC_LIMIT_UNSET) {
 		dev_err(&ffa_dev->dev,
 			"refusing to replace existing lower floor %#x\n", floor);
 		ret = -EBUSY;
 		goto unlock;
 	}
+	if (bind_control && data->profile->telemetry_if_floor_unsupported)
+		dev_warn(&ffa_dev->dev,
+			 "%s accepted a floor command; the state table is unverified\n",
+			 data->profile->name);
 	ret = dgx_ec_refresh(data);
 	if (ret)
 		goto unlock;
 	dev_info(&ffa_dev->dev, "baseline fan1=%u fan2=%u RPM\n",
 		 data->rpm[0], data->rpm[1]);
+	data->control_supported = bind_control;
 	mutex_unlock(&data->lock);
 
 	hwmon_dev = devm_hwmon_device_register_with_info(&ffa_dev->dev,
@@ -1065,6 +1304,12 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	if (IS_ERR(hwmon_dev))
 		return dev_err_probe(&ffa_dev->dev, PTR_ERR(hwmon_dev),
 				     "failed to register hwmon\n");
+
+	if (!data->control_supported) {
+		dev_info(&ffa_dev->dev,
+			 "fan telemetry registered; cooling device not registered\n");
+		return 0;
+	}
 
 	data->cooling_dev = thermal_cooling_device_register(
 		"dgx_ec_fan_floor", data, &dgx_ec_cooling_ops);
@@ -1101,8 +1346,7 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 
 unlock:
 	mutex_unlock(&data->lock);
-	return dev_err_probe(&ffa_dev->dev, ret,
-			     "refusing fan-floor cooling device\n");
+	return dgx_ec_probe_failed(ffa_dev, ret);
 }
 
 static void dgx_ec_fan_control_remove(struct ffa_device *ffa_dev)
@@ -1111,7 +1355,12 @@ static void dgx_ec_fan_control_remove(struct ffa_device *ffa_dev)
 
 	if (!data)
 		return;
-	thermal_cooling_device_unregister(data->cooling_dev);
+	if (data->cooling_dev)
+		thermal_cooling_device_unregister(data->cooling_dev);
+	if (!data->control_supported) {
+		dev_info(&ffa_dev->dev, "fan telemetry device removed\n");
+		return;
+	}
 	dgx_ec_restore_automatic(data, "module removal");
 	dev_info(&ffa_dev->dev, "fan-floor cooling device removed\n");
 }
@@ -1134,6 +1383,12 @@ static struct ffa_driver dgx_ec_fan_control_driver = {
 
 static int __init dgx_ec_fan_control_init(void)
 {
+	BUILD_BUG_ON(ARRAY_SIZE(dgx_ec_profiles[0].floors) !=
+		     DGX_EC_FLOOR_STATE_COUNT);
+	if (!dgx_ec_profiles_valid()) {
+		pr_err("dgx_ec_fan_control: capability profiles failed validation\n");
+		return -EINVAL;
+	}
 	if (!dgx_ec_is_supported_platform())
 		return -ENODEV;
 	return ffa_register(&dgx_ec_fan_control_driver);

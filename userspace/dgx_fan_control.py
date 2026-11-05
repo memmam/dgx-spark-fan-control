@@ -13,7 +13,10 @@ from threading import Event
 from pathlib import Path
 
 COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
+HWMON_DEVICE_NAME = "dgx_ec_fan"
+CONTROL_UNSUPPORTED = "control unsupported on this firmware"
 MAX_STATE = 12
+MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
 FILTER_ALPHA = 0.35
 DOWN_HYSTERESIS_C = 4.0
@@ -21,27 +24,38 @@ UP_STATES_PER_POLL = 2
 DOWN_STATES_PER_POLL = 1
 TRANSPORT_FAILURE_LIMIT = 3
 RETRY_INITIAL_SECONDS = 2.0
+# The driver arms a 30s cooldown before returning EAGAIN for a refused
+# reply-guard or idle-guard recovery. A retry inside that window cannot succeed.
+RECOVERY_COOLDOWN_SECONDS = 31.0
 CONTROLLER_UNAVAILABLE_EXIT = 69
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
     errno.ETIMEDOUT, errno.EREMOTEIO,
 ))
 
-# The curve becomes deliberately aggressive well below NVIDIA's stock 80 C
-# second step. Firmware still takes the maximum of its own demand and this
-# additive request.
+# Temperatures are unchanged. State indexes are shared by every capability
+# profile: the kernel maps them to that profile's floor table. State 0 is
+# NVIDIA's curve and is never selected while this process is running. A lower
+# clamp of 0 has been observed to latch with the fans stopped. State 1 is the
+# first additive floor of the active profile. State 12 is that profile's
+# reported maximum. Stopping the daemon still writes state 0.
 PERFORMANCE_CURVE = (
-    (50.0, 3),   # 4,500 common RPM floor
-    (55.0, 5),   # 6,300
-    (60.0, 8),   # 9,000
-    (65.0, 10),  # 11,250 (fan 0 saturates at 9,000)
-    (70.0, 12),  # 13,500 (both fans at their maxima)
+    (0.0, 1),
+    (50.0, 3),
+    (55.0, 5),
+    (60.0, 8),
+    (65.0, 10),
+    (70.0, 12),
 )
 
 LOG = logging.getLogger("dgx-fan-control")
 
 
-def find_cooling_device(thermal_root: Path) -> Path:
+class ControlUnsupported(RuntimeError):
+    """Hwmon telemetry is bound and the EC is not accepting a floor."""
+
+
+def cooling_devices(thermal_root: Path) -> list[Path]:
     matches = []
     for candidate in sorted(thermal_root.glob("cooling_device*")):
         try:
@@ -50,11 +64,43 @@ def find_cooling_device(thermal_root: Path) -> Path:
             continue
         if device_type == COOLING_DEVICE_TYPE:
             matches.append(candidate)
+    return matches
+
+
+def find_cooling_device(thermal_root: Path) -> Path:
+    matches = cooling_devices(thermal_root)
     if len(matches) != 1:
         raise RuntimeError(
             f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
         )
     return matches[0]
+
+
+def find_fan_hwmon(hwmon_root: Path) -> Path | None:
+    matches = []
+    for candidate in sorted(hwmon_root.glob("hwmon*")):
+        try:
+            name = (candidate / "name").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if name == HWMON_DEVICE_NAME:
+            matches.append(candidate)
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected at most one {HWMON_DEVICE_NAME!r} hwmon device, found {len(matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def require_control(thermal_root: Path, hwmon_root: Path) -> Path:
+    matches = cooling_devices(thermal_root)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) == 0 and find_fan_hwmon(hwmon_root) is not None:
+        raise ControlUnsupported(CONTROL_UNSUPPORTED)
+    raise RuntimeError(
+        f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
+    )
 
 
 def read_hottest_temperature_c(thermal_root: Path) -> float:
@@ -76,10 +122,18 @@ def curve_state(temperature_c: float) -> int:
         raise ValueError("temperature must be finite and positive")
     state = 0
     for threshold_c, threshold_state in PERFORMANCE_CURVE:
+        if threshold_state < MIN_CURVE_STATE:
+            raise ValueError("performance curve requested state 0")
         if temperature_c < threshold_c:
             break
         state = threshold_state
-    return state
+    return max(state, MIN_CURVE_STATE)
+
+
+def retry_delay_seconds(exc: OSError, failures: int) -> float:
+    if exc.errno == errno.EAGAIN:
+        return RECOVERY_COOLDOWN_SECONDS
+    return RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
 
 
 def next_state(current: int, filtered_temperature_c: float) -> int:
@@ -88,11 +142,14 @@ def next_state(current: int, filtered_temperature_c: float) -> int:
         raise ValueError("current cooling state is outside the driver contract")
     rising_target = curve_state(filtered_temperature_c)
     if rising_target > current:
-        return min(rising_target, current + UP_STATES_PER_POLL)
-    falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C)
-    if falling_target < current:
-        return max(falling_target, current - DOWN_STATES_PER_POLL)
-    return current
+        chosen = min(rising_target, current + UP_STATES_PER_POLL)
+    else:
+        falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C)
+        if falling_target < current:
+            chosen = max(falling_target, current - DOWN_STATES_PER_POLL)
+        else:
+            chosen = current
+    return max(chosen, MIN_CURVE_STATE)
 
 
 def read_state(cooling_device: Path) -> int:
@@ -114,10 +171,13 @@ def write_state(cooling_device: Path, state: int) -> None:
         raise RuntimeError(f"cooling-state readback mismatch: wrote {state}, read {observed}")
 
 
-def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
+def run_daemon(thermal_root: Path, poll_seconds: float,
+               hwmon_root: Path | None = None) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
-    cooling_device = find_cooling_device(thermal_root)
+    if hwmon_root is None:
+        hwmon_root = Path("/sys/class/hwmon")
+    cooling_device = require_control(thermal_root, hwmon_root)
     filtered_temperature_c: float | None = None
     stop_requested = Event()
     failures = 0
@@ -175,7 +235,7 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
                         failures, exc,
                     )
                     raise
-                delay = RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
+                delay = retry_delay_seconds(exc, failures)
                 LOG.warning(
                     "fan communication failed (%d/%d): %s; retrying in %.1fs",
                     failures, TRANSPORT_FAILURE_LIMIT, exc, delay,
@@ -206,6 +266,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/sys/class/thermal"),
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--hwmon-root",
+        type=Path,
+        default=Path("/sys/class/hwmon"),
+        help=argparse.SUPPRESS,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
     daemon = subparsers.add_parser("daemon", help="run the smooth performance curve")
     daemon.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
@@ -221,8 +287,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "daemon":
-            return run_daemon(args.thermal_root, args.poll_seconds)
-        cooling_device = find_cooling_device(args.thermal_root)
+            return run_daemon(args.thermal_root, args.poll_seconds, args.hwmon_root)
+        cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
             return 0
@@ -235,6 +301,13 @@ def main(argv: list[str] | None = None) -> int:
                 f"hottest={read_hottest_temperature_c(args.thermal_root):.1f}C"
             )
             return 0
+    except ControlUnsupported as exc:
+        LOG.error("%s", exc)
+        if args.command == "status":
+            print(CONTROL_UNSUPPORTED)
+        # Permanent firmware limitation. Exit 0 so systemd does not restart the
+        # daemon. set-state and automatic still fail because they cannot write.
+        return 0 if args.command in ("status", "daemon") else 1
     except (OSError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
         return CONTROLLER_UNAVAILABLE_EXIT if args.command == "daemon" else 1

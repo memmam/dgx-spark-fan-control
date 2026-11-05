@@ -2,7 +2,9 @@
 """Failure-path checks without touching the host's thermal interfaces."""
 
 import errno
+import io
 import math
+from contextlib import redirect_stdout
 from threading import Event
 import tempfile
 import unittest
@@ -95,7 +97,7 @@ class UserlandFailureTests(unittest.TestCase):
             if len(waits) == 2:
                 stop.set()
 
-        with patch.object(CONTROL, "find_cooling_device"), \
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
              patch.object(CONTROL, "read_state", side_effect=read), \
@@ -110,7 +112,7 @@ class UserlandFailureTests(unittest.TestCase):
     def test_persistent_failure_stops_and_preserves_original_error(self):
         stop = Event()
         original = OSError(errno.ETIMEDOUT, "initial timeout")
-        with patch.object(CONTROL, "find_cooling_device"), \
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
              patch.object(CONTROL, "read_state", side_effect=original) as read, \
@@ -125,9 +127,55 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertTrue(any("initial timeout" in line for line in logs.output))
         self.assertTrue(any("cleanup busy" in line for line in logs.output))
 
+    def test_reply_guard_refusal_waits_out_recovery_cooldown(self):
+        stop = Event()
+        delays = []
+        states = iter((OSError(errno.EAGAIN, "reply guard"), 1))
+
+        def read(device):
+            result = next(states)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        def wait(delay):
+            delays.append(delay)
+            if len(delays) == 2:
+                stop.set()
+
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL, "read_state", side_effect=read), \
+             patch.object(CONTROL, "read_hottest_temperature_c", return_value=70), \
+             patch.object(CONTROL, "write_state") as write, \
+             patch.object(stop, "wait", side_effect=wait), \
+             self.assertLogs(CONTROL.LOG, level="INFO"):
+            self.assertEqual(CONTROL.run_daemon(Path("unused"), 2), 0)
+        self.assertGreaterEqual(delays[0], CONTROL.RECOVERY_COOLDOWN_SECONDS)
+        self.assertEqual(delays[0], 31.0)
+        self.assertNotIn(0, [call.args[1] for call in write.call_args_list[:-1]])
+        self.assertEqual(write.call_args_list[-1].args[1], 0)
+
+    def test_reply_guard_refusal_is_bounded(self):
+        stop = Event()
+        original = OSError(errno.EAGAIN, "reply guard")
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL, "read_state", side_effect=original) as read, \
+             patch.object(CONTROL, "write_state"), \
+             patch.object(stop, "wait") as wait, \
+             self.assertLogs(CONTROL.LOG, level="WARNING"):
+            with self.assertRaises(OSError) as raised:
+                CONTROL.run_daemon(Path("unused"), 2)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [31.0, 31.0])
+
     def test_foreign_floor_is_not_retried(self):
         stop = Event()
-        with patch.object(CONTROL, "find_cooling_device"), \
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
              patch.object(CONTROL, "read_state", side_effect=OSError(errno.ESTALE, "foreign floor")) as read, \
@@ -156,7 +204,7 @@ class UserlandFailureTests(unittest.TestCase):
             else:
                 stop.set()
 
-        with patch.object(CONTROL, "find_cooling_device"), \
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
              patch.object(CONTROL, "read_state", side_effect=lambda device: actual[0]), \
@@ -172,7 +220,7 @@ class UserlandFailureTests(unittest.TestCase):
         handlers = {}
         def register(sig, callback):
             handlers[sig] = callback
-        with patch.object(CONTROL, "find_cooling_device"), \
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal", side_effect=register), \
              patch.object(CONTROL, "read_state", side_effect=OSError(errno.EBUSY, "busy")) as read, \
@@ -182,6 +230,28 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(CONTROL.run_daemon(Path("unused"), 2), 0)
         self.assertEqual(read.call_count, 1)
         self.assertEqual(write.call_args.args[1], 0)
+
+    def test_telemetry_only_firmware_does_not_loop_or_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon" / "hwmon0"
+            thermal.mkdir()
+            hwmon.mkdir(parents=True)
+            (hwmon / "name").write_text(CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii")
+            argv = [
+                "--thermal-root", str(thermal),
+                "--hwmon-root", str(root / "hwmon"),
+            ]
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertLogs(CONTROL.LOG, level="ERROR") as logs:
+                self.assertEqual(CONTROL.main([*argv, "status"]), 0)
+            self.assertIn(CONTROL.CONTROL_UNSUPPORTED, output.getvalue())
+            self.assertTrue(any(CONTROL.CONTROL_UNSUPPORTED in line for line in logs.output))
+            with self.assertLogs(CONTROL.LOG, level="ERROR"):
+                self.assertEqual(CONTROL.main([*argv, "daemon"]), 0)
+                self.assertEqual(CONTROL.main([*argv, "set-state", "1"]), 1)
+                self.assertEqual(CONTROL.main([*argv, "automatic"]), 1)
 
     def test_expected_daemon_error_uses_nonrestart_exit_status(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")), \

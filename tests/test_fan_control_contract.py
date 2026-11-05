@@ -24,11 +24,13 @@ class KernelContractTests(unittest.TestCase):
         self.assertNotIn("ioctl", SOURCE)
 
     def test_state_zero_is_automatic_and_states_are_bounded(self):
-        table = SOURCE.split("dgx_ec_floor_states[] = {", 1)[1].split("};", 1)[0]
+        table = SOURCE.split("static const struct dgx_ec_fan_profile dgx_ec_profiles[]", 1)[1]
         self.assertIn("DGX_EC_LIMIT_UNSET", table)
-        for rpm in ("2700U", "4500U", "9000U", "13500U"):
+        for rpm in ("2700U", "4500U", "9000U", "13500U", "1256U", "4350U"):
             self.assertIn(rpm, table)
-        self.assertIn("state >= ARRAY_SIZE(dgx_ec_floor_states)", SOURCE)
+        self.assertIn("state >= DGX_EC_FLOOR_STATE_COUNT", SOURCE)
+        self.assertIn("EC 3.5.8", table)
+        self.assertIn("EC 3.13.7", table)
 
     def test_platform_and_capabilities_fail_closed(self):
         for requirement in (
@@ -36,11 +38,18 @@ class KernelContractTests(unittest.TestCase):
             'DMI_PRODUCT_NAME, "NVIDIA_DGX_Spark"',
             'DMI_BOARD_NAME, "P4242"',
             "FFA_VERSION_1_2",
-            "DGX_EC_EXPECTED_FAN0_MIN_RPM",
-            "DGX_EC_EXPECTED_FAN1_MAX_RPM",
+            "dgx_ec_match_profile",
+            "return -EBADMSG",
+            "unrecognized capabilities raw=%*ph",
             "if (floor != DGX_EC_LIMIT_UNSET)",
             "floor == DGX_EC_LIMIT_STOPPED",
             "clearing zero lower clamp",
+            "DGX_EC_STATUS_UNSUPPORTED",
+            "registering hwmon telemetry only, no cooling device",
+            "October SoC 2.158.15",
+            "Do not write a level below 30",
+            "ret = -EAGAIN",
+            "floor ownership mismatch",
         ):
             self.assertIn(requirement, SOURCE)
 
@@ -55,10 +64,18 @@ class KernelContractTests(unittest.TestCase):
 
 class UserlandPolicyTests(unittest.TestCase):
     def test_performance_curve_reaches_maximum_at_seventy(self):
-        self.assertEqual(CONTROL.curve_state(49.9), 0)
+        self.assertEqual(CONTROL.curve_state(0.1), 1)
+        self.assertEqual(CONTROL.curve_state(49.9), 1)
         self.assertEqual(CONTROL.curve_state(50.0), 3)
         self.assertEqual(CONTROL.curve_state(60.0), 8)
         self.assertEqual(CONTROL.curve_state(70.0), 12)
+        self.assertGreaterEqual(min(state for _, state in CONTROL.PERFORMANCE_CURVE), 1)
+
+    def test_running_curve_never_selects_state_zero(self):
+        for temperature in (0.1, 1, 20, 49.9, 50, 55, 60, 65, 70, 90, 120):
+            self.assertGreaterEqual(CONTROL.curve_state(temperature), 1)
+            for current in range(CONTROL.MAX_STATE + 1):
+                self.assertGreaterEqual(CONTROL.next_state(current, temperature), 1)
 
     def test_rate_limit_rises_quickly_and_falls_with_hysteresis(self):
         self.assertEqual(CONTROL.next_state(0, 70.0), 2)

@@ -26,7 +26,7 @@ service before selecting a manual floor:
 
 ```sh
 sudo systemctl stop dgx-fan-control.service
-sudo dgx-fan-control set-state 12   # maximum floor: up to 9000 / 13500 RPM
+sudo dgx-fan-control set-state 12   # profile maximum (9000/13500 RPM on EC 3.5.8)
 dgx-fan-control status
 ```
 
@@ -56,20 +56,58 @@ policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-f
 
 ## Compatibility
 
-Originally tested on two **NVIDIA DGX Sparks, board P4242**, with DGX OS 7.5.0,
-kernel **`6.17.0-1029-nvidia`**, and EC firmware **3.5.8**. Other GB10 systems,
-OEM variants, generic kernels, and future firmware are unverified. The driver
-rejects platform or protocol responses outside its observed contract.
+Fan-floor **control** was tested on **NVIDIA DGX Spark, board P4242**, with
+**EC 3.5.8** and the SoC firmware it was qualified against, **2.155.11**
+(`0x02009b0b`), DGX OS 7.5.0, and kernel `6.17.0-1029-nvidia`. Later checks
+used kernel `7.0.0-1019-nvidia`. That SoC pairing is part of the contract.
+**EC 3.5.8 with October SoC firmware 2.158.15** (`0x02009e0f`) times out the
+FF-A/eSPI mailbox on the first read-only query, so this driver does not bind.
+Probe says so and points at the ACPI fan devices below.
+
+**EC 3.13.7** (`fwupdmgr` `0x03000d07`) has been observed on the same board,
+including kernel `7.0.0-1024-nvidia`. The capability reply is still revision 1,
+unit mode 0, but both fans report **975–4350** instead of 1260–9000 and
+1890–13500. Those figures match the ACPI tach target `975 + 33.75 × level`
+(level 100 is 4350). They are not a rescaling of the older RPM-mode control
+ranges, which the EC converts to PWM. A public diff of the EC images found the
+override handlers and their dispatch table byte-identical between 3.5.8 and
+3.13.7. They return **-5 (unsupported)** or **-116 (timeout)** when an enable
+bit is clear. What changed is host command **0xEB**: it now honors a permission
+table that marks the fan/thermal register block read-only, so the host can no
+longer set that enable bit. This is deliberate access control. Floor writes on
+3.13.7 are therefore expected to fail. Version 0.1.5 still accepts the exact
+capability reply. If the floor command is rejected, the module registers hwmon
+telemetry only and does not create a cooling device. `dgx-fan-control status`
+then prints `control unsupported on this firmware`. The 3.13.7 state table,
+used only if a write is actually accepted, is **not qualified**.
+
+On **EC 3.5.8 plus the October SoC**, the alternative that has been observed to
+work is the ACPI fan device: `/sys/class/thermal/cooling_device*` with type
+`Fan` and `max_state` 100. The BIOS maps a level to `975 + 33.75 × level` RPM.
+Reported measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
+about 1620 with the second fan stalling, and level 0 stops both fans. Do not
+write a level below 30; the observers use 40. This project does not drive those
+ACPI devices. On EC 3.13.7 the same ACPI write is accepted and does not change
+fan speed.
+
+Other GB10 boards, generic kernels, and any capability reply other than the
+two profiles above are rejected. The driver does not relax validation to make
+an unknown reply succeed.
 
 You need Python 3.10+, matching NVIDIA kernel headers and build tools, and an
 enrolled local signing certificate when Secure Boot is enabled. DKMS is optional;
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.4** keeps a loaded module on NVIDIA's curve when the performance
-service is not running. State 0 is that curve. A latched lower clamp of 0,
-which stops both fans and survives a warm reboot, is cleared on load and on
-every automatic restore. Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
+Version **0.1.5** recognizes the EC 3.13.7 capability reply, binds telemetry
+only when floor control is rejected, and tells a probe timeout apart from that
+case. The performance curve never requests state 0 while the daemon is running.
+A reply-guard recovery refusal is retried after the 30-second cooldown; a
+foreign floor remains fatal. Version **0.1.4** keeps a loaded module on NVIDIA's
+curve when the performance service is not running. State 0 is that curve. A
+latched lower clamp of 0, which stops both fans and survives a warm reboot, is
+cleared on load and on every automatic restore when floor writes still work.
+Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
 idle-mailbox failure. It validates physical mailbox observations, submits one
 read-only recovery request, checks the reply, and reconciles floor ownership
 before continuing. Timed-out setters are never blindly replayed. Recovery

@@ -23,6 +23,67 @@ capability response. Read the kernel log; do not remove validation checks.
 This implementation matches the NVIDIA P4242 platform only. Other GB10 boards
 have not been qualified.
 
+Version 0.1.5 accepts exactly two capability replies: EC 3.5.8
+(1260–9000 / 1890–13500) and EC 3.13.7 (975–4350 / 975–4350), both revision 1
+and unit mode 0. Anything else is still `-EBADMSG` (`-74`), including a
+one-count difference. The kernel log prints the unrecognized parsed ranges.
+The raw bytes are available with dynamic debug:
+
+```sh
+echo 'file dgx_ec_fan_control.c +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+```
+
+## EC 3.13.7: control unsupported
+
+On EC 3.13.7 the override handlers are still present, but they return
+unsupported (`-5`) or timeout (`-116`) while their enable bit is clear. Host
+command `0xEB` now refuses writes to the fan/thermal block, so that bit cannot
+be set from the host. Expect floor writes to fail. A successful capability
+read followed by a rejected floor command binds **hwmon telemetry only**.
+There is no `dgx_ec_fan_floor` cooling device, and the daemon must not keep
+retrying writes.
+
+```sh
+dgx-fan-control status
+# control unsupported on this firmware
+```
+
+`fan1_input` and `fan2_input` under the `dgx_ec_fan` hwmon device should still
+be readable. Do not register a second fan driver or send raw mailbox commands
+to work around the rejection. The ACPI `Fan` cooling device does not change
+fan speed on this EC either.
+
+## Mailbox timeout and the ACPI fan devices
+
+A failed **first** query is a different failure. EC 3.5.8 paired with October
+SoC firmware **2.158.15** (`0x02009e0f`) has failed the FF-A/eSPI mailbox on
+the first read-only query (eSPI status `0x05`, about 54 ms). This driver
+returns `-EIO` for submit status `0x05` and `-ETIMEDOUT` when a poll stays
+pending. Either one, before a capability profile matches, refuses the device.
+This driver's 3.5.8 fan-floor support assumes the older SoC firmware it was
+validated with (**2.155.11**, `0x02009b0b`). The kernel log names that pairing.
+The module does not bind, including no hwmon device, because the mailbox did
+not answer.
+
+On **EC 3.5.8 with that newer SoC**, the path that has been observed to work
+is the ACPI fan device, not this driver:
+
+```sh
+for device in /sys/class/thermal/cooling_device*; do
+  printf '%s type=%s max=%s cur=%s\n' \
+    "$device" "$(cat "$device/type")" \
+    "$(cat "$device/max_state")" "$(cat "$device/cur_state")"
+done
+```
+
+Look for type `Fan` and `max_state` 100. The BIOS maps a level to
+`975 + 33.75 * level` RPM. Observers measured about 4320 RPM at level 100,
+about 1940 at level 30, about 1620 at level 20 with the second fan stalling,
+and both fans stopped at level 0. Do not write a level below 30; those
+observers use 40. Writing either device on that hardware moved both fans.
+This project does not implement that path. On EC 3.13.7 the same write is
+accepted and ignored.
+
 An older experimental driver may already own the relay. Do not load multiple
 fan drivers or run a direct packet client alongside the controller. Restore
 automatic control with the existing owner before replacing it.
@@ -41,8 +102,13 @@ maintenance shutdown and cold power cycle. Do not repeatedly load competing
 probes or access controller MMIO: even a normal-world read of the secure-owned
 eSPI controller caused a watchdog reboot during the original investigation.
 
-An ownership mismatch (`ESTALE` in version 0.1.1) also causes failure: the driver
+An ownership mismatch (`ESTALE`) causes failure: the driver
 will not overwrite an unknown existing floor. Avoid concurrent writers. Version
+0.1.5 uses `ESTALE` only for that mismatch. A reply-guard refusal, where
+recovery will not trust the shared response, returns `EAGAIN`. The daemon
+retries `EAGAIN` after 31 seconds, past the driver's 30-second cooldown, at
+most three times. It does not treat that refusal as fatal. `ESTALE` still
+stops immediately. Version
 0.1.1 remembers its own attempted write and can reconcile it after transport
 recovery, even when acknowledgement or readback failed. Version 0.1.0 could lose
 ownership in this situation. Neither version can restore through a relay that

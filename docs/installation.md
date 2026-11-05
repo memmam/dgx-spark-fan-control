@@ -145,13 +145,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.4/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.4/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.5/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.5/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.4/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.4
-sudo dkms build -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.5/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.5
+sudo dkms build -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -192,7 +192,11 @@ dgx-fan-control status
 ```
 
 Status must start with **`state=0/12`**: the device was found and its added floor
-is unset. Successful `modprobe` alone is insufficient; device probing can still
+is unset. On EC 3.13.7, status may instead print
+`control unsupported on this firmware`: telemetry is up and floor writes were
+rejected. A mailbox timeout prints an error and does not create the hwmon
+device; that is the observed result of EC 3.5.8 with October SoC firmware
+2.158.15. Successful `modprobe` alone is insufficient; device probing can still
 reject the firmware contract. See [troubleshooting](troubleshooting.md) if needed.
 
 ## 5. Choose your startup mode
