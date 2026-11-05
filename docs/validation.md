@@ -4,14 +4,14 @@
 
 Not yet run on DGX hardware. The hardware-free suite covers exact capability
 matches for EC 3.5.8 and EC 3.13.7, rejection of a one-byte change, both floor
-tables, a 3.13.7 unset-write that returns unsupported without a second write,
-the unchanged 3.5.8 confirm path (read only), poll state `0xFF` as
-`-EOPNOTSUPP`, reply-guard `EAGAIN` versus ownership `ESTALE`, the daemon's
-31-second retry, and a curve that never selects state 0 while running. The
-EC 3.13.7 floor numbers and the assumption that poll state `0xFF` is how this
-relay reports an unsupported command are **not** confirmed on a machine.
-EC 3.5.8 with SoC 2.158.15 and the ACPI `Fan` levels are documented from public
-reports, not reproduced here.
+tables, EC 3.13.7 floor writes refused with `-EPERM` unless
+`allow_unverified_writes` is set, poll state `0xFF` as `-EOPNOTSUPP`,
+reply-guard `EAGAIN` versus ownership `ESTALE`, the daemon's 31-second retry,
+a curve that never selects state 0 while running, and a read-only ACPI
+fan-stall watchdog. Probe on EC 3.13.7 sends no floor command by default.
+The EC 3.13.7 floor numbers are **not** confirmed on a machine. EC 3.5.8 with
+SoC 2.158.15, the ACPI `Fan` levels, and the November 2026 stopped-fan reports
+are documented from the owner, not reproduced here.
 
 ## Version 0.1.4 zero-clamp restore
 

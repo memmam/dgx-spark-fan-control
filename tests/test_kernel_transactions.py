@@ -118,6 +118,7 @@ static int mailbox = 8, changing_status, status_reads, invalid_rtc, invalid_head
 static int oem_zero, oem_fail_at, retry_stuck, wedge_operation, ignore_write, repeat_wedge;
 static int stale_reply, overwrite_reply, reply_error, sender_busy, complete_on_oem;
 static int unsupported_after_write;
+static bool allow_unverified_writes;
 static int last_operation = 4;
 static u16 physical_floor, reply_floor;
 static int pending_polls, stuck, submit_count, get_count, write_count;
@@ -200,7 +201,6 @@ int main(int argc, char **argv) {
  oem_peer.ops = &ops; oem_peer.oem = 1;
  struct dgx_ec_fan_control_data data = {
   .ffa_dev = &ffa, .current_state = 3, .profile = &dgx_ec_profiles[0]};
- u16 floor = 0;
  struct thermal_cooling_device cdev = {.devdata = &data};
  unsigned long state = 999;
  physical_floor = reply_floor = 4500;
@@ -396,40 +396,18 @@ int main(int argc, char **argv) {
   poll_state_override = -1; transport_error_once = -EAGAIN;
   assert(dgx_ec_set_cur_state(&cdev, 5) == -EAGAIN);
   assert(submit_count == 0 && write_count == 0);
- } else if (!strcmp(argv[1], "confirm_358_read_only")) {
-  assert(!strcmp(dgx_ec_profiles[0].name, "EC 3.5.8"));
-  assert(dgx_ec_confirm_floor_control(&data, &floor) == 0);
-  assert(floor == 4500 && write_count == 0);
- } else if (!strcmp(argv[1], "confirm_3137_unsupported")) {
+ } else if (!strcmp(argv[1], "profile_3137_writes_require_opt_in")) {
   data.profile = &dgx_ec_profiles[1];
   data.current_state = 0;
   physical_floor = reply_floor = UINT16_MAX;
-  unsupported_after_write = 1;
+  allow_unverified_writes = 0;
   assert(!strcmp(data.profile->name, "EC 3.13.7"));
-  assert(data.profile->telemetry_if_floor_unsupported);
-  assert(dgx_ec_confirm_floor_control(&data, &floor) == -EOPNOTSUPP);
-  assert(write_count == 1 && physical_floor == UINT16_MAX && floor == UINT16_MAX);
-  assert(dgx_ec_bind_telemetry_only(data.profile, -EOPNOTSUPP));
-  assert(dgx_ec_bind_telemetry_only(data.profile, -EREMOTEIO));
-  assert(dgx_ec_bind_telemetry_only(data.profile, -EIO));
-  assert(!dgx_ec_bind_telemetry_only(data.profile, -ETIMEDOUT));
-  assert(!dgx_ec_bind_telemetry_only(data.profile, -ESTALE));
-  assert(!dgx_ec_bind_telemetry_only(&dgx_ec_profiles[0], -EOPNOTSUPP));
- } else if (!strcmp(argv[1], "confirm_3137_accepted")) {
-  data.profile = &dgx_ec_profiles[1];
-  data.current_state = 0;
-  physical_floor = reply_floor = UINT16_MAX;
-  assert(dgx_ec_confirm_floor_control(&data, &floor) == 0);
-  assert(floor == UINT16_MAX && write_count == 1);
+  assert(dgx_ec_set_cur_state(&cdev, 12) == -EPERM);
+  assert(write_count == 0 && physical_floor == UINT16_MAX);
+  allow_unverified_writes = 1;
   assert(dgx_ec_set_cur_state(&cdev, 12) == 0 && physical_floor == 4350);
   assert(dgx_ec_set_cur_state(&cdev, 1) == 0 && physical_floor == 1256);
   assert(physical_floor == dgx_ec_profiles[1].floors[1]);
- } else if (!strcmp(argv[1], "confirm_3137_ec_error")) {
-  data.profile = &dgx_ec_profiles[1];
-  physical_floor = reply_floor = UINT16_MAX;
-  poll_state_override = 1;
-  assert(dgx_ec_confirm_floor_control(&data, &floor) == -EREMOTEIO);
-  assert(write_count == 0);
  } else { assert(!"unknown case"); }
  return 0;
 }
@@ -453,8 +431,7 @@ class KernelTransactionTests(unittest.TestCase):
             "dgx_ec_reconcile_floor", "dgx_ec_read_fixed", "dgx_ec_valid_rtc",
             "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_recover_pending",
             "dgx_ec_preflight", "dgx_ec_read_operation", "dgx_ec_write_lower_floor",
-            "dgx_ec_read_lower_floor", "dgx_ec_bind_telemetry_only",
-            "dgx_ec_confirm_floor_control",
+            "dgx_ec_read_lower_floor",
             "dgx_ec_restore_automatic_locked", "dgx_ec_restore_automatic",
             "dgx_ec_get_cur_state", "dgx_ec_set_cur_state",
         )
@@ -473,8 +450,7 @@ class KernelTransactionTests(unittest.TestCase):
             "zero_clamp",
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
-            "confirm_358_read_only", "confirm_3137_unsupported",
-            "confirm_3137_accepted", "confirm_3137_ec_error",
+            "profile_3137_writes_require_opt_in",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):

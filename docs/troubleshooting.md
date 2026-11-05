@@ -38,10 +38,12 @@ echo 'file dgx_ec_fan_control.c +p' | sudo tee /sys/kernel/debug/dynamic_debug/c
 On EC 3.13.7 the override handlers are still present, but they return
 unsupported (`-5`) or timeout (`-116`) while their enable bit is clear. Host
 command `0xEB` now refuses writes to the fan/thermal block, so that bit cannot
-be set from the host. Expect floor writes to fail. A successful capability
-read followed by a rejected floor command binds **hwmon telemetry only**.
-There is no `dgx_ec_fan_floor` cooling device, and the daemon must not keep
-retrying writes.
+be set from the host. Expect floor writes to fail. Probe does not send one. After the capability
+reply matches, it reads telemetry and binds **hwmon only**. There is no
+`dgx_ec_fan_floor` cooling device, and the daemon must not keep retrying
+writes. `allow_unverified_writes=1` at `insmod` or `modprobe` opts into floor
+commands and logs a warning. The parameter defaults off and cannot be turned
+on after the module is loaded.
 
 ```sh
 dgx-fan-control status

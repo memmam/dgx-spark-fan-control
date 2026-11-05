@@ -76,10 +76,12 @@ bit is clear. What changed is host command **0xEB**: it now honors a permission
 table that marks the fan/thermal register block read-only, so the host can no
 longer set that enable bit. This is deliberate access control. Floor writes on
 3.13.7 are therefore expected to fail. Version 0.1.5 still accepts the exact
-capability reply. If the floor command is rejected, the module registers hwmon
-telemetry only and does not create a cooling device. `dgx-fan-control status`
-then prints `control unsupported on this firmware`. The 3.13.7 state table,
-used only if a write is actually accepted, is **not qualified**.
+capability reply. Probe on that profile reads capabilities and telemetry only.
+It does not send a floor command, and it does not create a cooling device.
+`dgx-fan-control status` then prints `control unsupported on this firmware`.
+Floor writes require `allow_unverified_writes=1` at module load, which logs a
+warning. The 3.13.7 state table behind that switch is **not qualified**. Do
+not enable it to test a machine whose fans have stopped.
 
 On **EC 3.5.8 plus the October SoC**, the alternative that has been observed to
 work is the ACPI fan device: `/sys/class/thermal/cooling_device*` with type
@@ -99,9 +101,10 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.5** recognizes the EC 3.13.7 capability reply, binds telemetry
-only when floor control is rejected, and tells a probe timeout apart from that
-case. The performance curve never requests state 0 while the daemon is running.
+Version **0.1.5** recognizes the EC 3.13.7 capability reply and binds telemetry
+only, with no floor command, unless `allow_unverified_writes=1`. It tells a
+probe timeout apart from that case. The performance curve never requests
+state 0 while the daemon is running.
 A reply-guard recovery refusal is retried after the 30-second cooldown; a
 foreign floor remains fatal. Version **0.1.4** keeps a loaded module on NVIDIA's
 curve when the performance service is not running. State 0 is that curve. A
@@ -120,6 +123,32 @@ timing and recovery observations without extra EC traffic, and the
 Orderly stop, suspend, reboot, and module removal request and verify automatic
 control. A hard crash or transport failure can prevent restoration; manual
 floors have no expiry timer. Read the [validation and limitations](docs/validation.md).
+
+## Known issues
+
+Owner-reported on two DGX Sparks on 5 Nov 2026 (EC `0x03000d07`, kernel
+`7.0.0-1024-nvidia`, BIOS `5.36_0ACUM028`). These are observations, not a
+verified cause.
+
+Twice, a Spark's ACPI fans (`acpi_fan` hwmon `fan1_input`) read a flat 0 RPM.
+Once the machine was idle, the external fan rig was off, and the SoC reached
+79°C. Once it was a cold boot, about 42°C. The stock 0.1.4 module was loaded
+through DKMS but probe had already failed with `-EBADMSG` after the capability
+read only, so no fan command had been sent. It is not believed to be the
+cause. A shutdown and a 30-second power pull cleared both events.
+
+External chassis fans (a front and rear rig) blowing through the unit lower
+the Spark's own fan RPM by about 400–500 total. Rear fans alone are about
+100 RPM. The change is smooth and reversible. Toggling the rig on and off
+repeatedly while the machine was running never produced a 0 RPM reading. The
+suspected trigger is boot-time state: boot order against external airflow, or
+the EC stopping its own fans. That has not been tested.
+
+Anyone running external airflow should read `fan1_input` after every boot. A
+watchdog should treat 0 RPM on both fans with the SoC above about 70°C as a
+fault. `sudo dgx-fan-control watchdog` does that from userspace. It only
+reads `acpi_fan` and `thermal_zone0`. It does not need this kernel module.
+The default action is `systemctl poweroff`.
 
 ## Development
 

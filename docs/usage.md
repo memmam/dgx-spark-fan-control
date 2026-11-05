@@ -201,7 +201,9 @@ are not scaled onto it. States 1–12 divide the reported span:
 | 6 | 2,662 | | |
 
 Public EC image diffs say this write is rejected because the override enable
-bit can no longer be set. The driver then does not register a cooling device.
+bit can no longer be set. Probe does not try it. There is no cooling device
+unless the module was loaded with `allow_unverified_writes=1`, which logs a
+warning and is not qualified.
 Do not treat this column as a measured RPM result. It is also unknown whether
 a future firmware that accepted the write would interpret the numbers as tach
 RPM or as the older PWM control encoding. ACPI level 0 on the 975–4350 scale
@@ -228,3 +230,21 @@ done
 
 `status` shows the requested state and hottest thermal zone; the hwmon files
 show measured RPM. If a command fails, see [troubleshooting](troubleshooting.md).
+
+## Watch for stopped fans
+
+This only reads. It does not load the kernel module and does not write a fan
+control. It watches every `fan*_input` under hwmon devices named `acpi_fan`,
+and `thermal_zone0`. If fewer than two fan inputs are visible it does not
+trip. If every one of them stays at 0 RPM for more than 10 seconds while
+`thermal_zone0` is at least 70°C, it logs at critical level and runs
+`systemctl poweroff`.
+
+```sh
+sudo dgx-fan-control watchdog
+```
+
+`--zero-seconds`, `--soc-celsius`, and `--action` change the hold time, the
+temperature, and the command. The action is one program plus arguments, not a
+shell pipeline. See the [known issues](../README.md#known-issues) before
+enabling this on a machine that uses external fans.

@@ -41,9 +41,8 @@ mailbox status byte is `0x00` on success and `0xFF` when the command is
 unsupported. Success status `0x00` is the same encoding as poll state 0. This
 driver treats poll state `0xFF` as `-EOPNOTSUPP` rather than as a malformed
 packet. Whether EC 3.13.7's relay forwards `0xFF` in that byte has not been
-confirmed on this driver's path. An EC error (poll state 1, `-EREMOTEIO`) or
-`-EIO` from a floor command is handled the same way when the matched profile
-allows a telemetry-only bind. A timeout is not that case.
+confirmed on this driver's path. Probe does not send a floor command on
+EC 3.13.7 unless `allow_unverified_writes=1` was set when the module was loaded.
 
 ### Capability profiles
 
@@ -54,7 +53,7 @@ parsed fields and, at debug level, the raw capability bytes.
 | Profile | Fan 0 | Fan 1 | Floor commands |
 | --- | --- | --- | --- |
 | EC 3.5.8 | 1260–9000 | 1890–13500 | Required. A rejection fails probe. |
-| EC 3.13.7 | 975–4350 | 975–4350 | Expected to be rejected. Probe then registers hwmon only. |
+| EC 3.13.7 | 975–4350 | 975–4350 | Not sent. Probe reads capabilities and telemetry only. |
 
 The 3.5.8 numbers are RPM-mode control ranges. The EC converts a floor to PWM
 against each fan's range. They are not a tachometer scale. The 3.13.7 numbers
@@ -63,11 +62,12 @@ comparison of the EC images shows the override handlers and dispatch table
 unchanged between these versions. The handlers return **-5 unsupported** or
 **-116 timeout** when an enable bit is clear. Host command `0xEB` now applies a
 permission table that already marked the fan/thermal block read-only, so the
-host can no longer set that bit. A constant unset (`0xffff`) floor read is
-therefore not proof that writes work. On the 3.13.7 profile, probe confirms
-with one documented write of the unset value. That write does not raise a
-floor. If it is rejected, no cooling device is registered. If it is accepted,
-the state table below is used and the kernel log says the table is unverified.
+host can no longer set that bit. Probe on this profile does not read or write
+the floor. It registers hwmon only, with no cooling device. Floor writes are
+possible only when the module is loaded with `allow_unverified_writes=1`.
+That logs a warning: the state table below is unverified, and a Spark has
+been observed with both fans stopped until a power pull. Do not set the
+parameter to discover whether writes work.
 
 EC 3.5.8 support also assumes SoC firmware that still completes this mailbox.
 The qualified SoC is **2.155.11** (`0x02009b0b`). October SoC **2.158.15**

@@ -253,6 +253,89 @@ class UserlandFailureTests(unittest.TestCase):
                 self.assertEqual(CONTROL.main([*argv, "set-state", "1"]), 1)
                 self.assertEqual(CONTROL.main([*argv, "automatic"]), 1)
 
+    def test_stall_requires_both_fans_hot_for_more_than_ten_seconds(self):
+        self.assertFalse(CONTROL.fans_stalled([0, 0], 70.0, 10.0))
+        self.assertTrue(CONTROL.fans_stalled([0, 0], 70.0, 10.01))
+        self.assertFalse(CONTROL.fans_stalled([0, 0], 69.9, 30.0))
+        self.assertFalse(CONTROL.fans_stalled([0, 400], 90.0, 30.0))
+        self.assertFalse(CONTROL.fans_stalled([0], 90.0, 30.0))
+        self.assertEqual(CONTROL.WATCHDOG_DEFAULT_ACTION, "systemctl poweroff")
+
+    def test_watchdog_reads_acpi_fans_without_the_kernel_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal" / "thermal_zone0"
+            thermal.mkdir(parents=True)
+            (thermal / "temp").write_text("79000\n", encoding="ascii")
+            for index in (0, 1):
+                device = root / "hwmon" / f"hwmon{index}"
+                device.mkdir(parents=True)
+                (device / "name").write_text("acpi_fan\n", encoding="ascii")
+                (device / "fan1_input").write_text("0\n", encoding="ascii")
+            clock = [0.0]
+            stop = Event()
+            actions = []
+
+            def wait(delay):
+                clock[0] += delay
+                if clock[0] > 30:
+                    stop.set()
+
+            def runner(action):
+                actions.append(action)
+                return 0
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    poll_seconds=2,
+                    zero_seconds=10,
+                    soc_celsius=70,
+                    monotonic=lambda: clock[0],
+                    runner=runner,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
+            self.assertTrue(any("fan stall" in line for line in logs.output))
+            self.assertFalse((root / "thermal").joinpath("cooling_device0").exists())
+            self.assertEqual((root / "hwmon" / "hwmon0" / "fan1_input").read_text(), "0\n")
+
+    def test_watchdog_does_not_trip_when_cool_or_a_fan_spins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal" / "thermal_zone0"
+            thermal.mkdir(parents=True)
+            (thermal / "temp").write_text("42000\n", encoding="ascii")
+            device = root / "hwmon" / "hwmon0"
+            device.mkdir(parents=True)
+            (device / "name").write_text("acpi_fan\n", encoding="ascii")
+            (device / "fan1_input").write_text("0\n", encoding="ascii")
+            (device / "fan2_input").write_text("2000\n", encoding="ascii")
+            clock = [0.0]
+            stop = Event()
+            actions = []
+
+            def wait(delay):
+                clock[0] += delay
+                stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="INFO"):
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [])
+
     def test_expected_daemon_error_uses_nonrestart_exit_status(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")), \
              self.assertLogs(CONTROL.LOG, level="ERROR"):

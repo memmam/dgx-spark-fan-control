@@ -46,6 +46,8 @@ class KernelContractTests(unittest.TestCase):
             "clearing zero lower clamp",
             "DGX_EC_STATUS_UNSUPPORTED",
             "registering hwmon telemetry only, no cooling device",
+            "allow_unverified_writes",
+            "module_param(allow_unverified_writes, bool, 0444)",
             "October SoC 2.158.15",
             "Do not write a level below 30",
             "ret = -EAGAIN",
@@ -60,6 +62,7 @@ class KernelContractTests(unittest.TestCase):
         self.assertIn("dgx_ec_restore_automatic(data, \"module load\")", SOURCE)
         self.assertIn("DGX_EC_RESTORE_ATTEMPTS", SOURCE)
         self.assertIn("thermal_cooling_device_register", SOURCE)
+        self.assertNotIn("dgx_ec_confirm_floor_control", SOURCE)
 
 
 class UserlandPolicyTests(unittest.TestCase):

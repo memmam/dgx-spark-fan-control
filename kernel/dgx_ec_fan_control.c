@@ -12,10 +12,10 @@
  * clear it, so loading this module without the performance service stays on
  * the firmware curve.
  *
- * EC 3.13.7 reports a different capability span and is expected to reject
- * floor commands. Probe then registers hwmon telemetry only. A mailbox
- * timeout refuses the device: EC 3.5.8 control assumes the older SoC
- * firmware this driver was validated with.
+ * EC 3.13.7 reports a different capability span. Probe on that profile is
+ * read-only (capabilities and telemetry only) unless allow_unverified_writes
+ * is set. A mailbox timeout refuses the device: EC 3.5.8 control assumes
+ * the older SoC firmware this driver was validated with.
  */
 
 #include <linux/arm_ffa.h>
@@ -30,6 +30,7 @@
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/reboot.h>
@@ -170,6 +171,16 @@ static const struct dgx_ec_fan_profile dgx_ec_profiles[] = {
 		},
 	},
 };
+
+/*
+ * EC 3.13.7 probe issues no floor command unless this is set at load time.
+ * It is not writable after load, so a running module cannot gain a write
+ * path it did not advertise.
+ */
+static bool allow_unverified_writes;
+module_param(allow_unverified_writes, bool, 0444);
+MODULE_PARM_DESC(allow_unverified_writes,
+		 "Allow unverified floor writes on EC 3.13.7 (default N)");
 
 struct dgx_ec_fan_capabilities {
 	u8 revision;
@@ -742,6 +753,14 @@ static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 	u16 floor;
 	int ret;
 
+	if (data->profile && data->profile->telemetry_if_floor_unsupported &&
+	    !allow_unverified_writes) {
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"refusing %s floor write without allow_unverified_writes=1\n",
+			data->profile->name);
+		return -EPERM;
+	}
+
 	ret = dgx_ec_preflight(data, DGX_EC_FAN_SET_LOWER_LIMIT);
 	if (ret)
 		return ret;
@@ -836,13 +855,6 @@ static int dgx_ec_profiles_valid(void)
 	}
 
 	return 1;
-}
-
-/* EC error, eSPI status -EIO, or explicit 0xFF. Not a timeout or a foreign floor. */
-static bool dgx_ec_bind_telemetry_only(const struct dgx_ec_fan_profile *profile, int ret)
-{
-	return profile && profile->telemetry_if_floor_unsupported &&
-		(ret == -EOPNOTSUPP || ret == -EREMOTEIO || ret == -EIO);
 }
 
 static int dgx_ec_read_capabilities(struct dgx_ec_fan_control_data *data)
@@ -1180,49 +1192,13 @@ static DEFINE_SIMPLE_DEV_PM_OPS(dgx_ec_fan_control_pm_ops,
 				dgx_ec_fan_control_suspend,
 				dgx_ec_fan_control_resume);
 
-/*
- * On EC 3.13.7 a successful capability read does not prove the floor slot
- * still accepts commands. A constant unset read is what a removed override
- * returns, so confirm with one documented unset write. That write does not
- * raise a floor. 3.5.8 only reads here; its existing probe path is unchanged.
- * *floor stays at the last successful read when a later write is rejected.
- */
-static int dgx_ec_confirm_floor_control(struct dgx_ec_fan_control_data *data,
-					u16 *floor)
-{
-	u16 current;
-	int ret;
-
-	if (!data->profile)
-		return -EBADMSG;
-	ret = dgx_ec_read_lower_floor(data, floor);
-	if (ret || !data->profile->telemetry_if_floor_unsupported)
-		return ret;
-	current = *floor;
-	if (current != DGX_EC_LIMIT_UNSET && current != DGX_EC_LIMIT_STOPPED)
-		return 0;
-
-	ret = dgx_ec_write_lower_floor(data, DGX_EC_LIMIT_UNSET);
-	if (ret)
-		return ret;
-	ret = dgx_ec_read_lower_floor(data, floor);
-	if (ret)
-		return ret;
-	if (*floor != DGX_EC_LIMIT_UNSET)
-		return -EIO;
-	if (current == DGX_EC_LIMIT_STOPPED)
-		dev_warn(&data->ffa_dev->dev,
-			 "clearing zero lower clamp; restoring NVIDIA fan curve\n");
-	return 0;
-}
-
 static int dgx_ec_probe_failed(struct ffa_device *ffa_dev, int ret)
 {
 	/*
 	 * Poll exhaustion is -ETIMEDOUT. Submit status 0x05 (eSPI read failed),
 	 * reported elsewhere as a 54 ms timeout, is -EIO in this driver. Both
-	 * mean the mailbox did not complete. EC 3.13.7 floor rejection uses a
-	 * different errno and does not reach here when telemetry still reads.
+	 * mean the mailbox did not complete. EC 3.13.7 probe does not send a
+	 * floor command, so this path is the capability or telemetry read.
 	 */
 	if (ret == -ETIMEDOUT || ret == -EIO)
 		return dev_err_probe(&ffa_dev->dev, ret,
@@ -1256,40 +1232,36 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 	ret = dgx_ec_read_capabilities(data);
 	if (ret)
 		goto unlock;
-	ret = dgx_ec_confirm_floor_control(data, &floor);
 	/*
-	 * Capability reads that time out never get here. A floor failure after
-	 * the 3.13.7 profile matched, including the enable-bit timeout, tries
-	 * telemetry before refusing the device. 3.5.8 still fails closed.
+	 * EC 3.13.7 stays read-only: capabilities and telemetry, then hwmon.
+	 * No floor read and no floor write. Opting in is explicit and logged.
 	 */
-	if (ret && data->profile->telemetry_if_floor_unsupported &&
-	    (dgx_ec_bind_telemetry_only(data->profile, ret) || ret == -ETIMEDOUT)) {
-		dev_warn(&ffa_dev->dev,
-			 "%s floor control rejected (%d); registering hwmon telemetry only, no cooling device\n",
-			 data->profile->name, ret);
-		if (floor == DGX_EC_LIMIT_STOPPED)
-			dev_warn(&ffa_dev->dev,
-				 "zero lower clamp remains; floor write was rejected\n");
-		data->floor_uncertain = false;
+	if (data->profile->telemetry_if_floor_unsupported &&
+	    !allow_unverified_writes) {
+		dev_info(&ffa_dev->dev,
+			 "%s floor writes disabled; registering hwmon telemetry only, no cooling device\n",
+			 data->profile->name);
 		bind_control = false;
-		ret = 0;
-	}
-	if (ret)
-		goto unlock;
-	if (bind_control && floor == DGX_EC_LIMIT_STOPPED) {
-		ret = dgx_ec_restore_automatic_locked(data);
+	} else {
+		if (data->profile->telemetry_if_floor_unsupported)
+			dev_warn(&ffa_dev->dev,
+				 "allow_unverified_writes=1: %s floor table is unverified; floor commands are enabled\n",
+				 data->profile->name);
+		ret = dgx_ec_read_lower_floor(data, &floor);
 		if (ret)
 			goto unlock;
-	} else if (bind_control && floor != DGX_EC_LIMIT_UNSET) {
-		dev_err(&ffa_dev->dev,
-			"refusing to replace existing lower floor %#x\n", floor);
-		ret = -EBUSY;
-		goto unlock;
+		if (floor == DGX_EC_LIMIT_STOPPED) {
+			ret = dgx_ec_restore_automatic_locked(data);
+			if (ret)
+				goto unlock;
+		} else if (floor != DGX_EC_LIMIT_UNSET) {
+			dev_err(&ffa_dev->dev,
+				"refusing to replace existing lower floor %#x\n",
+				floor);
+			ret = -EBUSY;
+			goto unlock;
+		}
 	}
-	if (bind_control && data->profile->telemetry_if_floor_unsupported)
-		dev_warn(&ffa_dev->dev,
-			 "%s accepted a floor command; the state table is unverified\n",
-			 data->profile->name);
 	ret = dgx_ec_refresh(data);
 	if (ret)
 		goto unlock;

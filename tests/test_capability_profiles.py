@@ -124,13 +124,6 @@ int main(void) {
  caps = caps_from(raw_358);
  caps.unit_mode = 1;
  assert(dgx_ec_match_profile(&caps) == NULL);
- assert(!dgx_ec_bind_telemetry_only(older, -EOPNOTSUPP));
- assert(dgx_ec_bind_telemetry_only(newer, -EOPNOTSUPP));
- assert(dgx_ec_bind_telemetry_only(newer, -EREMOTEIO));
- assert(dgx_ec_bind_telemetry_only(newer, -EIO));
- assert(!dgx_ec_bind_telemetry_only(newer, -ETIMEDOUT));
- assert(!dgx_ec_bind_telemetry_only(newer, -ESTALE));
- assert(!dgx_ec_bind_telemetry_only(newer, -EBADMSG));
  return 0;
 }
 '''
@@ -147,7 +140,6 @@ class CapabilityProfileTests(unittest.TestCase):
             brace_block(SOURCE, "static const struct dgx_ec_fan_profile dgx_ec_profiles[]"),
             extract_function(SOURCE, "dgx_ec_match_profile"),
             extract_function(SOURCE, "dgx_ec_profiles_valid"),
-            extract_function(SOURCE, "dgx_ec_bind_telemetry_only"),
             MAIN,
         ]
         with tempfile.TemporaryDirectory(prefix="dgx-profiles-") as directory:

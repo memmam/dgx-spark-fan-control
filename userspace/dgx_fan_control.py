@@ -7,14 +7,22 @@ import argparse
 import errno
 import logging
 import math
+import shlex
 import signal
+import subprocess
 import sys
+import time
 from threading import Event
 from pathlib import Path
 
 COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
 HWMON_DEVICE_NAME = "dgx_ec_fan"
+ACPI_FAN_NAME = "acpi_fan"
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
+WATCHDOG_POLL_SECONDS = 2.0
+WATCHDOG_ZERO_SECONDS = 10.0
+WATCHDOG_SOC_CELSIUS = 70.0
+WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 MAX_STATE = 12
 MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
@@ -90,6 +98,125 @@ def find_fan_hwmon(hwmon_root: Path) -> Path | None:
             f"expected at most one {HWMON_DEVICE_NAME!r} hwmon device, found {len(matches)}"
         )
     return matches[0] if matches else None
+
+
+def read_thermal_zone_c(thermal_root: Path, zone: str = "thermal_zone0") -> float:
+    text = (thermal_root / zone / "temp").read_text(encoding="ascii").strip()
+    millidegrees = int(text)
+    if not 0 <= millidegrees <= 200_000:
+        raise RuntimeError(f"{zone} temperature is outside the accepted range")
+    return millidegrees / 1000.0
+
+
+def read_named_fan_rpms(hwmon_root: Path, device_name: str = ACPI_FAN_NAME) -> list[int]:
+    """RPM inputs for one hwmon name. Does not require this project's module."""
+    readings = []
+    for device in sorted(hwmon_root.glob("hwmon*")):
+        try:
+            name = (device / "name").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if name != device_name:
+            continue
+        for path in sorted(device.glob("fan*_input")):
+            readings.append(int(path.read_text(encoding="ascii").strip()))
+    return readings
+
+
+def fans_stalled(fan_rpms: list[int], soc_c: float, held_seconds: float, *,
+                 soc_limit_c: float = WATCHDOG_SOC_CELSIUS,
+                 zero_seconds: float = WATCHDOG_ZERO_SECONDS) -> bool:
+    """True only after every fan has read 0 RPM for longer than zero_seconds."""
+    if len(fan_rpms) < 2 or any(rpm != 0 for rpm in fan_rpms):
+        return False
+    if not math.isfinite(soc_c) or soc_c < soc_limit_c:
+        return False
+    if not math.isfinite(held_seconds) or not math.isfinite(zero_seconds):
+        return False
+    return held_seconds > zero_seconds
+
+
+def run_watchdog_action(action: str) -> int:
+    argv = shlex.split(action)
+    if not argv:
+        raise ValueError("watchdog action is empty")
+    completed = subprocess.run(argv, check=False)
+    return completed.returncode
+
+
+def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
+                 poll_seconds: float = WATCHDOG_POLL_SECONDS,
+                 zero_seconds: float = WATCHDOG_ZERO_SECONDS,
+                 soc_celsius: float = WATCHDOG_SOC_CELSIUS,
+                 action: str = WATCHDOG_DEFAULT_ACTION,
+                 monotonic=None, runner=None) -> int:
+    """Read ACPI fan tachometers and thermal_zone0. Never writes a fan control."""
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("poll interval must be finite and positive")
+    if not math.isfinite(zero_seconds) or zero_seconds < 0:
+        raise ValueError("zero interval must be finite and non-negative")
+    if not math.isfinite(soc_celsius):
+        raise ValueError("SoC threshold must be finite")
+    if monotonic is None:
+        monotonic = time.monotonic
+    if runner is None:
+        runner = run_watchdog_action
+    stop_requested = Event()
+
+    def request_stop(signum: int, frame: object) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    LOG.critical(
+        "fan-stall watchdog watching ACPI fans and thermal_zone0; "
+        "0 RPM on every fan for more than %.0fs at >=%.0fC runs %s",
+        zero_seconds, soc_celsius, action,
+    )
+    fault_since: float | None = None
+    announced_shortage = False
+    while not stop_requested.is_set():
+        try:
+            fan_rpms = read_named_fan_rpms(hwmon_root)
+            soc_c = read_thermal_zone_c(thermal_root)
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            LOG.exception("fan-stall observation failed; not treating it as a stall")
+            fault_since = None
+        else:
+            if len(fan_rpms) < 2:
+                if not announced_shortage:
+                    LOG.warning(
+                        "fan-stall watchdog sees %d ACPI fan input(s); "
+                        "it will not trip until two are present",
+                        len(fan_rpms),
+                    )
+                    announced_shortage = True
+                fault_since = None
+            elif all(rpm == 0 for rpm in fan_rpms) and soc_c >= soc_celsius:
+                now = monotonic()
+                if fault_since is None:
+                    fault_since = now
+                held = now - fault_since
+                if fans_stalled(fan_rpms, soc_c, held, soc_limit_c=soc_celsius,
+                                zero_seconds=zero_seconds):
+                    LOG.critical(
+                        "fan stall: ACPI fans read %s RPM for %.1fs while "
+                        "thermal_zone0 is %.1fC; running %s",
+                        fan_rpms, held, soc_c, action,
+                    )
+                    status = runner(action)
+                    if status != 0:
+                        LOG.critical("fan-stall action exited %s", status)
+                        return status if isinstance(status, int) else 1
+                    return 0
+            else:
+                fault_since = None
+                announced_shortage = False
+        if stop_requested.is_set():
+            break
+        stop_requested.wait(poll_seconds)
+    LOG.info("fan-stall watchdog stopped")
+    return 0
 
 
 def require_control(thermal_root: Path, hwmon_root: Path) -> Path:
@@ -275,6 +402,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     daemon = subparsers.add_parser("daemon", help="run the smooth performance curve")
     daemon.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    watchdog = subparsers.add_parser(
+        "watchdog",
+        help="read ACPI fans and power off if both stay at 0 RPM while hot",
+    )
+    watchdog.add_argument("--poll-seconds", type=float, default=WATCHDOG_POLL_SECONDS)
+    watchdog.add_argument("--zero-seconds", type=float, default=WATCHDOG_ZERO_SECONDS)
+    watchdog.add_argument("--soc-celsius", type=float, default=WATCHDOG_SOC_CELSIUS)
+    watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
     subparsers.add_parser("automatic", help="restore firmware-automatic policy")
@@ -288,6 +423,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "daemon":
             return run_daemon(args.thermal_root, args.poll_seconds, args.hwmon_root)
+        if args.command == "watchdog":
+            return run_watchdog(
+                args.thermal_root,
+                args.hwmon_root,
+                poll_seconds=args.poll_seconds,
+                zero_seconds=args.zero_seconds,
+                soc_celsius=args.soc_celsius,
+                action=args.action,
+            )
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
