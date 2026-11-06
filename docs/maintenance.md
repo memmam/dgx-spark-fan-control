@@ -100,7 +100,10 @@ Then follow the route you originally installed:
 Refresh the command, the three unit files, and the motd snippet, then load
 and check the new module. The full update steps, including when to restart
 each service, are in
-[Updating an existing install](installation.md#6-updating-an-existing-install).
+[Update the userspace](installation.md#6-update-the-userspace). Rebuild the
+module only when that section's version check says to, using
+[7A](installation.md#7a-update-the-module-with-dkms) or
+[7B](installation.md#7b-update-the-module-by-hand).
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control

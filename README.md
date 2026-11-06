@@ -15,7 +15,7 @@ apply its own cooling policy throughout.
 | Rebuild automatically for kernel updates | [DKMS installation](docs/installation.md#3a-dkms-builds-for-kernel-updates) |
 | Build and sign a module myself | [Manual installation](docs/installation.md#3b-manual-build-and-sign) |
 | Choose what runs at boot | [Startup modes](docs/installation.md#5-choose-your-startup-mode) |
-| Update an install you already have | [Updating an existing install](docs/installation.md#6-updating-an-existing-install) |
+| Update an install you already have | [Update the userspace](docs/installation.md#6-update-the-userspace) |
 | Turn the fans up before a big job | [Pre-cooling](docs/usage.md#pre-cool-before-a-big-job) |
 | Restore the factory fan curve afterward | [NVIDIA automatic control](docs/usage.md#return-to-nvidia-automatic-control) |
 | Upgrade or remove the software | [Updates and removal](docs/maintenance.md) |

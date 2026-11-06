@@ -349,32 +349,30 @@ The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
 Continue to [pre-cooling and everyday usage](usage.md).
 
-## 6. Updating an existing install
+## 6. Update the userspace
 
-Do the userspace steps on every update. Update the kernel module only when
-this checkout changes files under `kernel/`, which this update does. Check
-before rebuilding:
+Do this on every update. It does not rebuild the kernel module.
 
 ```sh
-modinfo dgx_ec_fan_control | grep ^version:
+git pull
 ```
 
-Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
-(currently `0.1.6`). If they already match and `kernel/` did not change,
-stop after the userspace steps. Otherwise use the same module route you
-installed with: [6A](#6a-dkms-module-update) or
-[6B](#6b-manual-module-update).
+Reinstall the command, every unit file, and the motd snippet. Copying only
+`dgx-fan-control.service` leaves the watchdog unit missing, and `status`
+then shows `watchdog-enabled: not-found`. Leave an existing
+`/etc/default/dgx-fan-control` in place so a `BUSY_CHECK`, `READY_CHECK`,
+or `MANUAL_STATE` you already set is kept. Install the template only when
+the file is absent. New optional keys in `systemd/dgx-fan-control.default`,
+such as `PROGRESS_CHECK` and `STUCK_SECONDS`, are not merged into an
+existing `/etc/default` file. Copy the ones you want by hand. Do not
+replace `/etc/modprobe.d/dgx-fan-control-owned.conf` if `set-state` wrote
+it; that file is how the next load receives `owned_state` and
+`owned_floor`.
 
-### Userspace steps
-
-After `git pull`, reinstall the command, every unit file, and the motd
-snippet. Copying only `dgx-fan-control.service` leaves the watchdog unit
-missing, and `status` then shows `watchdog-enabled: not-found`. Leave an
-existing `/etc/default/dgx-fan-control` in place so a `BUSY_CHECK`,
-`READY_CHECK`, or `MANUAL_STATE` you already set is kept. Install the
-template only when the file is absent. Do not replace
-`/etc/modprobe.d/dgx-fan-control-owned.conf` if `set-state` wrote it; that
-file is how the next load receives `owned_state` and `owned_floor`.
+If the watchdog unit was not installed yet, `is-active` does not enable it.
+Use the manual install in [section 5](#5-choose-your-startup-mode), including
+`systemctl enable --now dgx-fan-watchdog.service`. Restart the performance
+daemon only when it is already active. Do not enable it from this update.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
@@ -401,14 +399,28 @@ fi
 if systemctl is-active --quiet dgx-fan-control.service; then
   sudo systemctl restart dgx-fan-control.service
 fi
+dgx-fan-control health
 ```
 
-If the watchdog unit was not installed yet, `is-active` does not enable it.
-Use the manual install in [section 5](#5-choose-your-startup-mode), including
-`systemctl enable --now dgx-fan-watchdog.service`. Restart the performance
-daemon only when it is already active. Do not enable it from this update.
+`health` is not run with sudo. Do not write an ACPI fan level for this check.
 
-## 6A. DKMS module update
+Update the kernel module only when this checkout changes files under
+`kernel/`. Compare the loaded module with this checkout:
+
+```sh
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
+(currently `0.1.6`). If they already match and `kernel/` did not change,
+stop here. Otherwise use the same module route you installed with:
+[7A](#7a-update-the-module-with-dkms) or
+[7B](#7b-update-the-module-by-hand).
+
+## 7A. Update the module with DKMS
+
+Do section 6 first. Run this only after `git pull` in section 6; building
+before the pull rebuilds the old source under the new version number.
 
 Use this when the original install was [3A](#3a-dkms-builds-for-kernel-updates).
 DKMS signs with the enrolled MOK already configured in
@@ -450,7 +462,10 @@ modinfo dgx_ec_fan_control | grep ^version:
 
 `health` is not run with sudo. Do not write an ACPI fan level for this check.
 
-## 6B. Manual module update
+## 7B. Update the module by hand
+
+Do section 6 first. Run this only after `git pull` in section 6; building
+before the pull rebuilds the old source under the new version number.
 
 Use this when the original install was
 [3B](#3b-manual-build-and-sign). Build and sign with the enrolled MOK, then
@@ -466,7 +481,7 @@ modinfo -F signer dgx_ec_fan_control
 
 Run `./scripts/build-sign` as the user who owns the key. The script does not
 install or load the module. An unsigned module will not load while Secure
-Boot is enforced. Then the same unload, reload, and health check as [6A](#6a-dkms-module-update).
+Boot is enforced. Then the same unload, reload, and health check as [7A](#7a-update-the-module-with-dkms).
 `modprobe` applies `owned_state` and `owned_floor` from
 `/etc/modprobe.d/dgx-fan-control-owned.conf`.
 
