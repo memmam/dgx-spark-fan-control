@@ -1019,17 +1019,87 @@ def read_job_watch(state_dir: Path) -> dict[str, str]:
 
 
 def write_job_watch(state_dir: Path, source: str, stuck: bool, seconds: float,
-                    detail: str = "") -> None:
+                    detail: str = "", when: float | None = None) -> None:
+    if when is None:
+        when = time.time()
     try:
         write_state_text(
             state_dir / JOB_WATCH_NAME,
             f"source={source}\n"
             f"detail={detail}\n"
             f"stuck={'yes' if stuck else 'no'}\n"
-            f"no_progress_seconds={max(0.0, seconds):.0f}\n",
+            f"no_progress_seconds={max(0.0, seconds):.0f}\n"
+            f"recorded={when:.3f}\n",
         )
     except OSError:
         return
+
+
+def format_utc_stamp(raw: str | float | None) -> str | None:
+    """Absolute UTC time, matching the stored-health clock format."""
+    try:
+        stamp = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp):
+        return None
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(stamp))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _with_recorded_time(text: str, job_watch: dict[str, str]) -> str:
+    shown = format_utc_stamp(job_watch.get("recorded"))
+    if not shown or not text.endswith(")"):
+        return text
+    return text[:-1] + f"; recorded {shown})"
+
+
+def recorded_work_text(fields: dict[str, str]) -> str | None:
+    """What the last job-watch sample said, without taking a new sample."""
+    if not fields or fields.get("unreadable") == "yes":
+        return None
+    source = fields.get("source", "").strip()
+    detail = fields.get("detail", "").strip()
+    if not source and not detail:
+        return None
+    if source == "unknown" or detail.startswith("could not sample GPU"):
+        return detail or "could not sample GPU"
+    if source == "off":
+        return detail or "no job running"
+    moving = "not moving" if fields.get("stuck") == "yes" else "moving"
+    return f"GPU job running, progress {moving} via {detail or source}"
+
+
+def last_recorded_work_note(state: dict, state_dir: Path) -> str:
+    """Poweroff parenthetical. A file error falls back; nothing is probed."""
+    try:
+        fields = _recorded_work_fields(state, state_dir)
+        phrase = recorded_work_text(fields) if fields else None
+        shown = format_utc_stamp(fields.get("recorded")) if fields else None
+    except Exception:
+        return "not sampled now; no earlier work-state record"
+    if not phrase or not shown:
+        return "not sampled now; no earlier work-state record"
+    return f"not sampled now; last recorded work state at {shown}: {phrase}"
+
+
+def _recorded_work_fields(state: dict, state_dir: Path) -> dict[str, str] | None:
+    if state.get("recorded_at") is not None and (
+        state.get("source") or state.get("detail")
+    ):
+        stuck = state.get("stuck")
+        return {
+            "source": str(state.get("source", "")),
+            "detail": str(state.get("detail", "")),
+            "stuck": "yes" if stuck is True or stuck == "yes" else "no",
+            "recorded": str(state.get("recorded_at")),
+        }
+    found = read_job_watch(state_dir)
+    if not found or found.get("unreadable") == "yes":
+        return None
+    return found
 
 
 def format_progress(job_watch: dict[str, str]) -> str:
@@ -1045,7 +1115,7 @@ def format_progress(job_watch: dict[str, str]) -> str:
         # A sampling gap is not a health failure. The next good sample
         # overwrites this file, so one transient miss does not stick.
         gap = job_watch.get("detail", "").strip() or "could not sample GPU"
-        return f"unknown ({gap})"
+        return _with_recorded_time(f"unknown ({gap})", job_watch)
     if source not in {"hook", "built-in", "off"}:
         source = "off"
     detail = job_watch.get("detail", "").strip()
@@ -1058,7 +1128,7 @@ def format_progress(job_watch: dict[str, str]) -> str:
             detail = "GPU utilization"
         else:
             detail = "no job running"
-    return f"{source} ({detail})"
+    return _with_recorded_time(f"{source} ({detail})", job_watch)
 
 
 def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
@@ -2364,10 +2434,12 @@ def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | 
 
     def publish(stuck: bool, seconds: float) -> None:
         source, detail = progress_source(command, state, busy_how)
+        recorded_at = time.time()
         state["source"] = source
         state["detail"] = detail
         state["stuck"] = stuck
-        write_job_watch(state_dir, source, stuck, seconds, detail)
+        state["recorded_at"] = recorded_at
+        write_job_watch(state_dir, source, stuck, seconds, detail, when=recorded_at)
 
     if not busy and was_busy and (episode or state.get("saw_hot")):
         started = state.get("episode_started")
@@ -2910,10 +2982,14 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             # delay it, and so the temperature is not stale from before
             # that delay.
             if hottest is not None and hottest >= zero_fan_celsius:
+                # Last job-watch sample only. No nvidia-smi or other probe.
+                try:
+                    recorded = last_recorded_work_note(job_state, marker_path.parent)
+                except Exception:
+                    recorded = "not sampled now; no earlier work-state record"
                 LOG.critical(
-                    "fan stall: work state not sampled and the hottest zone is "
-                    "%.1fC; running %s",
-                    hottest, action,
+                    "fan stall: hottest zone is %.1fC; running %s (%s)",
+                    hottest, action, recorded,
                 )
                 status = runner(action)
                 if status != 0:

@@ -544,7 +544,9 @@ class UserlandFailureTests(unittest.TestCase):
                 soc=85, reboot_seconds=60,
             )
             self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
-            self.assertIn("work state not sampled", "\n".join(logs))
+            self.assertIn(
+                "not sampled now; no earlier work-state record", "\n".join(logs),
+            )
             self.assertIn("85.0C", "\n".join(logs))
             self.assertNotIn(CONTROL.WATCHDOG_REBOOT_ACTION, actions)
 
@@ -581,6 +583,7 @@ class UserlandFailureTests(unittest.TestCase):
                     soc_celsius=85, monotonic=lambda: 0.0,
                     runner=runner, unit_state=lambda: "active",
                     notifier=lambda _message: None,
+                    marker_path=root / "marker" / "true-zero-reboot",
                 )
             self.assertEqual(status, 0)
             self.assertEqual(order[0][0], "temp")
@@ -588,8 +591,120 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(order[1], ("action", CONTROL.WATCHDOG_DEFAULT_ACTION))
             self.assertNotIn("nvidia-smi", order)
             text = "\n".join(logs.output)
-            self.assertIn("work state not sampled", text)
-            self.assertIn("91.0C", text)
+            self.assertIn(
+                "fan stall: hottest zone is 91.0C; running "
+                "systemctl poweroff (not sampled now; no earlier work-state record)",
+                text,
+            )
+
+            stamp = 1793949945.0
+            shown = CONTROL.format_utc_stamp(stamp)
+            state = root / "state"
+            CONTROL.write_state_text(
+                state / CONTROL.JOB_WATCH_NAME,
+                "source=hook\ndetail=PROGRESS_CHECK\nstuck=no\n"
+                "no_progress_seconds=0\n"
+                f"recorded={stamp:.3f}\n",
+            )
+            order.clear()
+            with patch.object(CONTROL, "read_hottest_temperature_c", side_effect=read_temp), \
+                 patch.object(CONTROL, "run_nvidia_smi", side_effect=hanging_smi), \
+                 patch.object(CONTROL, "Event", return_value=Event()), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, stall_seconds=15, reboot_seconds=60,
+                    soc_celsius=85, monotonic=lambda: 0.0,
+                    runner=runner, unit_state=lambda: "active",
+                    notifier=lambda _message: None,
+                    marker_path=state / "true-zero-reboot",
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(order[0], ("temp", 91.0))
+            self.assertEqual(order[1], ("action", CONTROL.WATCHDOG_DEFAULT_ACTION))
+            self.assertNotIn("nvidia-smi", order)
+            text = "\n".join(logs.output)
+            self.assertIn(
+                "fan stall: hottest zone is 91.0C; running systemctl poweroff "
+                f"(not sampled now; last recorded work state at {shown}: "
+                "GPU job running, progress moving via PROGRESS_CHECK)",
+                text,
+            )
+
+            gap = (
+                "could not sample GPU: nvidia-smi exited 9; "
+                "transient after a restart is normal"
+            )
+            CONTROL.write_state_text(
+                state / CONTROL.JOB_WATCH_NAME,
+                "source=unknown\n"
+                f"detail={gap}\n"
+                "stuck=no\nno_progress_seconds=0\n"
+                f"recorded={stamp:.3f}\n",
+            )
+            order.clear()
+            with patch.object(CONTROL, "read_hottest_temperature_c", side_effect=read_temp), \
+                 patch.object(CONTROL, "run_nvidia_smi", side_effect=hanging_smi), \
+                 patch.object(CONTROL, "Event", return_value=Event()), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, soc_celsius=85, monotonic=lambda: 0.0,
+                    runner=runner, unit_state=lambda: "active",
+                    notifier=lambda _message: None,
+                    marker_path=state / "true-zero-reboot",
+                )
+            self.assertEqual(status, 0)
+            self.assertNotIn("nvidia-smi", order)
+            self.assertIn(gap, "\n".join(logs.output))
+            self.assertIn(f"last recorded work state at {shown}", "\n".join(logs.output))
+
+            order.clear()
+            with patch.object(CONTROL, "read_hottest_temperature_c", side_effect=read_temp), \
+                 patch.object(CONTROL, "run_nvidia_smi", side_effect=hanging_smi), \
+                 patch.object(CONTROL, "read_job_watch", side_effect=OSError("unreadable")), \
+                 patch.object(CONTROL, "Event", return_value=Event()), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, soc_celsius=85, monotonic=lambda: 0.0,
+                    runner=runner, unit_state=lambda: "active",
+                    notifier=lambda _message: None,
+                    marker_path=state / "true-zero-reboot",
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(order[1], ("action", CONTROL.WATCHDOG_DEFAULT_ACTION))
+            self.assertNotIn("nvidia-smi", order)
+            self.assertIn(
+                "(not sampled now; no earlier work-state record)",
+                "\n".join(logs.output),
+            )
+            self.assertEqual(
+                CONTROL.format_progress({
+                    "source": "off",
+                    "detail": "no job running",
+                    "recorded": f"{stamp:.3f}",
+                }),
+                f"off (no job running; recorded {shown})",
+            )
+            memory = {
+                "recorded_at": stamp,
+                "source": "hook",
+                "detail": "PROGRESS_CHECK",
+                "stuck": False,
+            }
+            with patch.object(
+                CONTROL, "read_job_watch", side_effect=OSError("do not read"),
+            ):
+                note = CONTROL.last_recorded_work_note(memory, root / "missing")
+            self.assertEqual(
+                note,
+                f"not sampled now; last recorded work state at {shown}: "
+                "GPU job running, progress moving via PROGRESS_CHECK",
+            )
 
     def test_watchdog_reads_acpi_fans_without_the_kernel_module(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -973,7 +1088,8 @@ class UserlandFailureTests(unittest.TestCase):
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
             self.assertIn("health: healthy", text)
-            self.assertIn(f"progress: unknown ({gap})", text)
+            self.assertIn(f"progress: unknown ({gap}; recorded ", text)
+            self.assertIn(" UTC)", text)
             self.assertNotIn("NEEDS INTERVENTION", text)
             self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
 
@@ -997,7 +1113,8 @@ class UserlandFailureTests(unittest.TestCase):
                 )
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
-            self.assertIn("progress: off (no job running)", text)
+            self.assertIn("progress: off (no job running; recorded ", text)
+            self.assertIn(" UTC)", text)
             self.assertNotIn("could not sample GPU", text)
 
     def test_one_spinning_fan_does_not_reboot_or_power_off(self):

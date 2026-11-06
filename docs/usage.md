@@ -333,7 +333,11 @@ alert and keeps deferring. It does not reboot through work.
 
 If the hottest thermal zone reaches `--zero-fan-celsius` while **both**
 fans read 0 RPM, it powers off immediately. That does not wait for
-`--reboot-seconds`, and it does not matter whether work is in progress.
+`--reboot-seconds`, and it does not query the GPU first. The journal line
+is `fan stall: hottest zone is 85.3C; running systemctl poweroff (not sampled now; last recorded work state at 2026-11-06 09:41:12 UTC: GPU job running, progress moving via PROGRESS_CHECK)`,
+using the previous job-watch sample and its UTC time. If that sample is
+missing or unreadable, the parenthesis is
+`(not sampled now; no earlier work-state record)`.
 The default is **85°C**. `--soc-celsius` is a deprecated alias for that
 true-zero cutoff. A stall itself does not require a high temperature:
 both tachometers at 0 RPM are enough. Spinning fans are not powered off
@@ -501,7 +505,9 @@ The core checks are fan and thermal only:
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention
-- `progress:` is the watchdog's last sample, with the reason:
+- `progress:` is the watchdog's last sample, with the reason and the
+  sample's absolute UTC time when one was stored
+  (`; recorded 2026-11-06 09:41:12 UTC`):
   `off (no job running)`, `off (BUSY_CHECK failed)`,
   `built-in (GPU utilization)`, `built-in (BUSY_CHECK)`,
   `built-in (PROGRESS_CHECK failed)`, `hook (PROGRESS_CHECK)`, or

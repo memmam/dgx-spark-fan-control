@@ -83,12 +83,16 @@ The stored `ready=` matches the live `ready:` line, so telemetry-only
 records `ready=n/a`.
 
 `progress:` repeats the watchdog sample and names the reason, for example
-`off (no job running)` or `built-in (GPU utilization)`. Root and a normal
-user read that same file. `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
+`off (no job running; recorded 2026-11-06 09:41:12 UTC)` or
+`built-in (GPU utilization; recorded 2026-11-06 09:41:12 UTC)`. The clock
+is absolute UTC. Root and a normal user read that same file. `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
 means a short retry still could not run nvidia-smi. It is not a fault:
 health stays healthy, and the next good sample replaces it. The watchdog
-still defers a reboot on that sample. The stuck-job line is still
-only a warning.
+still defers a reboot on that sample. A true-zero poweroff at 85°C logs
+the hottest zone and the last job-watch sample with a UTC timestamp, or
+`(not sampled now; no earlier work-state record)` when that file cannot
+be read. It does not sample the GPU before powering off. The stuck-job
+line is still only a warning.
 
 The time is this Spark's local time, with the zone abbreviation. These
 machines are set to UTC, so expect `time=2026-11-06 07:25:45 UTC`.
