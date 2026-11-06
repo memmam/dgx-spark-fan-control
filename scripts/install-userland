@@ -35,6 +35,8 @@ install -D -m 0644 "${root}/systemd/dgx-fan-watchdog.service" \
   /etc/systemd/system/dgx-fan-watchdog.service
 install -D -m 0644 "${root}/systemd/dgx-fan-health.service" \
   /etc/systemd/system/dgx-fan-health.service
+install -D -m 0644 "${root}/systemd/dgx-fan-manual.service" \
+  /etc/systemd/system/dgx-fan-manual.service
 install -D -m 0755 "${root}/systemd/95-dgx-fan-control" \
   /etc/update-motd.d/95-dgx-fan-control
 if [[ ! -f /etc/default/dgx-fan-control ]]; then
@@ -43,6 +45,7 @@ if [[ ! -f /etc/default/dgx-fan-control ]]; then
 fi
 systemctl daemon-reload
 systemctl enable dgx-fan-health.service
+systemctl enable dgx-fan-manual.service
 
 if [[ "${watchdog}" -eq 1 ]]; then
   systemctl enable --now dgx-fan-watchdog.service

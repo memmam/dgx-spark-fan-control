@@ -110,6 +110,8 @@ sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
 sudo install -D -m 0644 systemd/dgx-fan-health.service \
   /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0644 systemd/dgx-fan-manual.service \
+  /etc/systemd/system/dgx-fan-manual.service
 sudo install -D -m 0755 systemd/95-dgx-fan-control \
   /etc/update-motd.d/95-dgx-fan-control
 sudo systemctl daemon-reload
@@ -149,6 +151,7 @@ comes out. Then stop the performance daemon and restore the factory curve.
 ```sh
 sudo systemctl disable --now dgx-fan-watchdog.service
 sudo systemctl disable --now dgx-fan-health.service
+sudo systemctl disable --now dgx-fan-manual.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo dgx-fan-control automatic
 dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
@@ -191,6 +194,8 @@ sudo rm -f /etc/modules-load.d/dgx_ec_fan_control.conf
 sudo rm -f /etc/systemd/system/dgx-fan-control.service
 sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
 sudo rm -f /etc/systemd/system/dgx-fan-health.service
+sudo rm -f /etc/systemd/system/dgx-fan-manual.service
+sudo rm -f /etc/modprobe.d/dgx-fan-control-owned.conf
 sudo rm -f /etc/update-motd.d/95-dgx-fan-control
 sudo rm -f /etc/default/dgx-fan-control
 sudo rm -f /usr/local/sbin/dgx-fan-control

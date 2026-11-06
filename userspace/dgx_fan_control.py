@@ -45,6 +45,9 @@ WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 WATCHDOG_REBOOT_ACTION = "systemctl reboot"
 DAEMON_UNIT = "dgx-fan-control.service"
 WATCHDOG_UNIT = "dgx-fan-watchdog.service"
+MANUAL_UNIT = "dgx-fan-manual.service"
+MANUAL_STATE_NAME = "manual-state"
+DAEMON_RESTART_LOOP = 3
 DAEMON_ALERT_INTERVAL_SECONDS = 60.0
 STALL_MARKER_DIR = Path("/var/lib/dgx-fan-control")
 STALL_MARKER_NAME = "true-zero-reboot"
@@ -67,6 +70,19 @@ MODULES_LOAD_DISABLED_TEXT = (
     "# dgx_ec_fan_control\n"
 )
 MAX_STATE = 12
+# Same RPM-mode tables as the kernel profiles. State 0 is unset and is not
+# an owned floor. The raw value is what the EC register holds.
+FLOOR_TABLES = {
+    "EC 3.5.8": (
+        None, 2700, 3600, 4500, 5400, 6300, 7200, 8100, 9000,
+        10125, 11250, 12375, 13500,
+    ),
+    "EC 3.13.7": (
+        None, 2000, 2213, 2427, 2640, 2854, 3068, 3281, 3495,
+        3709, 3922, 4136, 4350,
+    ),
+}
+OWNED_MODPROBE_NAME = "dgx-fan-control-owned.conf"
 MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
 FILTER_ALPHA = 0.35
@@ -243,10 +259,29 @@ def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
 
 
 def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str, int | None]:
+    active, enabled, exec_status, _result, _restarts = read_daemon_facts(unit)
+    return active, enabled, exec_status
+
+
+def read_daemon_facts(unit: str = DAEMON_UNIT) -> tuple:
+    """active, enabled, exec status, Result, and NRestarts."""
+    properties = systemctl_show_properties(unit, (
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+        "ExecMainStartTimestampMonotonic",
+        "ExecMainExitTimestampMonotonic",
+        "Result",
+        "NRestarts",
+    ))
+    result = properties.get("Result", "").strip()
+    if result in {"", "n/a"}:
+        result = ""
     return (
         systemctl_query("is-active", unit),
         systemctl_query("is-enabled", unit),
-        systemctl_exec_main_status(unit),
+        _show_int(properties, "ExecMainStatus"),
+        result or None,
+        _show_int(properties, "NRestarts"),
     )
 
 
@@ -356,14 +391,45 @@ def daemon_is_down(state: str) -> bool:
     return state != "active"
 
 
-def daemon_needs_alarm(active: str, enabled: str = "enabled",
-                       exec_status: int | None = None) -> bool:
-    """Alarm unless the unit is running, deliberately stopped, or unsupported.
+def daemon_stop_is_manual(active: str, enabled: str,
+                          exec_status: int | None = None,
+                          result: str | None = None) -> bool:
+    """True when the performance service was stopped on purpose.
 
-    A failed unit always alarms. Enabled but inactive alarms when the last
-    exit is not the startup unsupported-firmware code. Disabled and inactive
-    is ACPI-only mode and does not alarm. Exit 69 is only that startup check.
+    Restart=always would restart a spontaneous exit 0, so an inactive unit
+    whose result is success and whose exit is 0 was stopped with systemctl.
+    Disabled and inactive is the same choice. Exit 69 and 78 are not that.
     """
+    if active == "failed" or active != "inactive":
+        return False
+    if enabled == "disabled":
+        return True
+    if exec_status in (UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT):
+        return False
+    if result == "success" and exec_status in (None, 0):
+        return True
+    if exec_status == 0 and result in (None, "success"):
+        return True
+    return False
+
+
+def daemon_needs_alarm(active: str, enabled: str = "enabled",
+                       exec_status: int | None = None,
+                       result: str | None = None,
+                       n_restarts: int | None = None) -> bool:
+    """Alarm on a crash, a nonzero exit, or a restart loop.
+
+    A manual stop does not alarm. Exit 69 and 78 do not alarm here; the
+    health check reports those probes. A failed unit still alarms.
+    """
+    if daemon_stop_is_manual(active, enabled, exec_status, result):
+        return False
+    if (
+        n_restarts is not None
+        and n_restarts >= DAEMON_RESTART_LOOP
+        and active == "active"
+    ):
+        return True
     if active == "active":
         return False
     if active == "failed":
@@ -375,13 +441,19 @@ def daemon_needs_alarm(active: str, enabled: str = "enabled",
     return True
 
 
-def split_unit_state(reported: str | tuple) -> tuple[str, str, int | None]:
+def split_unit_state(reported: str | tuple) -> tuple:
+    """active, enabled, exec status, Result, NRestarts.
+
+    Older callers pass a string or a shorter tuple. Missing fields stay None.
+    """
     if isinstance(reported, tuple):
-        if len(reported) >= 3:
-            return reported[0], reported[1], reported[2]
-        if len(reported) == 2:
-            return reported[0], reported[1], None
-    return reported, "enabled", None
+        active = reported[0]
+        enabled = reported[1] if len(reported) > 1 else "enabled"
+        exec_status = reported[2] if len(reported) > 2 else None
+        result = reported[3] if len(reported) > 3 else None
+        n_restarts = reported[4] if len(reported) > 4 else None
+        return active, enabled, exec_status, result, n_restarts
+    return reported, "enabled", None, None, None
 
 
 def broadcast_alert(message: str) -> None:
@@ -682,15 +754,348 @@ def configured_float(defaults: dict[str, str], key: str, fallback: float) -> flo
 
 
 def _emit_check(name: str, status: str, detail: str, emit) -> str | None:
-    """Print one check. Return the flag text when it is not a pass."""
+    """Print one check. Return the flag text when it is not a pass.
+
+    ``note`` is a deliberate state. It is printed and is not a failure.
+    """
     if status == "pass":
         emit(f"{name}: pass")
+        return None
+    if status == "note":
+        emit(f"{name}: {detail}")
         return None
     if status == "unknown":
         emit(f"{name}: {NEEDS_ROOT}")
         return f"{name}: {NEEDS_ROOT}"
     emit(f"{name}: fail ({detail})")
     return detail
+
+
+def boot_load_state(etc: Path) -> str:
+    """managed-off, enabled, absent, or unknown.
+
+    managed-off is the modules-load file written by module disable.
+    """
+    path = etc / "modules-load.d" / MODULES_LOAD_NAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        if access_denied(exc):
+            return "unknown"
+        return "absent"
+    if "Disabled by dgx-fan-control module disable" in text:
+        return "managed-off"
+    if text_selects_module(text):
+        return "enabled"
+    return "absent"
+
+
+def read_last_manual_state(state_dir: Path) -> int | None:
+    """Last floor recorded by set-state while the service was stopped."""
+    try:
+        text = (state_dir / MANUAL_STATE_NAME).read_text(encoding="ascii")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "state":
+            try:
+                state = int(value.strip())
+            except ValueError:
+                return None
+            if 1 <= state <= MAX_STATE:
+                return state
+            return None
+    return None
+
+
+def raw_floor_for_state(profile: str | None, state: int) -> int | None:
+    table = FLOOR_TABLES.get(profile or "")
+    if table is None or not 1 <= state <= MAX_STATE:
+        return None
+    return table[state]
+
+
+def latest_refused_floor(log_text: str) -> int | None:
+    """Raw floor from the newest probe refusal, if the log has one."""
+    found = None
+    for match in re.finditer(
+        r"refusing to replace existing lower floor (0x[0-9a-fA-F]+)",
+        log_text,
+    ):
+        found = int(match.group(1), 16)
+    return found
+
+
+def floor_matches_last_set(live_floor: int | None,
+                           record: tuple[int, int | None] | None) -> str:
+    """ours, foreign, or none.
+
+    A missing record, or a record with no raw floor, is foreign whenever a
+    live floor is present. State 0 is never a record.
+    """
+    if live_floor is None:
+        return "none"
+    if record is None or record[1] is None or not 1 <= record[0] <= MAX_STATE:
+        return "foreign"
+    if live_floor == record[1]:
+        return "ours"
+    return "foreign"
+
+
+def floor_report(live_floor: int | None,
+                 record: tuple[int, int | None] | None) -> str | None:
+    """Health line detail, or None when there is nothing to say."""
+    verdict = floor_matches_last_set(live_floor, record)
+    if verdict == "none":
+        return None
+    if verdict == "ours" and record is not None:
+        return f"ours (matches last-set {record[0]})"
+    last = "none" if record is None or record[1] is None else f"0x{record[1]:x}"
+    live = "none" if live_floor is None else f"0x{live_floor:x}"
+    return f"foreign (live {live}, last-set {last})"
+
+
+def format_manual_floor_line(state_dir: Path = STALL_MARKER_DIR) -> str:
+    """One status line for the held floor, or none."""
+    try:
+        defaults = read_defaults()
+    except OSError as exc:
+        if access_denied(exc):
+            return f"manual-floor: {NEEDS_ROOT}"
+        defaults = {}
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid":
+        return "manual-floor: invalid MANUAL_STATE"
+    if state is None:
+        return "manual-floor: none"
+    origin = "MANUAL_STATE" if source == "override" else "last-set"
+    return f"manual-floor: {state} ({origin})"
+
+
+def read_manual_record(state_dir: Path, defaults: dict[str, str] | None = None,
+                       profile: str | None = None) -> tuple[int, int | None] | None:
+    """(state, raw floor) from MANUAL_STATE or the last-set file."""
+    if defaults is None:
+        defaults = {}
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid" or state is None:
+        return None
+    raw = None
+    try:
+        text = (state_dir / MANUAL_STATE_NAME).read_text(encoding="ascii")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if key == "floor":
+            try:
+                raw = int(value.strip(), 0)
+            except ValueError:
+                raw = None
+        elif key == "profile" and profile is None:
+            profile = value.strip() or None
+    if raw is None:
+        raw = raw_floor_for_state(profile, state)
+    return state, raw
+
+
+def write_last_manual_state(state_dir: Path, state: int,
+                            floor: int | None = None,
+                            profile: str | None = None) -> None:
+    """Record a held floor. State 0 is not a held floor and is not written."""
+    if not 1 <= state <= MAX_STATE:
+        raise ValueError(
+            "manual floor must be 1 through 12; state 0 is not persisted"
+        )
+    lines = [f"state={state}"]
+    if floor is not None:
+        lines.append(f"floor={floor}")
+    if profile:
+        lines.append(f"profile={profile}")
+    write_state_text(state_dir / MANUAL_STATE_NAME, "\n".join(lines) + "\n")
+
+
+def write_owned_module_option(etc: Path, state: int, floor: int) -> None:
+    """modprobe options the kernel probe reads at the next load."""
+    path = etc / "modprobe.d" / OWNED_MODPROBE_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Managed by dgx-fan-control. Do not edit.\n"
+        f"options dgx_ec_fan_control owned_state={state} owned_floor={floor}\n",
+        encoding="ascii",
+    )
+
+
+def clear_owned_module_option(etc: Path) -> None:
+    try:
+        (etc / "modprobe.d" / OWNED_MODPROBE_NAME).unlink()
+    except OSError:
+        return
+
+
+def clear_last_manual_state(state_dir: Path) -> None:
+    clear_stall_marker(state_dir / MANUAL_STATE_NAME)
+
+
+def parse_manual_override(defaults: dict[str, str]) -> tuple[int | None, bool]:
+    """Return (state, invalid). An empty MANUAL_STATE is not an override."""
+    raw = defaults.get("MANUAL_STATE", "").strip()
+    if not raw:
+        return None, False
+    try:
+        state = int(raw)
+    except ValueError:
+        return None, True
+    if not 1 <= state <= MAX_STATE:
+        return None, True
+    return state, False
+
+
+def resolved_manual_state(defaults: dict[str, str], state_dir: Path) -> tuple[int | None, str]:
+    """Wanted floor and its source: override, last-set, invalid, or empty."""
+    override, invalid = parse_manual_override(defaults)
+    if invalid:
+        return None, "invalid"
+    if override is not None:
+        return override, "override"
+    last = read_last_manual_state(state_dir)
+    if last is None:
+        return None, ""
+    return last, "last-set"
+
+
+def enable_manual_oneshot() -> None:
+    try:
+        subprocess.run(
+            ["systemctl", "enable", MANUAL_UNIT],
+            check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def disable_manual_oneshot() -> None:
+    try:
+        subprocess.run(
+            ["systemctl", "disable", MANUAL_UNIT],
+            check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def remember_manual_floor(state: int, service_active: str, state_dir: Path,
+                          *, profile: str | None = None, floor: int | None = None,
+                          etc: Path | None = None) -> None:
+    """Persist set-state when the performance service is not running.
+
+    An active service owns the curve and is not recorded. State 0 clears the
+    record. The raw floor is passed to the kernel at the next load. This
+    never writes an ACPI fan level.
+    """
+    if etc is None:
+        etc = Path("/etc")
+    if service_active == "active":
+        return
+    if service_active in {NEEDS_ROOT, "timeout", "unknown"}:
+        return
+    if state == 0:
+        clear_last_manual_state(state_dir)
+        clear_owned_module_option(etc)
+        disable_manual_oneshot()
+        return
+    if floor is None:
+        floor = raw_floor_for_state(profile, state)
+    write_last_manual_state(state_dir, state, floor, profile)
+    if floor is not None:
+        write_owned_module_option(etc, state, floor)
+    enable_manual_oneshot()
+
+
+def clear_persisted_manual_floor(state_dir: Path,
+                                 defaults: dict[str, str] | None = None,
+                                 etc: Path | None = None) -> None:
+    """Drop the last-set floor. A MANUAL_STATE override is left in place."""
+    if etc is None:
+        etc = Path("/etc")
+    del defaults
+    clear_last_manual_state(state_dir)
+    clear_owned_module_option(etc)
+    disable_manual_oneshot()
+
+
+def floor_devices(thermal_root: Path) -> list[Path] | None:
+    """dgx_ec_fan_floor devices, or None when the thermal directory is unreadable."""
+    names = scandir_names(thermal_root)
+    if names is None:
+        return None
+    found = []
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        try:
+            kind = (thermal_root / name / "type").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return None
+            continue
+        if kind == COOLING_DEVICE_TYPE:
+            found.append(thermal_root / name)
+    return found
+
+
+def apply_manual_floor(thermal_root: Path, hwmon_root: Path,
+                       defaults: dict[str, str] | None = None,
+                       state_dir: Path | None = None,
+                       wait_seconds: float = 30.0,
+                       monotonic=None, sleeper=None) -> int:
+    """Write the persisted floor to the cooling device. Never writes ACPI.
+
+    MANUAL_STATE overrides the last set-state. An empty configuration exits 0.
+    """
+    del hwmon_root
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid":
+        LOG.error("MANUAL_STATE must be a floor from 1 through 12; not applying")
+        return 1
+    if state is None:
+        return 0
+    if monotonic is None:
+        monotonic = time.monotonic
+    if sleeper is None:
+        sleeper = time.sleep
+    deadline = monotonic() + wait_seconds
+    device = None
+    while True:
+        matches = floor_devices(thermal_root)
+        if matches is None:
+            LOG.error("manual floor %s not applied; thermal sysfs is not readable", state)
+            return 1
+        if len(matches) == 1:
+            device = matches[0]
+            break
+        if monotonic() >= deadline:
+            LOG.error("manual floor %s not applied; cooling device missing", state)
+            return 1
+        sleeper(1)
+    write_state(device, state)
+    LOG.info("applied manual floor state %s from %s", state, source)
+    return 0
 
 
 def _module_loaded_now() -> bool | None:
@@ -776,7 +1181,12 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
                           module_loaded: bool | None, service_active: str,
                           service_enabled: str, exec_status: int | None,
                           watchdog_active: str, soc_celsius: float,
-                          log_text: str | None, ready: str, emit) -> list[str]:
+                          log_text: str | None, ready: str, emit,
+                          boot_load: str | None = None,
+                          service_result: str | None = None,
+                          n_restarts: int | None = None,
+                          record: tuple[int, int | None] | None = None,
+                          etc: Path | None = None) -> list[str]:
     """Run every check, emitting each line before the next external call.
 
     ``log_text`` None means read the kernel log only if a missing cooling
@@ -791,41 +1201,125 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
         if problem:
             problems.append(problem)
 
+    if etc is None:
+        etc = Path("/etc")
     if module_loaded is None:
         module_loaded = _module_loaded_now()
+    if boot_load is None and module_loaded is not True:
+        boot_load = boot_load_state(etc)
+    managed_off = module_loaded is False and boot_load == "managed-off"
     if module_loaded is None:
         keep("module", "unknown")
+    elif boot_load == "unknown" and module_loaded is not True:
+        keep("module", "unknown")
+    elif managed_off:
+        keep("module", "note", "off (disabled by module disable)")
     elif module_loaded:
         keep("module", "pass")
+    elif boot_load == "enabled":
+        keep("module", "fail", "enabled but not loaded: check dmesg | grep dgx_ec")
     else:
-        keep("module", "fail", "kernel module dgx_ec_fan_control is not loaded")
+        keep(
+            "module", "fail",
+            "not loaded; boot load is disabled. Run sudo dgx-fan-control module enable",
+        )
 
-    devices = _count_floor_devices(thermal_root)
-    foreign = exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
-    if devices is None:
+    devices = floor_devices(thermal_root)
+    if log_text is None and module_loaded is True and not managed_off:
+        log_text = read_kernel_log()
+    log_text = log_text or ""
+    live_floor = latest_refused_floor(log_text)
+    foreign_log = "refusing to replace existing lower floor" in log_text
+    unsupported = (
+        "registering hwmon telemetry only" in log_text
+        or "floor writes disabled" in log_text
+    )
+    verdict = floor_matches_last_set(live_floor, record)
+    if managed_off:
+        keep("cooling-device", "note", "skipped (module disabled by module disable)")
+    elif devices is None:
         keep("cooling-device", "unknown")
-    elif foreign:
+    elif verdict == "ours" and devices is not None and len(devices) == 1:
+        keep("cooling-device", "pass")
+    elif verdict == "ours":
+        keep(
+            "cooling-device", "fail",
+            f"owned floor matches last-set {record[0]} but the cooling device is missing",
+        )
+    elif foreign_log or (
+        exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
+        and verdict != "ours"
+    ):
         keep("cooling-device", "fail", "probe refused a foreign lower floor")
-    elif devices != 1:
-        if log_text is None and module_loaded is True:
-            log_text = read_kernel_log()
-        if log_text and "refusing to replace existing lower floor" in log_text:
-            keep("cooling-device", "fail", "probe refused a foreign lower floor")
+    elif devices is not None and len(devices) != 1:
+        if module_loaded is not True:
+            keep("cooling-device", "note", "skipped (module not loaded)")
+        elif unsupported:
+            keep("cooling-device", "fail", "unsupported firmware; telemetry only")
         else:
-            keep("cooling-device", "fail", "dgx_ec_fan_floor cooling device is missing")
+            keep(
+                "cooling-device", "fail",
+                "loaded but no cooling device registered; check dmesg | grep dgx_ec",
+            )
     else:
         keep("cooling-device", "pass")
 
+    report = floor_report(live_floor, record if verdict != "none" or record else None)
+    if devices is not None and len(devices) == 1 and record is not None and live_floor is None:
+        try:
+            live_state = read_state(devices[0])
+        except (OSError, RuntimeError, ValueError):
+            live_state = None
+        if live_state == record[0]:
+            report = f"ours (matches last-set {record[0]})"
+            verdict = "ours"
+        elif live_state is not None:
+            report = f"foreign (live state {live_state}, last-set state {record[0]})"
+            verdict = "foreign"
+    if report is not None:
+        emit(f"floor: {report}")
+        if verdict == "foreign":
+            problems.append(report)
+
+    manual = daemon_stop_is_manual(
+        service_active, service_enabled, exec_status, service_result,
+    )
+    restart_loop = (
+        n_restarts is not None
+        and n_restarts >= DAEMON_RESTART_LOOP
+        and not manual
+    )
     if service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
         keep("daemon", "unknown")
     elif service_active == "timeout" or service_enabled == "timeout":
         keep("daemon", "fail", "systemctl timed out")
+    elif restart_loop:
+        keep("daemon", "fail", f"restart loop (NRestarts={n_restarts})")
+    elif manual:
+        keep("daemon", "note", "stopped (manual)")
     elif service_active == "unknown" or service_enabled == "unknown":
         keep("daemon", "fail", "systemctl state unknown")
-    elif service_enabled == "enabled" and service_active != "active":
+    elif exec_status == FOREIGN_FLOOR_EXIT and service_active != "active":
+        keep("daemon", "note", "stopped (exit 78)")
+    elif exec_status == UNSUPPORTED_FIRMWARE_EXIT and service_active != "active":
+        keep("daemon", "note", "stopped (exit 69)")
+    elif service_active == "failed" or (
+        service_enabled == "enabled" and service_active != "active"
+    ):
         keep("daemon", "fail", f"{DAEMON_UNIT} is not active ({service_active})")
     else:
         keep("daemon", "pass")
+
+    if record is not None and managed_off:
+        keep("mode", "fail", f"last-set floor is {record[0]} but the module is disabled")
+    elif record is not None and verdict == "foreign":
+        keep("mode", "fail", f"manual floor state {record[0]} is not what is held")
+    elif record is not None and verdict == "ours":
+        keep("mode", "note", f"manual floor state {record[0]} (held)")
+    elif record is not None and (devices is None or len(devices) != 1):
+        keep("mode", "fail", f"manual floor state {record[0]} is not held")
+    else:
+        keep("mode", "note", "not configured")
 
     keep("fans", *_fan_status(hwmon_root))
     keep("temperature", *_temperature_status(thermal_root, soc_celsius))
@@ -894,6 +1388,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
                poll_seconds: float = HEALTH_POLL_SECONDS,
                soc_celsius: float = WATCHDOG_SOC_CELSIUS,
                state_dir: Path | None = None,
+               etc: Path | None = None,
                defaults: dict[str, str] | None = None,
                monotonic=None, wall_time=None, sleeper=None,
                observer=None, notifier=None, boot_id: str | None = None,
@@ -909,6 +1404,8 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     """
     if state_dir is None:
         state_dir = STALL_MARKER_DIR
+    if etc is None:
+        etc = Path("/etc")
     defaults_denied = False
     if defaults is None:
         try:
@@ -944,13 +1441,15 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     def evaluate(emit) -> list[str]:
         nonlocal ready
         if observer is None:
-            active, enabled, exec_status = read_daemon_unit()
+            active, enabled, exec_status, service_result, n_restarts = read_daemon_facts()
             watchdog_active, _watchdog_enabled = watchdog_unit_state()
             snapshot = {
                 "module_loaded": None,
                 "service_active": active,
                 "service_enabled": enabled,
                 "exec_status": exec_status,
+                "service_result": service_result,
+                "n_restarts": n_restarts,
                 "watchdog_active": watchdog_active,
             }
             log_text = None
@@ -961,6 +1460,8 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             ready = NEEDS_ROOT
         else:
             ready = ready_for_work(defaults)
+        profile = pinned_ec_name(log_text or "")
+        record = snapshot.get("record", read_manual_record(state_dir, defaults, profile))
         return collect_health_checks(
             thermal_root, hwmon_root,
             module_loaded=snapshot.get("module_loaded", None),
@@ -972,6 +1473,11 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             log_text=log_text,
             ready=ready,
             emit=emit,
+            boot_load=snapshot.get("boot_load"),
+            service_result=snapshot.get("service_result"),
+            n_restarts=snapshot.get("n_restarts"),
+            record=record,
+            etc=etc,
         )
 
     while True:
@@ -1191,7 +1697,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     if runner is None:
         runner = run_watchdog_action
     if unit_state is None:
-        unit_state = read_daemon_unit
+        unit_state = read_daemon_facts
     if notifier is None:
         notifier = broadcast_alert
     if gpu_jobs is None:
@@ -1235,6 +1741,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     smi_warned = False
     reported_unsupported = False
     foreign_walled = False
+    manual_stop_logged = False
     foreign_since: float | None = None
     foreign_deferred = False
     foreign_intervened = False
@@ -1243,7 +1750,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     zero_defer_since: float | None = None
     zero_defer_wall: float | None = None
     while not stop_requested.is_set():
-        active_state, enabled_state, exec_status = split_unit_state(unit_state())
+        active_state, enabled_state, exec_status, unit_result, n_restarts = (
+            split_unit_state(unit_state())
+        )
         if exec_status == FOREIGN_FLOOR_EXIT:
             now = monotonic()
             if foreign_since is None:
@@ -1346,14 +1855,32 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             stop_requested.wait(poll_seconds)
             continue
         foreign_since = None
-        if daemon_needs_alarm(active_state, enabled_state, exec_status):
+        # A stall is measured fan RPM only. Cooling state 0 is not a stall.
+        manual_stop = daemon_stop_is_manual(
+            active_state, enabled_state, exec_status, unit_result,
+        )
+        restart_loop = (
+            n_restarts is not None
+            and n_restarts >= DAEMON_RESTART_LOOP
+            and not manual_stop
+            and active_state == "active"
+        )
+        if daemon_needs_alarm(
+            active_state, enabled_state, exec_status, unit_result, n_restarts,
+        ):
             now = monotonic()
-            state_key = (active_state, enabled_state, exec_status)
+            state_key = (active_state, enabled_state, exec_status, n_restarts)
             changed = state_key != last_daemon_state
-            message = (
-                f"dgx-fan-control: {DAEMON_UNIT} is not active "
-                f"({active_state}, {enabled_state})"
-            )
+            if restart_loop:
+                message = (
+                    f"dgx-fan-control: {DAEMON_UNIT} restart loop "
+                    f"(NRestarts={n_restarts})"
+                )
+            else:
+                message = (
+                    f"dgx-fan-control: {DAEMON_UNIT} is not active "
+                    f"({active_state}, {enabled_state})"
+                )
             LOG.warning(message)
             repeat_due = (
                 last_daemon_wall is None
@@ -1363,6 +1890,16 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 _wall(notifier, message, "fan-daemon alert")
                 last_daemon_wall = now
             last_daemon_state = state_key
+            manual_stop_logged = False
+        elif manual_stop:
+            if not manual_stop_logged:
+                LOG.info(
+                    "dgx-fan-control: %s is stopped (manual); not alerting",
+                    DAEMON_UNIT,
+                )
+                manual_stop_logged = True
+            last_daemon_wall = None
+            last_daemon_state = None
         else:
             last_daemon_wall = None
             last_daemon_state = None
@@ -1543,7 +2080,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     return 0
 
 
-def missing_cooling_reason(module_loaded: bool, log_text: str) -> str:
+def missing_cooling_reason(module_loaded: bool, log_text: str,
+                           record: tuple[int, int | None] | None = None) -> str:
     """Why status has no dgx_ec_fan_floor device. Never the bare count 'found 0'."""
     if not module_loaded:
         return (
@@ -1551,6 +2089,13 @@ def missing_cooling_reason(module_loaded: bool, log_text: str) -> str:
             "dgx_ec_fan_control is not loaded"
         )
     if "refusing to replace existing lower floor" in log_text:
+        live = latest_refused_floor(log_text)
+        if floor_matches_last_set(live, record) == "ours" and record is not None:
+            return (
+                "no dgx_ec_fan_floor cooling device: existing floor matches "
+                f"last-set {record[0]}. Probe did not adopt it. Reload the "
+                "module so owned_floor is passed. This is not a foreign floor."
+            )
         return (
             "no dgx_ec_fan_floor cooling device: probe refused a foreign lower floor. "
             "ACPI cur_state writes the same EC register. This driver will not clear it. "
@@ -1568,7 +2113,8 @@ def missing_cooling_reason(module_loaded: bool, log_text: str) -> str:
 
 def require_control(thermal_root: Path, hwmon_root: Path, *,
                     module_loaded: bool | None = None,
-                    log_text: str | None = None) -> Path:
+                    log_text: str | None = None,
+                    record: tuple[int, int | None] | None = None) -> Path:
     matches = cooling_devices(thermal_root)
     if len(matches) == 1:
         return matches[0]
@@ -1582,7 +2128,13 @@ def require_control(thermal_root: Path, hwmon_root: Path, *,
         module_loaded = module_is_loaded()
     if log_text is None:
         log_text = read_kernel_log()
-    reason = missing_cooling_reason(module_loaded, log_text)
+    if record is None and "refusing to replace existing lower floor" in log_text:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
+        record = read_manual_record(STALL_MARKER_DIR, defaults, pinned_ec_name(log_text))
+    reason = missing_cooling_reason(module_loaded, log_text, record)
     if "probe refused a foreign lower floor" in reason:
         raise ForeignFloor(reason)
     raise RuntimeError(reason)
@@ -2402,7 +2954,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
-    subparsers.add_parser("automatic", help="restore firmware-automatic policy")
+    subparsers.add_parser("automatic", help="restore firmware-automatic policy and clear the held floor")
+    subparsers.add_parser(
+        "manual-apply",
+        help="reapply the last-set floor at boot; does not start the performance curve",
+    )
     subparsers.add_parser("status", help="show the cooling state and hottest sensor")
     health = subparsers.add_parser(
         "health",
@@ -2502,6 +3058,8 @@ def main(argv: list[str] | None = None) -> int:
                 watchdog_enabled=watchdog_enabled,
             ), end="")
             return 0
+        if args.command == "manual-apply":
+            return apply_manual_floor(args.thermal_root, args.hwmon_root)
         if args.command == "health":
             if args.clear:
                 if os.geteuid() != 0:
@@ -2528,13 +3086,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"state={NEEDS_ROOT} hottest={NEEDS_ROOT}")
             active, enabled = watchdog_unit_state()
             print(format_watchdog_status(active, enabled), end="")
+            print(format_manual_floor_line())
             return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
+            remember_manual_floor(
+                args.state,
+                systemctl_query("is-active"),
+                STALL_MARKER_DIR,
+                profile=pinned_ec_name(read_kernel_log()),
+            )
             return 0
         if args.command == "automatic":
             write_state(cooling_device, 0)
+            clear_persisted_manual_floor(STALL_MARKER_DIR)
             return 0
         if args.command == "status":
             try:
@@ -2564,6 +3130,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(format_cooling_status(state, hottest))
             print(format_watchdog_status(active, enabled), end="")
+            print(format_manual_floor_line())
             return 0
     except ControlUnsupported as exc:
         # status is interactive: print the reason once. Logging it as well

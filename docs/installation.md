@@ -239,6 +239,8 @@ sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
 sudo install -D -m 0644 systemd/dgx-fan-health.service \
   /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0644 systemd/dgx-fan-manual.service \
+  /etc/systemd/system/dgx-fan-manual.service
 sudo install -D -m 0755 systemd/95-dgx-fan-control \
   /etc/update-motd.d/95-dgx-fan-control
 if [ ! -f /etc/default/dgx-fan-control ]; then
@@ -247,6 +249,7 @@ if [ ! -f /etc/default/dgx-fan-control ]; then
 fi
 sudo systemctl daemon-reload
 sudo systemctl enable dgx-fan-health.service
+sudo systemctl enable dgx-fan-manual.service
 sudo systemctl enable --now dgx-fan-watchdog.service
 ```
 
@@ -263,9 +266,12 @@ the kernel module. Restore the factory curve first, as in
 ```sh
 sudo systemctl disable --now dgx-fan-watchdog.service
 sudo systemctl disable --now dgx-fan-health.service
+sudo systemctl disable --now dgx-fan-manual.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
 sudo rm -f /etc/systemd/system/dgx-fan-health.service
+sudo rm -f /etc/systemd/system/dgx-fan-manual.service
+sudo rm -f /etc/modprobe.d/dgx-fan-control-owned.conf
 sudo rm -f /etc/systemd/system/dgx-fan-control.service
 sudo rm -f /etc/update-motd.d/95-dgx-fan-control
 sudo rm -f /etc/default/dgx-fan-control
@@ -290,6 +296,8 @@ sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
 sudo install -D -m 0644 systemd/dgx-fan-health.service \
   /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0644 systemd/dgx-fan-manual.service \
+  /etc/systemd/system/dgx-fan-manual.service
 sudo install -D -m 0755 systemd/95-dgx-fan-control \
   /etc/update-motd.d/95-dgx-fan-control
 if [ ! -f /etc/default/dgx-fan-control ]; then
@@ -298,6 +306,7 @@ if [ ! -f /etc/default/dgx-fan-control ]; then
 fi
 sudo systemctl daemon-reload
 sudo systemctl enable dgx-fan-health.service
+sudo systemctl enable dgx-fan-manual.service
 if systemctl is-active --quiet dgx-fan-watchdog.service; then
   sudo systemctl restart dgx-fan-watchdog.service
 fi

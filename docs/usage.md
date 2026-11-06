@@ -13,6 +13,40 @@ There are three modes:
 NVIDIA's thermal policy remains active in all three modes. Use one policy
 writer at a time; stop the service before a manual boost.
 
+## Hold a manual floor
+
+Stopping the performance service and setting a floor is a lasting mode, not
+only a pre-cool. With `dgx-fan-control.service` stopped or disabled,
+`set-state N` records N. `N` is a kernel cooling state from 1 through 12.
+State 0 is the NVIDIA curve and is not recorded. This does not write an ACPI
+fan level.
+
+```sh
+sudo systemctl stop dgx-fan-control.service
+sudo dgx-fan-control set-state 6
+dgx-fan-control status
+```
+
+`status` prints `manual-floor: 6 (last-set)`. The record is
+`/var/lib/dgx-fan-control/manual-state`. The same command writes
+`/etc/modprobe.d/dgx-fan-control-owned.conf` so the next module load receives
+`owned_state` and `owned_floor`. The kernel probe compares the EC floor with
+that pair. A match is adopted and is not a foreign floor. A mismatch, or no
+record, stays on the foreign-floor path. `dgx-fan-manual.service` reapplies
+the state at boot and does not start the performance curve.
+
+`MANUAL_STATE=` in `/etc/default/dgx-fan-control` overrides the record when
+you set it. Leave it empty to use the last `set-state`.
+
+See the held value with `dgx-fan-control status` or `dgx-fan-control health`
+(`mode: manual floor state N (held)` and `floor: ours (matches last-set N)`).
+Clear the record with `sudo dgx-fan-control automatic`. If you also set
+`MANUAL_STATE`, empty that line or the override remains.
+
+A manual stop does not make the watchdog broadcast. A true zero is still both
+ACPI fan tachometers at 0 RPM. Cooling state 0, with the fans spinning, is
+not a stall.
+
 ## Pre-cool before a big job
 
 ### 1. Request maximum cooling
@@ -22,6 +56,10 @@ sudo systemctl stop dgx-fan-control.service
 sudo dgx-fan-control set-state 12
 dgx-fan-control status
 ```
+
+`set-state 12` records that floor until `automatic` clears it. See [Hold a
+manual floor](#hold-a-manual-floor). The watchdog does not broadcast for this
+stop.
 
 State 12 requests that profile's maximum common floor. On EC 3.5.8 the two fans
 can reach approximately **9000 and 13500 RPM** in the firmware's RPM-mode
@@ -56,7 +94,7 @@ sudo dgx-fan-control automatic
 dgx-fan-control status
 ```
 
-Expect **`state=0/12 (no floor; EC curve)`**. That is NVIDIA's curve, not fans stopped. Leave the service stopped to retain it. Enabling the service is a separate command; `module enable` does not do it.
+Expect **`state=0/12 (no floor; EC curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` also clears the persisted manual floor. Leave the service stopped to retain the curve. Enabling the service is a separate command; `module enable` does not do it.
 Firmware hysteresis can keep fans fast for a while after the floor is removed.
 
 ## Return to NVIDIA automatic control

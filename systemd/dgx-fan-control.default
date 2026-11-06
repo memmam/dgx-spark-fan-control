@@ -29,3 +29,9 @@ BUSY_CHECK=
 # Overrides dgx-fan-control watchdog --max-defer-seconds when set.
 MAX_DEFER_SECONDS=1800
 
+# Optional override of the held floor. Empty uses the last set-state
+# recorded while the performance service was stopped. automatic clears
+# that record. If this is set, it wins over the record. Use 1 through 12.
+# This is the kernel cooling state, not an ACPI level. Do not set 0.
+MANUAL_STATE=
+

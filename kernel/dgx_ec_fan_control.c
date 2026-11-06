@@ -188,6 +188,21 @@ module_param(allow_unverified_writes, bool, 0444);
 MODULE_PARM_DESC(allow_unverified_writes,
 		 "Allow unverified floor writes on EC 3.13.7 (default N)");
 
+/*
+ * Set by modprobe from the userspace last-set record before this module
+ * loads. owned_state < 0 or owned_floor == 0 means there is no record.
+ * A probe that finds the same raw floor adopts it. Anything else is foreign.
+ * State 0 is the NVIDIA curve and is never an owned floor.
+ */
+static int owned_state = -1;
+static unsigned int owned_floor;
+module_param(owned_state, int, 0444);
+module_param(owned_floor, uint, 0444);
+MODULE_PARM_DESC(owned_state,
+		 "Cooling state of a floor this driver already set (default -1)");
+MODULE_PARM_DESC(owned_floor,
+		 "Raw EC lower-floor value for owned_state (default 0, none)");
+
 struct dgx_ec_fan_capabilities {
 	u8 revision;
 	u8 unit_mode;
@@ -1281,15 +1296,28 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 				goto unlock;
 		} else if (floor != DGX_EC_LIMIT_UNSET) {
 			/*
-			 * Do not clear a floor this driver does not own. ACPI
-			 * cur_state writes the same register; level 0 stops both fans
-			 * and still leaves the foreign value in place.
+			 * A floor that matches the last-set record passed at load
+			 * is ours. Adopt it and register the cooling device.
+			 * A mismatch, or no record, is foreign: do not clear it.
+			 * ACPI cur_state writes the same register; level 0 stops
+			 * both fans and still leaves the foreign value in place.
 			 */
-			dev_err(&ffa_dev->dev,
-				"refusing to replace existing lower floor %#x (%u RPM). This driver did not set it. An ACPI Fan cur_state write uses the same EC lower-floor register (level 100 is 4350 RPM, 0x10fe). The floor was not cleared. Do not write ACPI level 0: it stops both fans and does not clear the floor. Unload this module before using ACPI. A cold power cycle is the recovery that avoids writing a fan level\n",
-				floor, floor);
-			ret = -EBUSY;
-			goto unlock;
+			if (owned_state >= 1 &&
+			    owned_state < DGX_EC_FLOOR_STATE_COUNT &&
+			    owned_floor != 0 &&
+			    floor == owned_floor &&
+			    data->profile->floors[owned_state] == owned_floor) {
+				data->current_state = owned_state;
+				dev_info(&ffa_dev->dev,
+					 "taking ownership of existing lower floor %#x (%u RPM); matches owned state %d\n",
+					 floor, floor, owned_state);
+			} else {
+				dev_err(&ffa_dev->dev,
+					"refusing to replace existing lower floor %#x (%u RPM). This driver did not set it. An ACPI Fan cur_state write uses the same EC lower-floor register (level 100 is 4350 RPM, 0x10fe). The floor was not cleared. Do not write ACPI level 0: it stops both fans and does not clear the floor. Unload this module before using ACPI. A cold power cycle is the recovery that avoids writing a fan level\n",
+					floor, floor);
+				ret = -EBUSY;
+				goto unlock;
+			}
 		}
 	}
 	ret = dgx_ec_refresh(data);

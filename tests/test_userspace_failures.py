@@ -533,7 +533,8 @@ class UserlandFailureTests(unittest.TestCase):
     def _drive_watchdog(self, root, *, rpm, celsius, gpu, stop_after, boot="boot-a",
                         marker=None, module=False, soc=85.0, reboot_seconds=60,
                         max_defer_seconds=None, defaults=None,
-                        alert_repeat_seconds=1800, unit_state="active"):
+                        alert_repeat_seconds=1800, unit_state="active",
+                        cooling_state=None):
         self._stopped_acpi_fans(root, rpm, celsius)
         if module:
             device = root / "thermal" / "cooling_device2"
@@ -541,7 +542,8 @@ class UserlandFailureTests(unittest.TestCase):
             (device / "type").write_text(
                 CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii",
             )
-            (device / "cur_state").write_text("1\n", encoding="ascii")
+            initial = 1 if cooling_state is None else cooling_state
+            (device / "cur_state").write_text(f"{initial}\n", encoding="ascii")
             (device / "max_state").write_text("12\n", encoding="ascii")
         if marker is None:
             marker = root / "marker" / "true-zero-reboot"
@@ -724,7 +726,7 @@ class UserlandFailureTests(unittest.TestCase):
                 Path("/tmp/dgx-fan-missing"),
                 Path("/tmp/dgx-fan-missing"),
                 monotonic=lambda: clock[0],
-                unit_state=lambda: ("inactive", "enabled", 0),
+                unit_state=lambda: ("inactive", "enabled", 1),
                 notifier=alerts.append,
                 alert_repeat_seconds=1800,
                 gpu_jobs=lambda: False,
@@ -1051,12 +1053,15 @@ class UserlandFailureTests(unittest.TestCase):
             state = root / "state"
             CONTROL.write_stall_marker(state / CONTROL.STALL_MARKER_NAME, "boot-a", 1.0)
             code, alerts, notices = self._health(
-                root, {}, self._healthy_snapshot(module_loaded=False),
+                root, {}, self._healthy_snapshot(module_loaded=False, boot_load="absent"),
             )
             self.assertEqual(code, 1)
             self.assertEqual(alerts, [])
             text = (state / CONTROL.INTERVENTION_NAME).read_text(encoding="ascii")
-            self.assertIn("kernel module dgx_ec_fan_control is not loaded", text)
+            self.assertIn(
+                "not loaded; boot load is disabled. Run sudo dgx-fan-control module enable",
+                text,
+            )
             self.assertTrue((state / CONTROL.STALL_MARKER_NAME).exists())
             self.assertTrue(notices and "needs intervention" in notices[0])
 
@@ -1096,7 +1101,7 @@ class UserlandFailureTests(unittest.TestCase):
             stdout = io.StringIO()
             with redirect_stdout(stdout):
                 code, alerts, notices = self._health(
-                    root, {}, self._healthy_snapshot(module_loaded=False),
+                    root, {}, self._healthy_snapshot(module_loaded=False, boot_load="absent"),
                     sleeper=refuse_wait, record=False,
                 )
             text = stdout.getvalue()
@@ -1104,7 +1109,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(alerts, [])
             self.assertEqual(notices, [])
             self.assertIn(
-                "module: fail (kernel module dgx_ec_fan_control is not loaded)",
+                "module: fail (not loaded; boot load is disabled. Run sudo dgx-fan-control module enable)",
                 text,
             )
             self.assertLess(text.index("module:"), text.index("health: fail"))
@@ -1147,7 +1152,7 @@ class UserlandFailureTests(unittest.TestCase):
             def observer():
                 calls["n"] += 1
                 if calls["n"] == 1:
-                    return self._healthy_snapshot(module_loaded=False)
+                    return self._healthy_snapshot(module_loaded=False, boot_load="absent")
                 return self._healthy_snapshot()
 
             clock = [0.0]
@@ -1174,7 +1179,7 @@ class UserlandFailureTests(unittest.TestCase):
             text = "\n".join(logs.output)
             self.assertIn("health attempt 1:", text)
             self.assertIn(
-                "module: fail (kernel module dgx_ec_fan_control is not loaded)",
+                "module: fail (not loaded; boot load is disabled. Run sudo dgx-fan-control module enable)",
                 text,
             )
             self.assertIn("health: healthy", stdout.getvalue())
@@ -1229,7 +1234,10 @@ class UserlandFailureTests(unittest.TestCase):
             state = root / "absent-state"
             with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
                  patch.object(CONTROL.os, "geteuid", return_value=1000), \
-                 patch.object(CONTROL, "read_daemon_unit", return_value=("inactive", "disabled", None)), \
+                 patch.object(
+                     CONTROL, "read_daemon_facts",
+                     return_value=("inactive", "disabled", None, None, None),
+                 ), \
                  patch.object(CONTROL, "watchdog_unit_state", return_value=("active", "enabled")), \
                  patch.object(CONTROL, "_module_loaded_now", return_value=True):
                 code, stdout, stderr = run_cli([
@@ -1246,6 +1254,201 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn("Traceback", combined)
             self.assertNotIn("Permission denied", combined)
             self.assertFalse(state.exists())
+
+    def test_owned_floor_match_mismatch_and_missing_record(self):
+        self.assertEqual(CONTROL.floor_matches_last_set(13500, (12, 13500)), "ours")
+        self.assertEqual(
+            CONTROL.floor_report(13500, (12, 13500)),
+            "ours (matches last-set 12)",
+        )
+        self.assertEqual(CONTROL.floor_matches_last_set(0x10FE, (12, 13500)), "foreign")
+        foreign = CONTROL.floor_report(0x10FE, (12, 13500))
+        self.assertEqual(foreign, "foreign (live 0x10fe, last-set 0x34bc)")
+        self.assertEqual(CONTROL.floor_matches_last_set(0x10FE, None), "foreign")
+        self.assertEqual(
+            CONTROL.floor_report(0x10FE, None),
+            "foreign (live 0x10fe, last-set none)",
+        )
+        refused = "refusing to replace existing lower floor 0x34bc (13500 RPM)\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon"
+            thermal.mkdir()
+            hwmon.mkdir()
+            with self.assertRaises(CONTROL.ForeignFloor):
+                CONTROL.require_control(
+                    thermal, hwmon, module_loaded=True, log_text=refused, record=None,
+                )
+            with self.assertRaises(CONTROL.ForeignFloor):
+                CONTROL.require_control(
+                    thermal, hwmon, module_loaded=True, log_text=refused,
+                    record=(6, 7200),
+                )
+            with self.assertRaises(RuntimeError) as caught:
+                CONTROL.require_control(
+                    thermal, hwmon, module_loaded=True, log_text=refused,
+                    record=(12, 13500),
+                )
+            self.assertNotIsInstance(caught.exception, CONTROL.ForeignFloor)
+            self.assertIn("last-set 12", str(caught.exception))
+            self.assertNotIn("probe refused a foreign lower floor", str(caught.exception))
+
+    def test_module_disable_is_healthy_and_enabled_but_unloaded_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(module_loaded=False, boot_load="managed-off"),
+                    record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn("module: off (disabled by module disable)", text)
+            self.assertIn("cooling-device: skipped (module disabled by module disable)", text)
+            self.assertIn("daemon: stopped (manual)", text)
+            self.assertIn("health: healthy", text)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(module_loaded=False, boot_load="enabled"),
+                    record=False,
+                )
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "module: fail (enabled but not loaded: check dmesg | grep dgx_ec)",
+                stdout.getvalue(),
+            )
+
+    def test_set_state_records_the_floor_and_automatic_clears_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            etc = root / "etc"
+            calls = []
+            with patch.object(CONTROL, "enable_manual_oneshot", side_effect=lambda: calls.append("enable")), \
+                 patch.object(CONTROL, "disable_manual_oneshot", side_effect=lambda: calls.append("disable")):
+                CONTROL.remember_manual_floor(
+                    6, "inactive", root / "state",
+                    profile="EC 3.5.8", etc=etc,
+                )
+            text = (root / "state" / CONTROL.MANUAL_STATE_NAME).read_text(encoding="ascii")
+            self.assertIn("state=6\n", text)
+            self.assertIn("floor=7200\n", text)
+            option = etc / "modprobe.d" / CONTROL.OWNED_MODPROBE_NAME
+            self.assertIn("owned_state=6 owned_floor=7200", option.read_text(encoding="ascii"))
+            self.assertEqual(calls, ["enable"])
+            acpi = root / "thermal" / "cooling_device0" / "cur_state"
+            self.assertEqual(acpi.read_text(encoding="ascii"), "40\n")
+            with patch.object(CONTROL, "disable_manual_oneshot"):
+                CONTROL.clear_persisted_manual_floor(root / "state", {}, etc)
+            self.assertFalse((root / "state" / CONTROL.MANUAL_STATE_NAME).exists())
+            self.assertFalse(option.exists())
+
+            device = root / "thermal" / "cooling_device2"
+            CONTROL.write_last_manual_state(root / "state", 6, 7200, "EC 3.5.8")
+            (device / "cur_state").write_text("1\n", encoding="ascii")
+            code = CONTROL.apply_manual_floor(
+                root / "thermal", root / "hwmon",
+                defaults={"MANUAL_STATE": "4"},
+                state_dir=root / "state",
+                wait_seconds=0,
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual((device / "cur_state").read_text(encoding="ascii"), "4\n")
+            self.assertEqual(acpi.read_text(encoding="ascii"), "40\n")
+            self.assertEqual(
+                CONTROL.apply_manual_floor(
+                    root / "thermal", root / "hwmon",
+                    defaults={"MANUAL_STATE": "0"},
+                    state_dir=root / "state",
+                    wait_seconds=0,
+                ),
+                1,
+            )
+            self.assertEqual((device / "cur_state").read_text(encoding="ascii"), "4\n")
+
+    def test_true_zero_still_runs_in_every_mode_and_state_zero_does_not(self):
+        manual = ("inactive", "enabled", 0, "success", 0)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                module=False,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            self.assertIn("wrote ACPI Fan level 100", "\n".join(logs))
+            self.assertEqual(
+                (root / "thermal" / "cooling_device0" / "cur_state").read_text(),
+                "100\n",
+            )
+
+            root = Path(directory) / "stopped"
+            root.mkdir()
+            _status, actions, alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                module=False, unit_state=manual,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            self.assertTrue(any("fans are stopped" in item for item in alerts))
+            self.assertFalse(any("not active" in item for item in alerts))
+            self.assertIn("stopped (manual)", "\n".join(logs))
+
+            root = Path(directory) / "held"
+            root.mkdir()
+            held_marker = root / "marker"
+            held_marker.mkdir()
+            CONTROL.write_last_manual_state(held_marker, 12, 13500, "EC 3.5.8")
+            _status, actions, alerts, _logs, marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                module=True, cooling_state=12, marker=held_marker / "true-zero-reboot",
+            )
+            self.assertTrue((held_marker / CONTROL.MANUAL_STATE_NAME).exists())
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            self.assertEqual(
+                (root / "thermal" / "cooling_device2" / "cur_state").read_text(),
+                "12\n",
+            )
+            self.assertEqual(
+                (root / "thermal" / "cooling_device0" / "cur_state").read_text(),
+                "40\n",
+            )
+
+            root = Path(directory) / "spinning-zero"
+            root.mkdir()
+            _status, actions, alerts, _logs, _marker = self._drive_watchdog(
+                root, rpm=(2700, 4050), celsius=40, gpu=lambda: False, stop_after=80,
+                module=True, cooling_state=0,
+            )
+            self.assertEqual(actions, [])
+            self.assertEqual(alerts, [])
+            self.assertEqual(
+                (root / "thermal" / "cooling_device2" / "cur_state").read_text(),
+                "0\n",
+            )
+
+            root = Path(directory) / "automatic"
+            root.mkdir()
+            _status, actions, alerts, _logs, marker = self._drive_watchdog(
+                root, rpm=(2700, 4050), celsius=40, gpu=lambda: False, stop_after=80,
+                module=True, cooling_state=0,
+            )
+            self.assertFalse((marker.parent / CONTROL.MANUAL_STATE_NAME).exists())
+            self.assertEqual(actions, [])
+            self.assertEqual(alerts, [])
+
+            root = Path(directory) / "stopped-fans-state-zero"
+            root.mkdir()
+            _status, actions, _alerts, _logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                module=True, cooling_state=0,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
 
     def test_one_spinning_fan_or_one_input_does_not_alert(self):
         with tempfile.TemporaryDirectory() as directory:

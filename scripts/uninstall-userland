@@ -14,10 +14,13 @@ fi
 
 systemctl disable --now dgx-fan-watchdog.service
 systemctl disable --now dgx-fan-health.service
+systemctl disable --now dgx-fan-manual.service
 systemctl disable --now dgx-fan-control.service
 rm -f /etc/systemd/system/dgx-fan-watchdog.service
 rm -f /etc/systemd/system/dgx-fan-health.service
+rm -f /etc/systemd/system/dgx-fan-manual.service
 rm -f /etc/systemd/system/dgx-fan-control.service
+rm -f /etc/modprobe.d/dgx-fan-control-owned.conf
 rm -f /etc/update-motd.d/95-dgx-fan-control
 rm -f /etc/default/dgx-fan-control
 rm -f /usr/local/sbin/dgx-fan-control

@@ -56,6 +56,10 @@ class KernelContractTests(unittest.TestCase):
             "has completed this probe",
             "has also timed out",
             "refusing to replace existing lower floor",
+            "taking ownership of existing lower floor",
+            "module_param(owned_state, int, 0444)",
+            "module_param(owned_floor, uint, 0444)",
+            "matches owned state",
             "Do not write ACPI level 0",
             "realtime=%lld.%09ld uptime=%lld.%09ld",
             "ret = -EAGAIN",
@@ -154,9 +158,13 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("--no-watchdog", INSTALL_USERLAND)
         self.assertIn("not enabling dgx-fan-watchdog.service (--no-watchdog)", INSTALL_USERLAND)
         self.assertIn("systemctl enable dgx-fan-health.service\n", INSTALL_USERLAND)
+        self.assertIn("systemctl enable dgx-fan-manual.service\n", INSTALL_USERLAND)
+        self.assertIn("/etc/systemd/system/dgx-fan-manual.service", INSTALL_USERLAND)
         self.assertIn("/etc/update-motd.d/95-dgx-fan-control", INSTALL_USERLAND)
         self.assertIn("systemctl disable --now dgx-fan-watchdog.service\n", UNINSTALL_USERLAND)
         self.assertIn("systemctl disable --now dgx-fan-health.service\n", UNINSTALL_USERLAND)
+        self.assertIn("systemctl disable --now dgx-fan-manual.service\n", UNINSTALL_USERLAND)
+        self.assertIn("rm -f /etc/modprobe.d/dgx-fan-control-owned.conf\n", UNINSTALL_USERLAND)
         self.assertIn("rm -f /etc/update-motd.d/95-dgx-fan-control\n", UNINSTALL_USERLAND)
         health = (ROOT / "systemd" / "dgx-fan-health.service").read_text()
         self.assertIn("Type=oneshot\n", health)
@@ -174,6 +182,7 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("READY_CHECK=\n", defaults)
         self.assertIn("BUSY_CHECK=\n", defaults)
         self.assertIn("MAX_DEFER_SECONDS=1800\n", defaults)
+        self.assertIn("MANUAL_STATE=\n", defaults)
 
 
 if __name__ == "__main__":
