@@ -4517,6 +4517,17 @@ def main(argv: list[str] | None = None) -> int:
                 stuck_seconds=args.stuck_seconds,
             )
         if args.command == "acpi-max":
+            # Telemetry-only firmware (EC 3.13.7): ACPI cur_state writes are
+            # accepted and ignored for RPM. Do not write; leave set_acpi_fans
+            # unchanged for the watchdog stall-repair caller on supported EC.
+            if classify_fan_binding(args.thermal_root, args.hwmon_root) == "unsupported":
+                profile = pinned_ec_name(read_kernel_log()) or "EC 3.13.7"
+                LOG.info(
+                    "acpi-max: nothing written (%s, telemetry only; "
+                    "EC runs its own curve)",
+                    profile,
+                )
+                return 0
             set_acpi_fans(
                 args.thermal_root, args.level, force=args.force,
                 profile=pinned_ec_name(read_kernel_log()),
