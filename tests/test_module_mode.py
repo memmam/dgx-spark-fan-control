@@ -122,6 +122,7 @@ class ModuleModeTests(unittest.TestCase):
         self.assertIn("service-active: inactive\n", report)
         self.assertIn("watchdog-enabled: unknown\n", report)
         self.assertIn("watchdog-active: unknown\n", report)
+        self.assertNotIn("watchdog-hint:", report)
         self.assertIn("mode: ACPI-only\n", report)
         self.assertIn("initramfs: ", report)
         self.assertIn("service-exit: n/a\n", report)
@@ -175,6 +176,21 @@ class ModuleModeTests(unittest.TestCase):
         self.assertIn(
             ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
         )
+
+    def test_status_hints_when_the_watchdog_unit_is_not_installed(self):
+        hint = CONTROL.format_watchdog_status("inactive", "not-found")
+        self.assertIn("watchdog-active: inactive\n", hint)
+        self.assertIn("watchdog-enabled: not-found\n", hint)
+        self.assertEqual(hint.count("watchdog-hint:"), 1)
+        self.assertIn("docs/installation.md#5-choose-your-startup-mode", hint)
+        installed = CONTROL.format_watchdog_status("active", "enabled")
+        self.assertNotIn("watchdog-hint:", installed)
+        report = CONTROL.module_status(
+            self.etc, loaded=True, service_active="inactive", service_enabled="disabled",
+            watchdog_active="inactive", watchdog_enabled="not-found",
+        )
+        self.assertEqual(report.count("watchdog-hint:"), 1)
+        self.assertIn("docs/installation.md#5-choose-your-startup-mode", report)
 
     def test_status_names_unsupported_control(self):
         report = CONTROL.module_status(

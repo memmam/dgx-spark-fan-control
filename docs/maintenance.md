@@ -97,20 +97,26 @@ Then follow the route you originally installed:
   DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
   in the next step or the previous CLI remains.
 
-Refresh the command and service definition, then load and check the new module:
+Refresh the command and **both** unit files, then load and check the new module.
+The full update steps, including when to restart each service, are in
+[Updating an existing install](installation.md#updating-an-existing-install).
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
 sudo install -D -m 0644 systemd/dgx-fan-control.service \
   /etc/systemd/system/dgx-fan-control.service
+sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
+  /etc/systemd/system/dgx-fan-watchdog.service
 sudo systemctl daemon-reload
 sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
 
-If you want the performance curve again, run
-`sudo systemctl start dgx-fan-control.service`. Otherwise leave it stopped for
-NVIDIA's factory curve. Existing boot enablement is preserved.
+Restart `dgx-fan-watchdog.service` if it is active. Restart
+`dgx-fan-control.service` only if it is active. Do not enable the performance
+daemon from an update. If status says `watchdog-enabled: not-found`, install
+and enable the watchdog unit as in
+[startup modes](installation.md#5-choose-your-startup-mode).
 
 ## Switch from manual installation to DKMS
 

@@ -740,8 +740,17 @@ def format_cooling_status(state: int, hottest_c: float) -> str:
     return f"{text} hottest={hottest_c:.1f}C"
 
 
+WATCHDOG_NOT_FOUND_HINT = (
+    "watchdog-hint: unit not installed; see "
+    "docs/installation.md#5-choose-your-startup-mode"
+)
+
+
 def format_watchdog_status(active: str, enabled: str) -> str:
-    return f"watchdog-active: {active}\nwatchdog-enabled: {enabled}\n"
+    text = f"watchdog-active: {active}\nwatchdog-enabled: {enabled}\n"
+    if enabled == "not-found":
+        text += WATCHDOG_NOT_FOUND_HINT + "\n"
+    return text
 
 
 def watchdog_unit_state() -> tuple[str, str]:
@@ -1197,6 +1206,7 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
         f"service-active: {service_active}",
         f"watchdog-enabled: {watchdog_enabled}",
         f"watchdog-active: {watchdog_active}",
+        *([WATCHDOG_NOT_FOUND_HINT] if watchdog_enabled == "not-found" else []),
         f"control: {control}",
         f"mode: {mode}",
         "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),

@@ -212,7 +212,7 @@ probing can still reject the firmware contract. See
 ## 5. Choose your startup mode
 
 Install the boot-load entry, both unit files, and the command. This enables
-and starts **only** `dgx-fan-watchdog.service`. It does not enable
+and starts **only** `dgx-fan-watchdog.service`. It does **not** enable
 `dgx-fan-control.service`.
 
 ```sh
@@ -221,11 +221,64 @@ sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
 sudo ./scripts/install-userland
 ```
 
-To install the same files without enabling the watchdog:
+The same commands by hand, without the script. Run them from the checkout.
+This installs the command, both unit files, and the modules-load entry, then
+reloads systemd and enables the watchdog. It does **not** enable
+`dgx-fan-control.service`.
 
 ```sh
-sudo ./scripts/install-userland --no-watchdog
+sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
+sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
+  /etc/modules-load.d/dgx_ec_fan_control.conf
+sudo install -D -m 0644 systemd/dgx-fan-control.service \
+  /etc/systemd/system/dgx-fan-control.service
+sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
+  /etc/systemd/system/dgx-fan-watchdog.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dgx-fan-watchdog.service
 ```
+
+To install those files and leave the watchdog disabled, stop before the
+`enable --now` line, or run `sudo ./scripts/install-userland --no-watchdog`.
+
+Manual removal of the command and both units, the same steps as
+`scripts/uninstall-userland`. This does not unload the kernel module. Restore
+the factory curve first, as in [maintenance](maintenance.md#uninstall).
+
+```sh
+sudo systemctl disable --now dgx-fan-watchdog.service
+sudo systemctl disable --now dgx-fan-control.service
+sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
+sudo rm -f /etc/systemd/system/dgx-fan-control.service
+sudo rm -f /usr/local/sbin/dgx-fan-control
+sudo systemctl daemon-reload
+```
+
+### Updating an existing install
+
+After `git pull`, reinstall the command and **both** unit files. Copying only
+`dgx-fan-control.service` leaves the watchdog unit missing, and `status`
+then shows `watchdog-enabled: not-found`.
+
+```sh
+sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
+sudo install -D -m 0644 systemd/dgx-fan-control.service \
+  /etc/systemd/system/dgx-fan-control.service
+sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
+  /etc/systemd/system/dgx-fan-watchdog.service
+sudo systemctl daemon-reload
+if systemctl is-active --quiet dgx-fan-watchdog.service; then
+  sudo systemctl restart dgx-fan-watchdog.service
+fi
+if systemctl is-active --quiet dgx-fan-control.service; then
+  sudo systemctl restart dgx-fan-control.service
+fi
+```
+
+If the watchdog unit was not installed yet, `is-active` does not enable it.
+Use the manual install above, including `systemctl enable --now
+dgx-fan-watchdog.service`. Restart the performance daemon only when it is
+already active. Do not enable it from this update.
 
 Then choose one mode:
 

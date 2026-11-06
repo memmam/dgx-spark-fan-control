@@ -158,8 +158,11 @@ Anyone running external airflow should read `fan1_input` after every boot.
 `dgx-fan-watchdog.service` runs `dgx-fan-control watchdog` at boot. It does
 not depend on the performance daemon or this kernel module, so disabling
 `dgx-fan-control.service` leaves it running. `sudo ./scripts/install-userland`
-enables it; `--no-watchdog` skips that. It reads `acpi_fan` and
-`thermal_zone0`. If every fan stays at 0 RPM for 15 seconds, at
+enables it; `--no-watchdog` skips that. The same `install` commands, for both
+unit files, are written out in
+[startup modes](docs/installation.md#5-choose-your-startup-mode). Copying only
+the performance unit leaves `status` at `watchdog-enabled: not-found`. The
+watchdog reads `acpi_fan` and `thermal_zone0`. If every fan stays at 0 RPM for 15 seconds, at
 any temperature, it logs and broadcasts with `wall` and does not power off.
 On a cold stop, and only when `dgx_ec_fan_control` is not loaded, it tries
 once to write ACPI Fan level 100. It never writes level 0. If every fan stays

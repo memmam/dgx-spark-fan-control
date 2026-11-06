@@ -271,7 +271,9 @@ If every fan stays at 0 RPM for more than 10 seconds while `thermal_zone0`
 is at least 70°C, it logs at critical level and runs `systemctl poweroff`.
 That hot hold is separate from the 15-second alert.
 
-The installer starts this as `dgx-fan-watchdog.service`. That unit does not
+Install starts this as `dgx-fan-watchdog.service`, either with
+`scripts/install-userland` or the manual commands in
+[startup modes](installation.md#5-choose-your-startup-mode). That unit does not
 depend on `dgx-fan-control.service` or on the kernel module, so stopping or
 disabling the performance daemon leaves the watchdog running. `module enable`
 and `module disable` do not touch it. Opt out at install time with
