@@ -700,7 +700,9 @@ class UserlandFailureTests(unittest.TestCase):
             argv = ["--thermal-root", str(thermal)]
             code, stdout, stderr = run_cli([*argv, "status"])
             self.assertEqual(code, 0)
-            self.assertEqual(stdout, "state=4/12 hottest=50.0C\n")
+            self.assertTrue(stdout.startswith("state=4/12 hottest=50.0C\n"))
+            self.assertIn("watchdog-active:", stdout)
+            self.assertIn("watchdog-enabled:", stdout)
             self.assertEqual(stderr, "")
             code, stdout, stderr = run_cli([*argv, "set-state", "6"])
             self.assertEqual(code, 0)
@@ -714,7 +716,11 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual((device / "cur_state").read_text(), "0\n")
             code, stdout, stderr = run_cli([*argv, "status"])
             self.assertEqual(code, 0)
-            self.assertEqual(stdout, "state=0/12 (no floor; EC curve) hottest=50.0C\n")
+            self.assertTrue(
+                stdout.startswith("state=0/12 (no floor; EC curve) hottest=50.0C\n")
+            )
+            self.assertEqual(stdout.count("watchdog-active:"), 1)
+            self.assertEqual(stdout.count("watchdog-enabled:"), 1)
             self.assertEqual(stderr, "")
 
     def test_unknown_curve_and_unprivileged_module_are_reported_once(self):

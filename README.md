@@ -155,8 +155,11 @@ suspected trigger is boot-time state: boot order against external airflow, or
 the EC stopping its own fans. That has not been tested.
 
 Anyone running external airflow should read `fan1_input` after every boot.
-`sudo dgx-fan-control watchdog` reads `acpi_fan` and `thermal_zone0`. It does
-not need this kernel module. If every fan stays at 0 RPM for 15 seconds, at
+`dgx-fan-watchdog.service` runs `dgx-fan-control watchdog` at boot. It does
+not depend on the performance daemon or this kernel module, so disabling
+`dgx-fan-control.service` leaves it running. `sudo ./scripts/install-userland`
+enables it; `--no-watchdog` skips that. It reads `acpi_fan` and
+`thermal_zone0`. If every fan stays at 0 RPM for 15 seconds, at
 any temperature, it logs and broadcasts with `wall` and does not power off.
 On a cold stop, and only when `dgx_ec_fan_control` is not loaded, it tries
 once to write ACPI Fan level 100. It never writes level 0. If every fan stays
@@ -232,14 +235,16 @@ reported and left untouched. `module enable` removes only the managed
 blacklist, restores the modules-load.d entry, and loads the module. It does
 **not** enable or start `dgx-fan-control.service`. That is a separate choice:
 `sudo dgx-fan-control module enable --start-service` or
-`sudo systemctl enable --now dgx-fan-control.service`. On EC 3.13.7, where the
+`sudo systemctl enable --now dgx-fan-control.service`. Neither `module enable`
+nor `module disable` enables, starts, or stops the watchdog. On EC 3.13.7, where the
 module registers telemetry only, enable loads the module and leaves the
 service disabled. It prints once that fan control is unsupported and points
 at `acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
 
 `module status` prints whether the module is loaded, whether the managed
-blacklist or another blacklist is present, whether the service is enabled and
-active, whether fan control is `supported` or `unsupported (EC 3.13.7,
+blacklist or another blacklist is present, whether the performance service
+and the watchdog are enabled and active, whether fan control is `supported`
+or `unsupported (EC 3.13.7,
 telemetry only)`, and the mode (`module` or `ACPI-only`). `service-exit` is
 `n/a` while the unit is running, or while it is disabled and has not failed,
 including a leftover code from a run before the latest disable. When the unit

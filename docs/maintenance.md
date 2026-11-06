@@ -130,12 +130,20 @@ copies first avoids DKMS backing one up and restoring it during later removal.
 
 ### 1. Restore the factory curve before removing anything
 
+Stop the watchdog first so it cannot write an ACPI level while the module
+comes out. Then stop the performance daemon and restore the factory curve.
+
 ```sh
+sudo systemctl disable --now dgx-fan-watchdog.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo dgx-fan-control automatic
 dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
 sudo modprobe -r dgx_ec_fan_control
 ```
+
+`sudo ./scripts/uninstall-userland` stops and disables both units and removes
+their files and the command. Run it only after the factory curve is restored.
+It does not unload the kernel module.
 
 If restoration, readback, or unload fails, stop here and consult
 [troubleshooting](troubleshooting.md). Do not discard the tools needed to
@@ -166,6 +174,7 @@ registered version uses it.
 ```sh
 sudo rm -f /etc/modules-load.d/dgx_ec_fan_control.conf
 sudo rm -f /etc/systemd/system/dgx-fan-control.service
+sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
 sudo rm -f /usr/local/sbin/dgx-fan-control
 sudo systemctl daemon-reload
 ```

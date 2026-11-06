@@ -1,0 +1,47 @@
+[Unit]
+Description=DGX Spark fan-stall watchdog
+# This unit does not depend on the performance daemon or the kernel module.
+# No Requires, Wants, BindsTo, PartOf, or After on that daemon: disabling
+# the performance service must leave this process running.
+# It reads ACPI hwmon and thermal_zone0 directly.
+After=sysinit.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/dgx-fan-control watchdog
+Restart=always
+# Short enough that a crash does not leave fans unwatched for the 15s alert.
+RestartSec=5s
+TimeoutStopSec=15s
+
+# Root, so sysfs writes and systemctl poweroff are allowed by DAC and D-Bus
+# policy. NoNewPrivileges is safe here because nothing needs to gain a uid.
+NoNewPrivileges=yes
+# An empty CapabilityBoundingSet would drop CAP_DAC_OVERRIDE. wall then
+# cannot write other users' ptys. Leave the bounding set unset.
+# PrivateDevices would hide /dev/pts, so wall could not broadcast.
+# PrivateNetwork is left unset so the system D-Bus socket stays reachable
+# for systemctl is-active and systemctl poweroff.
+# ProtectKernelTunables would make /sys read-only and block the cool-stall
+# write of ACPI cur_state=100. Do not set it.
+# ProtectSystem=strict leaves the API filesystems /dev, /proc, and /sys
+# mounted as they are. ReadWritePaths=/sys keeps the level-100 write working
+# even if a later systemd remounts /sys read-only under strict.
+ProtectSystem=strict
+ReadWritePaths=/sys
+ProtectHome=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# systemctl and D-Bus use AF_UNIX. No other family is required.
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

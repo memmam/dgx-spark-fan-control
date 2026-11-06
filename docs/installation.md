@@ -211,14 +211,20 @@ probing can still reject the firmware contract. See
 
 ## 5. Choose your startup mode
 
-Install the boot-load entry and optional service definition:
+Install the boot-load entry, both unit files, and the command. This enables
+and starts **only** `dgx-fan-watchdog.service`. It does not enable
+`dgx-fan-control.service`.
 
 ```sh
 sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
   /etc/modules-load.d/dgx_ec_fan_control.conf
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo systemctl daemon-reload
+sudo ./scripts/install-userland
+```
+
+To install the same files without enabling the watchdog:
+
+```sh
+sudo ./scripts/install-userland --no-watchdog
 ```
 
 Then choose one mode:
@@ -245,6 +251,31 @@ same as the table above. `start`/`stop` change the current session;
 `enable`/`disable` change future boots. Disabling the service alone does not
 clear a manually set non-zero floor, which is why `automatic` is explicit
 above. Do not substitute an ACPI level of 0 for `automatic`.
+
+The watchdog is a separate unit. It reads the ACPI fans and `thermal_zone0`
+directly. `systemctl disable --now dgx-fan-control.service` and
+`module disable` do not stop it.
+
+After a reboot, check the watchdog only. Do not write an ACPI fan level for
+this check.
+
+```sh
+systemctl is-active dgx-fan-watchdog.service
+sudo journalctl -u dgx-fan-watchdog.service -b --no-pager | head
+```
+
+`is-active` should print `active`. The journal should contain
+`fan-stall watchdog watching`. If you have explicitly enabled the performance
+service, stop it without disabling it, confirm the watchdog journal then
+shows the daemon-not-active alert, and start it again:
+
+```sh
+sudo systemctl stop dgx-fan-control.service
+sudo journalctl -u dgx-fan-watchdog.service -n 20 --no-pager
+sudo systemctl start dgx-fan-control.service
+```
+
+Do not write ACPI `cur_state` 0, or any level below 40, to provoke a stall.
 
 For the performance service, verify startup:
 

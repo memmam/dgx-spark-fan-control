@@ -61,6 +61,7 @@ class ModuleModeTests(unittest.TestCase):
         unloads = [cmd for cmd in self.commands if cmd[:2] == ["modprobe", "-r"]]
         self.assertEqual(len(unloads), 1)
         self.assertIn(["systemctl", "disable", "--now", CONTROL.DAEMON_UNIT], self.commands)
+        self.assertFalse(any(CONTROL.WATCHDOG_UNIT in cmd for cmd in self.commands))
 
     def test_enable_restores_autoload_and_is_idempotent(self):
         with self.assertLogs(CONTROL.LOG, level="WARNING"):
@@ -99,6 +100,7 @@ class ModuleModeTests(unittest.TestCase):
         self.assertIn(
             ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
         )
+        self.assertFalse(any(CONTROL.WATCHDOG_UNIT in cmd for cmd in self.commands))
 
     def test_status_reports_acpi_only_and_initramfs_without_editing_it(self):
         initramfs = self.etc / "initramfs-tools" / "modules"
@@ -118,6 +120,8 @@ class ModuleModeTests(unittest.TestCase):
         self.assertNotIn("local-options.conf", report)
         self.assertIn("service-enabled: disabled\n", report)
         self.assertIn("service-active: inactive\n", report)
+        self.assertIn("watchdog-enabled: unknown\n", report)
+        self.assertIn("watchdog-active: unknown\n", report)
         self.assertIn("mode: ACPI-only\n", report)
         self.assertIn("initramfs: ", report)
         self.assertIn("service-exit: n/a\n", report)

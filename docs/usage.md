@@ -271,9 +271,30 @@ If every fan stays at 0 RPM for more than 10 seconds while `thermal_zone0`
 is at least 70°C, it logs at critical level and runs `systemctl poweroff`.
 That hot hold is separate from the 15-second alert.
 
+The installer starts this as `dgx-fan-watchdog.service`. That unit does not
+depend on `dgx-fan-control.service` or on the kernel module, so stopping or
+disabling the performance daemon leaves the watchdog running. `module enable`
+and `module disable` do not touch it. Opt out at install time with
+`sudo ./scripts/install-userland --no-watchdog`.
+
 ```sh
 sudo dgx-fan-control watchdog
 ```
+
+After a reboot, `systemctl is-active dgx-fan-watchdog.service` should print
+`active`, and `journalctl -u dgx-fan-watchdog.service` should contain
+`fan-stall watchdog watching`. If the performance service is enabled, stop
+it without disabling it and confirm the watchdog journal shows the
+daemon-not-active alert, then start it again:
+
+```sh
+sudo systemctl stop dgx-fan-control.service
+sudo journalctl -u dgx-fan-watchdog.service -n 20 --no-pager
+sudo systemctl start dgx-fan-control.service
+```
+
+Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
+path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
 `--zero-seconds`, `--stall-seconds`, `--soc-celsius`, and `--action` change
 the hot hold, the any-temperature alert hold, the temperature, and the

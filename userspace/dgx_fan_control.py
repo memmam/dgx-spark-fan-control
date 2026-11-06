@@ -35,6 +35,7 @@ WATCHDOG_STALL_SECONDS = 15.0
 WATCHDOG_SOC_CELSIUS = 70.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 DAEMON_UNIT = "dgx-fan-control.service"
+WATCHDOG_UNIT = "dgx-fan-watchdog.service"
 DAEMON_ALERT_INTERVAL_SECONDS = 60.0
 MODULE_NAME = "dgx_ec_fan_control"
 MANAGED_BLACKLIST_NAME = "dgx-spark-fan-control-disable.conf"
@@ -739,6 +740,17 @@ def format_cooling_status(state: int, hottest_c: float) -> str:
     return f"{text} hottest={hottest_c:.1f}C"
 
 
+def format_watchdog_status(active: str, enabled: str) -> str:
+    return f"watchdog-active: {active}\nwatchdog-enabled: {enabled}\n"
+
+
+def watchdog_unit_state() -> tuple[str, str]:
+    return (
+        systemctl_query("is-active", WATCHDOG_UNIT),
+        systemctl_query("is-enabled", WATCHDOG_UNIT),
+    )
+
+
 def run_daemon(thermal_root: Path, poll_seconds: float,
                hwmon_root: Path | None = None, curve: str | None = None) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
@@ -1162,7 +1174,9 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
                   control: str = "unknown", exec_status: int | None = None,
                   exit_timestamp: str | None = None,
                   start_monotonic_us: int | None = None,
-                  exit_monotonic_us: int | None = None) -> str:
+                  exit_monotonic_us: int | None = None,
+                  watchdog_active: str = "unknown",
+                  watchdog_enabled: str = "unknown") -> str:
     modprobe_dir, _modules_load, managed = module_paths(etc)
     foreign = foreign_blacklist_files(modprobe_dir)
     initramfs = initramfs_module_files(etc)
@@ -1181,6 +1195,8 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
         "other-blacklists: " + (", ".join(str(path) for path in foreign) if foreign else "none"),
         f"service-enabled: {service_enabled}",
         f"service-active: {service_active}",
+        f"watchdog-enabled: {watchdog_enabled}",
+        f"watchdog-active: {watchdog_active}",
         f"control: {control}",
         f"mode: {mode}",
         "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),
@@ -1407,6 +1423,7 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 profile = None
             exec_status, exit_timestamp, start_us, exit_us = read_exec_main()
+            watchdog_active, watchdog_enabled = watchdog_unit_state()
             print(module_status(
                 etc,
                 loaded=loaded,
@@ -1417,6 +1434,8 @@ def main(argv: list[str] | None = None) -> int:
                 exit_timestamp=exit_timestamp,
                 start_monotonic_us=start_us,
                 exit_monotonic_us=exit_us,
+                watchdog_active=watchdog_active,
+                watchdog_enabled=watchdog_enabled,
             ), end="")
             return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
@@ -1434,9 +1453,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(exc)
                     return 1
                 raise
+            active, enabled = watchdog_unit_state()
             print(format_cooling_status(
                 state, read_hottest_temperature_c(args.thermal_root),
             ))
+            print(format_watchdog_status(active, enabled), end="")
             return 0
     except ControlUnsupported as exc:
         # status is interactive: print the reason once. Logging it as well
@@ -1444,7 +1465,9 @@ def main(argv: list[str] | None = None) -> int:
         # The daemon and the write commands only log, so the journal has one
         # line. Exit 69 is only the daemon's startup check.
         if args.command == "status":
+            active, enabled = watchdog_unit_state()
             print(CONTROL_UNSUPPORTED)
+            print(format_watchdog_status(active, enabled), end="")
             return 0
         LOG.error("%s", exc)
         if args.command == "daemon":
@@ -1455,7 +1478,9 @@ def main(argv: list[str] | None = None) -> int:
             str(exc).startswith("no dgx_ec_fan_floor")
             or "floor was changed outside this driver" in str(exc)
         ):
+            active, enabled = watchdog_unit_state()
             print(exc)
+            print(format_watchdog_status(active, enabled), end="")
             return 1
         if not was_reported(exc):
             LOG.error("%s", exc)

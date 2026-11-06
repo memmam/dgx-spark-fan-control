@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "kernel" / "dgx_ec_fan_control.c").read_text()
 MODULE_PATH = ROOT / "userspace" / "dgx_fan_control.py"
 SERVICE = (ROOT / "systemd" / "dgx-fan-control.service").read_text()
+WATCHDOG_SERVICE = (ROOT / "systemd" / "dgx-fan-watchdog.service").read_text()
+INSTALL_USERLAND = (ROOT / "scripts" / "install-userland").read_text()
+UNINSTALL_USERLAND = (ROOT / "scripts" / "uninstall-userland").read_text()
 SPEC = importlib.util.spec_from_file_location("dgx_fan_control", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 CONTROL = importlib.util.module_from_spec(SPEC)
@@ -121,6 +124,36 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec=0\n", SERVICE)
         self.assertIn("RestartPreventExitStatus=69\n", SERVICE)
         self.assertNotIn("StartLimitBurst", SERVICE)
+
+    def test_watchdog_unit_is_independent_and_can_do_its_job(self):
+        text = WATCHDOG_SERVICE
+        self.assertIn("ExecStart=/usr/local/sbin/dgx-fan-control watchdog\n", text)
+        self.assertIn("Restart=always\n", text)
+        self.assertIn("RestartSec=5s\n", text)
+        self.assertIn("StartLimitIntervalSec=0\n", text)
+        self.assertIn("WantedBy=multi-user.target\n", text)
+        for forbidden in (
+            "Requires=",
+            "BindsTo=",
+            "PartOf=",
+            "Wants=dgx-fan-control.service",
+            "After=dgx-fan-control.service",
+            "dgx-fan-control.service",
+            "PrivateDevices=",
+            "PrivateNetwork=",
+            "ProtectKernelTunables=",
+            "CapabilityBoundingSet=",
+        ):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("ProtectSystem=strict\n", text)
+        self.assertIn("ReadWritePaths=/sys\n", text)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX\n", text)
+        self.assertIn("NoNewPrivileges=yes\n", text)
+        self.assertIn("systemctl enable --now dgx-fan-watchdog.service\n", INSTALL_USERLAND)
+        self.assertNotIn("enable --now dgx-fan-control.service", INSTALL_USERLAND)
+        self.assertIn("--no-watchdog", INSTALL_USERLAND)
+        self.assertIn("not enabling dgx-fan-watchdog.service (--no-watchdog)", INSTALL_USERLAND)
+        self.assertIn("systemctl disable --now dgx-fan-watchdog.service\n", UNINSTALL_USERLAND)
 
 
 if __name__ == "__main__":
