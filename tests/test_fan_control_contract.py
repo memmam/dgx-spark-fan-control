@@ -256,8 +256,59 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("MANUAL_STATE=\n", defaults)
         self.assertIn("PROGRESS_CHECK=\n", defaults)
         self.assertIn("STUCK_SECONDS=600\n", defaults)
-        self.assertIn("vllm:generation_tokens_total", defaults)
-        self.assertIn("vllm:prompt_tokens_total", defaults)
+        self.assertIn(
+            "awk '/^vllm:(generation|prompt)_tokens_total[{ ]/{s+=$NF} END{print s+0}'",
+            defaults,
+        )
+
+    def test_vllm_progress_example_sums_labeled_series_and_keeps_zero(self):
+        awk = re.search(
+            r"awk '([^']+)'",
+            (ROOT / "systemd" / "dgx-fan-control.default").read_text(),
+        )
+        usage = re.search(r"awk '([^']+)'", (ROOT / "docs" / "usage.md").read_text())
+        self.assertIsNotNone(awk)
+        self.assertIsNotNone(usage)
+        self.assertEqual(awk.group(1), usage.group(1))
+        program = awk.group(1)
+        metrics = "\n".join((
+            '# HELP vllm:generation_tokens_total Generated tokens.',
+            'vllm:generation_tokens_total{model_name="alpha"} 1000.0',
+            'vllm:generation_tokens_total{model_name="beta"} 50',
+            'vllm:prompt_tokens_total{model_name="alpha"} 200.5',
+            'vllm:prompt_tokens_total{model_name="beta"} 0',
+            "vllm:prompt_tokens_total 1",
+            'vllm:generation_tokens_created{model_name="alpha"} 999',
+            'vllm:request_success_total{model_name="alpha"} 7',
+            "",
+        ))
+
+        def sampled(text: str) -> float | None:
+            quoted = text.replace("'", "'\\''")
+            return CONTROL.read_progress_value(
+                f"printf '%s\\n' '{quoted}' | awk '{program}'"
+            )
+
+        self.assertEqual(sampled(metrics), 1251.5)
+        self.assertEqual(sampled(""), 0.0)
+        self.assertEqual(sampled("# no counters\n"), 0.0)
+        state: dict = {}
+        for moment, value in ((0.0, 0.0), (10.0, 0.0), (20.0, 1251.5)):
+            CONTROL.observe_hot_job(
+                now=moment, fan_rpms=[2700, 4050], hottest=90.0, busy=True,
+                defaults={"PROGRESS_CHECK": "tokens"},
+                state_dir=Path("/nonexistent-job-watch"),
+                notifier=lambda _message: None, alert_repeat=1800,
+                zero_fan_celsius=85, stuck_seconds=600, state=state,
+                progress_reader=lambda _command, value=value: value,
+                builtin_reader=lambda: (_ for _ in ()).throw(
+                    AssertionError("zero is a hook sample"),
+                ),
+            )
+            self.assertFalse(state.get("hook_failed"))
+            self.assertEqual(state.get("source"), "hook")
+        self.assertEqual(state.get("progress_value"), 1251.5)
+        self.assertFalse(state.get("stuck"))
 
 
 if __name__ == "__main__":

@@ -704,8 +704,8 @@ def read_progress_value(command: str) -> float | None:
     """A monotonic progress number from PROGRESS_CHECK, or None if unusable.
 
     The command has the same timeout as BUSY_CHECK. Success is exit 0 and a
-    final token that parses as a number. A higher number than last time is
-    progress.
+    final token that parses as a number, including 0. A zero sum is a real
+    sample. A higher number than last time is progress.
     """
     command = command.strip()
     if not command:

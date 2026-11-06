@@ -375,14 +375,15 @@ cutoff. The stuck warning itself is raised only during a hot episode.
 
 `PROGRESS_CHECK` in `/etc/default/dgx-fan-control` is the primary signal. It
 is a command with the same 5 second timeout as `BUSY_CHECK`. It must print
-one monotonic number. A larger number than the last sample is progress. A
-failure, a timeout, or output that is not a number is logged once, and the
+one monotonic number. A total of 0 is still that number; only a larger
+number than the last sample is progress. A failure, a timeout, or output
+that is not a number is logged once, and the
 watchdog falls back to the built-in heuristic until the hook works again.
 Empty means the built-in heuristic. This example reads vLLM's Prometheus
 counters and is not enabled by default:
 
 ```
-PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:generation_tokens_total /{g=$2} /^vllm:prompt_tokens_total /{p=$2} END{print g+p}'
+PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:(generation|prompt)_tokens_total[{ ]/{s+=$NF} END{print s+0}'
 ```
 
 The built-in heuristic is weaker. With a compute process still present, the

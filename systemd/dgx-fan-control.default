@@ -41,8 +41,11 @@ MAX_DEFER_SECONDS=1800
 # processes' CPU time in /proc/<pid>/stat stops advancing. A long prefill
 # can look idle. A busy-loop hang can look alive.
 #
-# Example, not enabled. vLLM Prometheus counters:
-# PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:generation_tokens_total /{g=$2} /^vllm:prompt_tokens_total /{p=$2} END{print g+p}'
+# Example, not enabled. vLLM Prometheus lines carry labels, for example
+# vllm:generation_tokens_total{model_name="x"} 1234.0. Match with or without
+# labels and sum every series. A total of 0 is still a number. Only a
+# larger total than the last sample is progress.
+# PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:(generation|prompt)_tokens_total[{ ]/{s+=$NF} END{print s+0}'
 PROGRESS_CHECK=
 
 # Seconds without progress before a hot-under-load warning. Progress is
