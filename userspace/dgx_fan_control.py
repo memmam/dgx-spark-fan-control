@@ -138,6 +138,9 @@ CONTROLLER_UNAVAILABLE_EXIT = 69
 UNSUPPORTED_FIRMWARE_EXIT = 69
 # Probe refused a floor this driver does not own. Restarting cannot fix it.
 FOREIGN_FLOOR_EXIT = 78
+# A held manual floor is recorded. Starting the curve would walk it down,
+# and the stop path would write state 0. The floor stays until automatic.
+HELD_FLOOR_EXIT = 79
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
     errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
@@ -427,13 +430,16 @@ def daemon_stop_is_manual(active: str, enabled: str,
 
     Restart=always would restart a spontaneous exit 0, so an inactive unit
     whose result is success and whose exit is 0 was stopped with systemctl.
-    Disabled and inactive is the same choice. Exit 69 and 78 are not that.
+    Disabled and inactive is the same choice. Exits 69, 78, and 79 are not that.
+    Exit 79 is a held floor: the daemon refused to start.
     """
     if active == "failed" or active != "inactive":
         return False
     if enabled == "disabled":
         return True
-    if exec_status in (UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT):
+    if exec_status in (
+        UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT, HELD_FLOOR_EXIT,
+    ):
         return False
     if result == "success" and exec_status in (None, 0):
         return True
@@ -450,11 +456,14 @@ def daemon_needs_alarm(active: str, enabled: str = "enabled",
     """Alarm on a crash, a nonzero exit, or a restart loop.
 
     A manual stop does not alarm. Exit 69 does not alarm in any unit state,
-    including failed and enabled: that is the telemetry-only probe. Exit 78
-    does not alarm unless the unit is failed. Recognized unsupported firmware
-    is not a fault whether the unit is enabled or disabled.
+    including failed and enabled: that is the telemetry-only probe. Exit 79
+    does not alarm in any unit state either: a held floor refused the start.
+    Exit 78 does not alarm unless the unit is failed. Recognized unsupported
+    firmware is not a fault whether the unit is enabled or disabled.
     """
-    if firmware_unsupported or exec_status == UNSUPPORTED_FIRMWARE_EXIT:
+    if firmware_unsupported or exec_status in (
+        UNSUPPORTED_FIRMWARE_EXIT, HELD_FLOOR_EXIT,
+    ):
         return False
     if daemon_stop_is_manual(active, enabled, exec_status, result):
         return False
@@ -2111,6 +2120,7 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
         n_restarts is not None
         and n_restarts >= DAEMON_RESTART_LOOP
         and not manual
+        and exec_status != HELD_FLOOR_EXIT
     )
     if recognized and service_enabled == "enabled" and service_active != "active":
         keep(
@@ -2123,6 +2133,12 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
         keep("daemon", "unknown")
     elif service_active == "timeout" or service_enabled == "timeout":
         keep("daemon", "fail", "systemctl timed out")
+    elif exec_status == HELD_FLOOR_EXIT and service_active != "active":
+        if record is not None and 1 <= record[0] <= MAX_STATE:
+            detail = f"stopped (held floor {record[0]}; automatic clears it)"
+        else:
+            detail = "stopped (exit 79, held floor)"
+        keep("daemon", "note", detail)
     elif restart_loop:
         keep("daemon", "fail", f"restart loop (NRestarts={n_restarts})")
     elif manual:
@@ -2994,6 +3010,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         stuck_seconds,
     )
     reported_unsupported = False
+    reported_held_floor = False
     foreign_walled = False
     manual_stop_logged = False
     foreign_since: float | None = None
@@ -3178,8 +3195,19 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             and active_state == "active"
             and not firmware_unsupported
             and exec_status != UNSUPPORTED_FIRMWARE_EXIT
+            and exec_status != HELD_FLOOR_EXIT
         )
-        if daemon_needs_alarm(
+        if exec_status == HELD_FLOOR_EXIT:
+            if not reported_held_floor:
+                LOG.info(
+                    "dgx-fan-control: %s refused to start while a floor is "
+                    "held (active=%s enabled=%s exit=%s); not alerting",
+                    DAEMON_UNIT, active_state, enabled_state, exec_status,
+                )
+                reported_held_floor = True
+            last_daemon_wall = None
+            last_daemon_state = None
+        elif daemon_needs_alarm(
             active_state, enabled_state, exec_status, unit_result, n_restarts,
             firmware_unsupported=firmware_unsupported,
         ):
@@ -3641,14 +3669,34 @@ def watchdog_unit_state() -> tuple[str, str]:
 
 
 def run_daemon(thermal_root: Path, poll_seconds: float,
-               hwmon_root: Path | None = None, curve: str | None = None) -> int:
+               hwmon_root: Path | None = None, curve: str | None = None,
+               state_dir: Path | None = None,
+               defaults: dict[str, str] | None = None) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
     if hwmon_root is None:
         hwmon_root = Path("/sys/class/hwmon")
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
     dismiss_unsupported_firmware_flag(STALL_MARKER_DIR / INTERVENTION_NAME)
     selected = CURVES[curve_name(curve)]
+    # Telemetry-only firmware raises here and main() returns exit 69.
+    # That stays ahead of the held-floor refusal.
     cooling_device = require_control(thermal_root, hwmon_root)
+    held, source = resolved_manual_state(defaults, state_dir)
+    if source in {"last-set", "override"} and held is not None:
+        label = "MANUAL_STATE" if source == "override" else "last-set"
+        LOG.error(
+            "held floor %s recorded (%s); not starting the curve; "
+            "run dgx-fan-control automatic first",
+            held, label,
+        )
+        return HELD_FLOOR_EXIT
     filtered_temperature_c: float | None = None
     stop_requested = Event()
     failures = 0

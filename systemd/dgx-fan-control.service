@@ -7,16 +7,18 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/dgx-fan-control daemon
-# Restart after every exit except 69 and 78. Exit 69 is only the daemon's
+# Restart after every exit except 69, 78, and 79. Exit 69 is only the daemon's
 # startup check that fan control is unsupported. Exit 78 is a foreign lower
 # floor: retrying cannot clear it, and a reboot clears the ACPI floor.
+# Exit 79 is a held manual floor. Another start would refuse again; clear it
+# with dgx-fan-control automatic. The cooling state is left unchanged.
 # A transport failure or crash uses another status and is restarted.
 # Preventing every 69 used to leave a live daemon dead for 1 d 19 h
 # (tenhkspark, 2026-10-31); that failure was not this startup check.
 # StartLimitIntervalSec=0 means crash retries continue.
 Restart=always
 RestartSec=30s
-RestartPreventExitStatus=69 78
+RestartPreventExitStatus=69 78 79
 TimeoutStopSec=30s
 CapabilityBoundingSet=
 LockPersonality=yes

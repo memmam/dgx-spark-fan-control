@@ -298,6 +298,15 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
             self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
 
+            state = root / "state"
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL, "read_defaults", return_value={}), \
+                 patch.object(CONTROL, "write_state", side_effect=AssertionError("wrote")):
+                code, stdout, stderr = run_cli([*argv, "daemon"])
+            self.assertEqual(code, CONTROL.UNSUPPORTED_FIRMWARE_EXIT)
+            self.assertNotIn("held floor", stdout + stderr)
+
             code, stdout, stderr = run_cli([*argv, "set-state", "1"])
             self.assertEqual(code, 1)
             combined = stdout + stderr
@@ -329,6 +338,118 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn("ERROR", combined)
             write_acpi.assert_not_called()
             self.assertEqual(cur_state.read_text(encoding="ascii"), "40\n")
+
+    def _floor_device(self, root: Path, state: str = "6\n"):
+        thermal = root / "thermal"
+        thermal.mkdir()
+        device = thermal / "cooling_device0"
+        device.mkdir()
+        (device / "type").write_text(
+            CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii",
+        )
+        (device / "max_state").write_text("12\n", encoding="ascii")
+        cur = device / "cur_state"
+        cur.write_text(state, encoding="ascii")
+        zone = thermal / "thermal_zone0"
+        zone.mkdir()
+        (zone / "temp").write_text("40000\n", encoding="ascii")
+        return cur
+
+    def test_daemon_refuses_a_held_floor_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cur = self._floor_device(root)
+            state = root / "state"
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            writes = []
+            real_write = CONTROL.write_state
+
+            def record_write(device, value):
+                writes.append(value)
+                return real_write(device, value)
+
+            argv = ["--thermal-root", str(root / "thermal"), "--hwmon-root", str(root / "hwmon"), "daemon"]
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL, "read_defaults", return_value={}), \
+                 patch.object(CONTROL, "write_state", side_effect=record_write):
+                code, stdout, stderr = run_cli(argv)
+            text = stdout + stderr
+            self.assertEqual(code, CONTROL.HELD_FLOOR_EXIT)
+            self.assertIn(
+                "held floor 6 recorded (last-set); not starting the curve; "
+                "run dgx-fan-control automatic first",
+                text,
+            )
+            self.assertEqual(writes, [])
+            self.assertEqual(cur.read_text(encoding="ascii"), "6\n")
+            self.assertNotIn("0", writes)
+
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL, "read_defaults", return_value={"MANUAL_STATE": "4"}), \
+                 patch.object(CONTROL, "write_state", side_effect=record_write):
+                code, stdout, stderr = run_cli(argv)
+            self.assertEqual(code, CONTROL.HELD_FLOOR_EXIT)
+            self.assertIn("held floor 4 recorded (MANUAL_STATE)", stdout + stderr)
+            self.assertEqual(writes, [])
+            self.assertEqual(cur.read_text(encoding="ascii"), "6\n")
+
+            stop = Event()
+            with patch.object(CONTROL, "STALL_MARKER_DIR", root / "empty"), \
+                 patch.object(CONTROL, "read_defaults", return_value={}), \
+                 patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+                 patch.object(CONTROL, "write_state", side_effect=record_write):
+                code, stdout, stderr = run_cli(argv)
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertNotIn("held floor", stdout + stderr)
+            self.assertIn(0, writes)
+
+    def test_health_notes_a_held_floor_exit_without_failing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            (root / "thermal" / "cooling_device2" / "cur_state").write_text(
+                "6\n", encoding="ascii",
+            )
+            state = root / "state"
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            snapshot = self._healthy_snapshot(
+                service_active="failed",
+                service_enabled="enabled",
+                exec_status=CONTROL.HELD_FLOOR_EXIT,
+                n_restarts=5,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, snapshot, record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn(
+                "daemon: stopped (held floor 6; automatic clears it)", text,
+            )
+            self.assertNotIn("restart loop", text)
+            self.assertNotIn("needs intervention", text)
+            self.assertNotIn("health: fail", text)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+
+            snapshot.pop("n_restarts", None)
+            bare = self._healthy_snapshot(
+                service_active="inactive",
+                service_enabled="enabled",
+                exec_status=CONTROL.HELD_FLOOR_EXIT,
+                record=None,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, bare, record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("daemon: stopped (exit 79, held floor)", text)
 
     def test_automatic_on_unsupported_firmware_is_noop(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -255,6 +255,15 @@ class ModuleModeTests(unittest.TestCase):
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "enabled", 69))
         self.assertFalse(CONTROL.daemon_needs_alarm("failed", "enabled", 69))
         self.assertFalse(CONTROL.daemon_needs_alarm("failed", "disabled", 69))
+        self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "enabled", 79))
+        self.assertFalse(CONTROL.daemon_needs_alarm("failed", "enabled", 79))
+        self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled", 79))
+        self.assertFalse(CONTROL.daemon_needs_alarm("failed", "disabled", 79))
+        self.assertFalse(CONTROL.daemon_needs_alarm(
+            "active", "enabled", 79, n_restarts=5,
+        ))
+        self.assertFalse(CONTROL.daemon_stop_is_manual("inactive", "enabled", 79))
+        self.assertFalse(CONTROL.daemon_stop_is_manual("failed", "enabled", 79))
         self.assertTrue(CONTROL.daemon_needs_alarm("inactive", "enabled", 1))
         self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled", 1))
         self.assertFalse(CONTROL.daemon_needs_alarm(
@@ -281,6 +290,29 @@ class ModuleModeTests(unittest.TestCase):
         self.assertTrue(any("not alerting" in line for line in logs.output))
         self.assertFalse(any("is not active" in line for line in logs.output))
         self.assertNotIn("needs intervention", "\n".join(logs.output))
+
+        for state in (("failed", "enabled", 79), ("inactive", "enabled", 79)):
+            alerts = []
+            stop = Event()
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+                 self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+                status = CONTROL.run_watchdog(
+                    Path("/tmp/dgx-fan-missing"),
+                    Path("/tmp/dgx-fan-missing"),
+                    unit_state=lambda reported=state: reported,
+                    notifier=alerts.append,
+                    runner=lambda action: None,
+                    monotonic=lambda: 0.0,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(alerts, [])
+            joined = "\n".join(logs.output)
+            self.assertIn("refused to start while a floor is held", joined)
+            self.assertIn("not alerting", joined)
+            self.assertNotIn("is not active", joined)
+            self.assertNotIn("needs intervention", joined)
 
     def test_acpi_max_refuses_a_loaded_module_unless_forced(self):
         with TemporaryDirectory() as directory:

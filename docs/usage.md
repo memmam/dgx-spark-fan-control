@@ -34,7 +34,10 @@ dgx-fan-control status
 that pair. A match is adopted and is not a foreign floor. A mismatch, or no
 record, stays on the foreign-floor path. Install enables
 `dgx-fan-manual.service`. That unit reapplies the state at boot and does not
-start the performance curve.
+start the performance curve. While that record, or a valid `MANUAL_STATE`,
+is set, the performance daemon refuses to start even if the service is
+enabled. It exits 79 and does not change the cooling state, so the floor
+survives a reboot. systemd does not restart that exit.
 
 `MANUAL_STATE=` in `/etc/default/dgx-fan-control` overrides the record when
 you set it. Leave it empty to use the last `set-state`.
@@ -59,8 +62,9 @@ dgx-fan-control status
 ```
 
 `set-state 12` records that floor until `automatic` clears it. See [Hold a
-manual floor](#hold-a-manual-floor). The watchdog does not broadcast for this
-stop.
+manual floor](#hold-a-manual-floor). While it is held, the performance daemon
+refuses to start, even if it is enabled, so the floor survives a reboot.
+The watchdog does not broadcast for this stop.
 
 State 12 requests that profile's maximum common floor. On EC 3.5.8 the two fans
 can reach approximately **9000 and 13500 RPM** in the firmware's RPM-mode
@@ -95,7 +99,7 @@ sudo dgx-fan-control automatic
 dgx-fan-control status
 ```
 
-Expect **`state=0/12 (daemon not setting a floor; EC's own curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` also clears the persisted manual floor. Leave the service stopped to retain the curve. Enabling the service is a separate command; `module enable` does not do it.
+Expect **`state=0/12 (daemon not setting a floor; EC's own curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` writes state 0 and clears the persisted manual floor. It does not start the daemon. If `dgx-fan-control.service` is enabled, it starts again at the next boot. Start it now with `sudo systemctl start dgx-fan-control.service`. `module enable` does not start it.
 On EC 3.13.7 telemetry-only there is no floor to clear in sysfs, so `automatic` is a no-op that still clears a stale last-set record and exits 0.
 Firmware hysteresis can keep fans fast for a while after the floor is removed.
 
@@ -168,7 +172,12 @@ sudo journalctl -u dgx-fan-control.service -n 30
 ```
 
 Use `sudo systemctl enable dgx-fan-control.service` if you also want this at
-boot. This is **our performance curve**, not NVIDIA's factory curve. While the
+boot. `sudo systemctl start dgx-fan-control.service` is refused while a floor
+is held: the daemon exits 79 and leaves the cooling state unchanged. Clear
+the record with `sudo dgx-fan-control automatic` first. `automatic` does not
+start the daemon. If the service is enabled, the next boot starts it; start
+it now with `sudo systemctl start dgx-fan-control.service` after the record
+is cleared. This is **our performance curve**, not NVIDIA's factory curve. While the
 daemon is running it never selects state 0. Below 50°C it holds state 1, the
 first additive floor, because a clamp of 0 has been observed to latch with the
 fans stopped. Stopping the service still restores state 0 (NVIDIA's curve).
@@ -201,8 +210,9 @@ Constants live in [`userspace/dgx_fan_control.py`](../userspace/dgx_fan_control.
 The daemon rereads the kernel state each sample, including after suspend/resume.
 Brief transport failures receive two retries, after two and four seconds. Three
 consecutive failures attempt automatic restoration and exit 1. Exit 69 is only
-the startup check that fan control is unsupported. Systemd restarts exit 1
-every 30 seconds and does not restart exit 69. See [troubleshooting](troubleshooting.md).
+the startup check that fan control is unsupported. Exit 79 means a held floor
+refused the start. Systemd restarts exit 1 every 30 seconds and does not
+restart exit 69 or exit 79. See [troubleshooting](troubleshooting.md).
 
 ## Choose a fan floor
 
@@ -448,7 +458,9 @@ After a reboot, `systemctl is-active dgx-fan-watchdog.service` should print
 `active`, and `journalctl -u dgx-fan-watchdog.service` should contain
 `fan-stall watchdog watching`. If the performance service is enabled, stop
 it without disabling it and confirm the watchdog journal shows the
-daemon-not-active alert, then start it again:
+daemon-not-active alert, then start it again. `start` is refused while a
+floor is held: the daemon exits 79, the cooling state stays, and the
+watchdog does not alert for that exit.
 
 ```sh
 sudo systemctl stop dgx-fan-control.service
@@ -496,7 +508,9 @@ The core checks are fan and thermal only:
 - `dgx_ec_fan_control` is loaded
 - `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
 - `dgx-fan-control.service` is active when it is enabled, and it did not
-  exit 78
+  exit 78. Exit 79 is a note, `stopped (held floor N; automatic clears it)`,
+  not a failure and not needs-intervention. `start` is refused while that
+  floor is held
 - both ACPI fans read nonzero RPM. The line lists every `fan*_input`
   under every hwmon device named `acpi_fan`, plus each ACPI `Fan`
   `cur_state`. One device with two inputs prints `fan1=… fan2=… RPM`.

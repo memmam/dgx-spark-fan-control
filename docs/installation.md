@@ -378,7 +378,9 @@ not write the flag or the record.
 `dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
 If you have explicitly enabled the performance
 service, stop it without disabling it, confirm the watchdog journal then
-shows the daemon-not-active alert, and start it again:
+shows the daemon-not-active alert, and start it again. `start` is refused
+while a floor is held. The daemon exits 79 and the watchdog does not alert
+for that exit.
 
 ```sh
 sudo systemctl stop dgx-fan-control.service
