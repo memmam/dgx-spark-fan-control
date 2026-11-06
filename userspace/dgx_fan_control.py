@@ -3469,7 +3469,7 @@ def missing_cooling_reason(module_loaded: bool, log_text: str,
         return (
             "no dgx_ec_fan_floor cooling device: the EC mailbox did not complete. "
             "On EC 3.5.8 the ACPI Fan device is the fallback when that happens. "
-            "Do not write an ACPI level below 30; level 0 stops both fans."
+            "Do not write an ACPI level below 35; level 0 stops both fans."
         )
     return "no dgx_ec_fan_floor cooling device: probe did not register one"
 
@@ -4368,9 +4368,9 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
         raise ValueError(
             f"refusing ACPI fan level {level}: this command only writes "
             f"{ACPI_MIN_LEVEL} through {ACPI_MAX_LEVEL}. "
-            "Level 35 is the lowest level measured to hold. Levels below 30 "
-            "are unsafe. Level 0 stops both fans immediately "
-            "and they stay stopped. Level 20 has stalled one fan. Do not write 0."
+            "Level 35 is the lowest level measured to hold. Level 20 has "
+            "stalled one fan. Level 0 stops both fans immediately "
+            "and they stay stopped. Do not write 0."
         )
     if module_loaded is None:
         module_loaded = module_is_loaded()

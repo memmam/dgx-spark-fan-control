@@ -11,7 +11,8 @@ Steps every ACPI Fan cooling device through the given levels (default
 thermal zone each interval. It stops and writes level 100 at once if any fan
 reads 0 or is missing, a fan falls below --min-rpm, the hottest zone reaches
 --max-temp, or the run is interrupted. It always writes level 100 when it
-finishes. It never writes a level below 30, and never writes 0.
+finishes. It never writes a level below 30, its own limit for a supervised
+run, and never writes 0. Outside this script, 35 is the lowest level to use.
 """
 from __future__ import annotations
 

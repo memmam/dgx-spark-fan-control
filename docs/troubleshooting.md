@@ -253,9 +253,9 @@ done
 Look for type `Fan` and `max_state` 100. The BIOS maps a level to
 `975 + 33.75 * level` RPM. Observers measured about 4320 RPM at level 100,
 about 1940 at level 30, about 1620 at level 20 with the second fan stalling,
-and both fans stopped at level 0. **Never write a level below 30. Level 0
-stops both fans immediately and they stay at 0 RPM; the EC did not spin them
-back up at 39°C, and the write did not clear a foreign floor.** `acpi-max`
+and both fans stopped at level 0. **Never write a level below 35, the
+lowest level measured to hold. Level 0 stops both fans immediately and they
+stay at 0 RPM; the EC did not spin them back up at 39°C, and the write did not clear a foreign floor.** `acpi-max`
 refuses levels below 35. It also refuses while this module is loaded or the
 fan service is active. On EC 3.13.7 the same write is accepted and ignored.
 An ACPI level resets on reboot: both Sparks returned to about 2700/4050 RPM

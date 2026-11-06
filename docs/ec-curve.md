@@ -152,4 +152,6 @@ It holds each level for 180 seconds and logs both fans and the hottest zone
 every second to a CSV. It writes level 100 at once if a fan reads 0 or is
 missing, a fan drops below 1000 RPM, the hottest zone reaches 60 C, or the run
 is interrupted, and it always writes 100 when it finishes. It never writes a
-level below 30. EC 3.13.7 ignores these writes, so a run there measures nothing.
+level below 30, its own limit for a supervised run; outside it, 35 is the
+lowest level to use. EC 3.13.7 ignores these writes, so a run there measures
+nothing.

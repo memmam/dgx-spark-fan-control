@@ -675,7 +675,7 @@ loaded, or the fan service is active.
 The module and ACPI `cur_state` write the same EC lower floor. `acpi-max`
 refuses in that case. `--force` overrides the refusal and logs a warning.
 `--level` below 35 is refused and does not write. **Never write a level
-below 30. Level 0 stops both fans and is not a recovery step.** Level 20 has
+below 35. Level 0 stops both fans and is not a recovery step.** Level 20 has
 stalled one fan. Level 100 is about 4320 RPM, quieter than module state 12
 on EC 3.5.8. The level resets on reboot. If a level below 100 fails partway,
 or the command is interrupted after it has found the devices, it tries to

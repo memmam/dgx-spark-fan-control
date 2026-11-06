@@ -93,11 +93,11 @@ On **EC 3.5.8**, ACPI `Fan` `cur_state` and this module's lower floor are the
 same EC register. The BIOS maps an ACPI level to `975 + 33.75 × level` RPM.
 Forum measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
 about 1620 with the second fan stalling, and level 0 stops both fans. **Never
-write an ACPI level below 30. Level 0 stops both fans immediately and they
-stay stopped; it also does not clear a foreign floor.** This command refuses
-levels below 35. `acpi-max` refuses while `dgx_ec_fan_control` is loaded or
-`dgx-fan-control.service` is active, unless `--force` is passed. On EC 3.13.7
-the same ACPI write is accepted and does not change fan speed. An ACPI level
+write an ACPI level below 35, the lowest level measured to hold. Level 0 stops
+both fans immediately and they stay stopped; it also does not clear a foreign
+floor.** This command refuses levels below 35. `acpi-max` refuses while
+`dgx_ec_fan_control` is loaded or `dgx-fan-control.service` is active, unless
+`--force` is passed. On EC 3.13.7 the same ACPI write is accepted and does not change fan speed. An ACPI level
 does not survive reboot: these machines returned to about 2700/4050 RPM
 without another `acpi-max`.
 
