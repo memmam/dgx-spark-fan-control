@@ -1888,6 +1888,294 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertNotIn("Traceback", combined)
         self.assertNotIn("cleanup busy", stdout)
 
+    def test_telemetry_only_firmware_is_healthy_and_keeps_last_set(self):
+        log = (
+            "pinned EC 3.13.7 capabilities fan0=975..4350 fan1=975..4350\n"
+            "EC 3.13.7 floor writes disabled; registering hwmon telemetry only, "
+            "no cooling device\n"
+        )
+
+        def tree(root: Path) -> None:
+            self._stopped_acpi_fans(root, (2073, 2154), 40.0)
+            hwmon = root / "hwmon" / "hwmon1"
+            hwmon.mkdir()
+            (hwmon / "name").write_text(
+                CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii",
+            )
+
+        def snapshot(**overrides):
+            base = self._healthy_snapshot(
+                module_loaded=True,
+                service_active="inactive",
+                service_enabled="disabled",
+                exec_status=0,
+                service_result="success",
+                log_text=log,
+                ec_updates=("pass", "not blocked (EC 3.13.7)"),
+            )
+            base.update(overrides)
+            return base
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root)
+            state = root / "state"
+            CONTROL.write_intervention(
+                state / CONTROL.INTERVENTION_NAME,
+                "unsupported firmware; telemetry only",
+                "boot-a", 1.0,
+            )
+            CONTROL.write_last_manual_state(
+                state, 6, floor=2700, profile="EC 3.5.8",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    snapshot(
+                        service_active="inactive",
+                        service_enabled="disabled",
+                        exec_status=0,
+                        service_result="success",
+                    ),
+                    record=True,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn(
+                "firmware: control unsupported (EC 3.13.7, telemetry only)",
+                text,
+            )
+            self.assertIn(
+                "cooling-device: n/a (EC 3.13.7: telemetry only, control unsupported)",
+                text,
+            )
+            self.assertIn("daemon: n/a/stopped (unsupported firmware)", text)
+            self.assertIn("mode: n/a (last-set 6 kept)", text)
+            self.assertIn("ready: n/a", text)
+            self.assertIn("fans: pass", text)
+            self.assertIn("temperature: pass", text)
+            self.assertIn("watchdog: pass", text)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+            self.assertIn("state=6", (state / CONTROL.MANUAL_STATE_NAME).read_text())
+            self.assertIn("result=healthy", (state / CONTROL.HEALTH_NAME).read_text())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tree(root)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    snapshot(
+                        service_active="inactive",
+                        service_enabled="enabled",
+                        exec_status=CONTROL.UNSUPPORTED_FIRMWARE_EXIT,
+                        service_result="exit-code",
+                        log_text="",
+                        ec_updates=(
+                            "warn",
+                            "not blocked; EC 3.5.8 can be replaced by 3.13.7",
+                        ),
+                    ),
+                    record=True,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn("daemon: n/a/stopped (unsupported firmware)", text)
+            self.assertIn("mode: n/a", text)
+            self.assertIn("ec-updates: warn", text)
+            self.assertIn("stored needs-intervention: none", text)
+            self.assertNotIn("NEEDS INTERVENTION:", text)
+            self.assertFalse((root / "state" / CONTROL.INTERVENTION_NAME).exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (2700, 4050), 40.0)
+            lines = []
+            problems = CONTROL.collect_health_checks(
+                root / "thermal", root / "hwmon",
+                module_loaded=True, service_active="inactive",
+                service_enabled="disabled", exec_status=None,
+                watchdog_active="active", soc_celsius=85,
+                log_text="pinned EC 3.5.8 capabilities fan0=1260..9000 fan1=1890..13500\n",
+                ready="not configured", emit=lines.append,
+                ec_block=("note", "unknown (fwupd not installed)"),
+            )
+            self.assertTrue(any("cooling-device: fail" in line for line in lines))
+            self.assertTrue(problems)
+            self.assertFalse(any(line.startswith("firmware:") for line in lines))
+
+            lines = []
+            problems = CONTROL.collect_health_checks(
+                root / "thermal", root / "hwmon",
+                module_loaded=True, service_active="inactive",
+                service_enabled="disabled", exec_status=None,
+                watchdog_active="active", soc_celsius=85, log_text="",
+                ready="not configured", emit=lines.append,
+                ec_block=("note", "unknown (fwupd not installed)"),
+            )
+            self.assertIn("cooling-device: fail (telemetry missing)", lines)
+            self.assertTrue(problems)
+
+        stop = Event()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "true-zero-reboot"
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()):
+                status = CONTROL.run_watchdog(
+                    Path("/tmp/dgx-fan-missing"),
+                    Path("/tmp/dgx-fan-missing"),
+                    unit_state=lambda: (
+                        "inactive", "enabled", CONTROL.UNSUPPORTED_FIRMWARE_EXIT,
+                    ),
+                    notifier=lambda _message: None,
+                    runner=lambda action: 0,
+                    monotonic=lambda: 0.0,
+                    marker_path=marker,
+                    boot_id="boot-a",
+                    defaults={},
+                )
+            self.assertEqual(status, 0)
+            self.assertFalse((Path(directory) / CONTROL.INTERVENTION_NAME).exists())
+
+    def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
+        reason = "unsupported firmware; telemetry only"
+        held = reason + "; manual floor state 6 is not held"
+
+        with tempfile.TemporaryDirectory() as directory:
+            flag = Path(directory) / CONTROL.INTERVENTION_NAME
+            CONTROL.write_intervention(flag, reason, "boot-a", 1.0)
+            self.assertFalse(flag.exists())
+            CONTROL.write_intervention(flag, held, "boot-a", 1.0)
+            self.assertFalse(flag.exists())
+            CONTROL.write_intervention(flag, "foreign floor remains", "boot-a", 1.0)
+            self.assertIn("foreign floor remains", flag.read_text(encoding="ascii"))
+
+        def telemetry_tree(root: Path) -> None:
+            self._stopped_acpi_fans(root, (2073, 2154), 40.0)
+            hwmon = root / "hwmon" / "hwmon1"
+            hwmon.mkdir()
+            (hwmon / "name").write_text(
+                CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            telemetry_tree(root)
+            state = root / "state"
+            flag = state / CONTROL.INTERVENTION_NAME
+            CONTROL.write_state_text(flag, f"reason={reason}\nboot_id=old\ntime=1.000\n")
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(
+                        module_loaded=True,
+                        log_text=(
+                            "pinned EC 3.13.7 capabilities fan0=975..4350 "
+                            "fan1=975..4350\n"
+                            "EC 3.13.7 floor writes disabled; registering hwmon "
+                            "telemetry only, no cooling device\n"
+                        ),
+                        ec_updates=("pass", "blocked"),
+                    ),
+                    record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertNotIn("NEEDS INTERVENTION:", text)
+            self.assertIn("stored needs-intervention: none", text)
+            self.assertIn("recorded: no", text)
+            self.assertFalse(flag.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            telemetry_tree(root)
+            state = root / "state"
+            flag = state / CONTROL.INTERVENTION_NAME
+            CONTROL.write_state_text(flag, f"reason={reason}\nboot_id=old\ntime=1.000\n")
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+                code, stdout, stderr = run_cli([
+                    "--thermal-root", str(root / "thermal"),
+                    "--hwmon-root", str(root / "hwmon"),
+                    "status",
+                ])
+            combined = stdout + stderr
+            self.assertEqual(code, 0, combined)
+            self.assertIn(CONTROL.TELEMETRY_ONLY_STATUS, stdout)
+            self.assertNotIn("NEEDS INTERVENTION:", combined)
+            self.assertFalse(flag.exists())
+            self.assertIn("state=6", (state / CONTROL.MANUAL_STATE_NAME).read_text())
+
+            CONTROL.write_state_text(
+                flag, "reason=foreign floor remains\nboot_id=old\ntime=1.000\n",
+            )
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+                code, stdout, stderr = run_cli([
+                    "--thermal-root", str(root / "thermal"),
+                    "--hwmon-root", str(root / "hwmon"),
+                    "status",
+                ])
+            self.assertIn("NEEDS INTERVENTION: foreign floor remains", stdout)
+            self.assertTrue(flag.exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            telemetry_tree(root)
+            state = root / "state"
+            flag = state / CONTROL.INTERVENTION_NAME
+            CONTROL.write_state_text(flag, f"reason={held}\nboot_id=old\ntime=1.000\n")
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+                code = CONTROL.apply_manual_floor(
+                    root / "thermal", root / "hwmon", defaults={}, state_dir=state,
+                    wait_seconds=0, monotonic=lambda: 0.0, sleeper=lambda delay: None,
+                )
+            self.assertEqual(code, 1)
+            self.assertFalse(flag.exists())
+            self.assertTrue((state / CONTROL.MANUAL_STATE_NAME).exists())
+            self.assertFalse(flag.exists())
+
+            CONTROL.write_state_text(flag, f"reason={reason}\nboot_id=old\ntime=1.000\n")
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+                code, stdout, stderr = run_cli([
+                    "--thermal-root", str(root / "thermal"),
+                    "--hwmon-root", str(root / "hwmon"),
+                    "daemon",
+                ])
+            self.assertEqual(code, CONTROL.UNSUPPORTED_FIRMWARE_EXIT)
+            self.assertNotIn("NEEDS INTERVENTION:", stdout + stderr)
+            self.assertFalse(flag.exists())
+
+        stop = Event()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            flag = root / CONTROL.INTERVENTION_NAME
+            CONTROL.write_state_text(flag, f"reason={reason}\nboot_id=old\ntime=1.000\n")
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()):
+                status = CONTROL.run_watchdog(
+                    Path("/tmp/dgx-fan-missing"),
+                    Path("/tmp/dgx-fan-missing"),
+                    unit_state=lambda: (
+                        "inactive", "enabled", CONTROL.UNSUPPORTED_FIRMWARE_EXIT,
+                    ),
+                    notifier=lambda _message: None,
+                    runner=lambda action: 0,
+                    monotonic=lambda: 0.0,
+                    marker_path=root / "true-zero-reboot",
+                    boot_id="boot-a",
+                    defaults={},
+                )
+            self.assertEqual(status, 0)
+            self.assertFalse(flag.exists())
+
     def test_ec_update_block_is_informational_and_never_fails(self):
         guid = CONTROL.EC_FWUPD_GUID
         soc = "b488217b-3895-4fc0-b1bf-ab7005a2d45a"

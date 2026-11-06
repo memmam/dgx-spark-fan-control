@@ -28,6 +28,7 @@ ACPI_FAN_NAME = "acpi_fan"
 ACPI_MIN_LEVEL = 40
 ACPI_MAX_LEVEL = 100
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
+TELEMETRY_ONLY_STATUS = "control unsupported on this firmware (telemetry only)"
 WATCHDOG_POLL_SECONDS = 2.0
 WATCHDOG_ZERO_SECONDS = 10.0
 # Any-temperature alert. Idle fans on EC 3.5.8 with the October SoC run near
@@ -531,11 +532,45 @@ def write_state_text(path: Path, text: str) -> None:
         return
 
 
+def unsupported_firmware_flag_only(reason: str | None) -> bool:
+    """True when a stored flag names only the telemetry-only firmware state.
+
+    That state is deliberate. The held-floor line from the same transition
+    does not make it a real fault. Any other reason stays in place.
+    """
+    if not reason or reason == NEEDS_ROOT:
+        return False
+    text = reason.strip()
+    exact = "unsupported firmware; telemetry only"
+    if text == exact:
+        return True
+    prefix = exact + "; "
+    if not text.startswith(prefix):
+        return False
+    rest = text[len(prefix):].strip()
+    return rest.startswith("manual floor state ") and rest.endswith(" is not held")
+
+
 def write_intervention(path: Path, reason: str, boot_id: str | None, when: float) -> None:
+    """Record a fault. Recognized unsupported firmware is not a fault."""
+    if unsupported_firmware_flag_only(reason):
+        return
     write_state_text(
         path,
         f"reason={reason}\nboot_id={boot_id or ''}\ntime={when:.3f}\n",
     )
+
+
+def dismiss_unsupported_firmware_flag(path: Path) -> bool:
+    """Remove a stale unsupported-firmware flag. Other reasons stay.
+
+    A reader that cannot write the directory leaves the file alone. Status
+    still must not treat that reason as a banner.
+    """
+    if not unsupported_firmware_flag_only(read_intervention_reason(path)):
+        return False
+    clear_stall_marker(path)
+    return True
 
 
 def access_denied(exc: BaseException) -> bool:
@@ -575,7 +610,7 @@ def read_intervention_reason(path: Path) -> str | None:
 
 def intervention_banner(path: Path) -> str:
     reason = read_intervention_reason(path)
-    if not reason:
+    if not reason or unsupported_firmware_flag_only(reason):
         return ""
     return f"NEEDS INTERVENTION: {reason}\n"
 
@@ -1173,6 +1208,43 @@ def clear_persisted_manual_floor(state_dir: Path,
     disable_manual_oneshot()
 
 
+def telemetry_hwmon_present(hwmon_root: Path) -> bool | None:
+    """True when dgx_ec_fan is registered. None when the directory is unreadable."""
+    names = scandir_names(hwmon_root)
+    if names is None:
+        return None
+    for name in names:
+        if not name.startswith("hwmon"):
+            continue
+        try:
+            device_name = (hwmon_root / name / "name").read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if device_name == HWMON_DEVICE_NAME:
+            return True
+    return False
+
+
+def telemetry_only_firmware(log_text: str, profile: str | None,
+                            telemetry: bool | None,
+                            device_count: int | None) -> bool:
+    """Recognized unsupported firmware, not a missing driver.
+
+    EC 3.13.7 registers hwmon and does not register a cooling device. That
+    shape still counts when the kernel log is unreadable. A log that names
+    a control-capable profile does not.
+    """
+    if (
+        "registering hwmon telemetry only" in log_text
+        or "floor writes disabled" in log_text
+        or profile == "EC 3.13.7"
+    ):
+        return True
+    if profile not in (None, "EC 3.13.7"):
+        return False
+    return telemetry is True and device_count == 0
+
+
 def floor_devices(thermal_root: Path) -> list[Path] | None:
     """dgx_ec_fan_floor devices, or None when the thermal directory is unreadable."""
     names = scandir_names(thermal_root)
@@ -1210,6 +1282,7 @@ def apply_manual_floor(thermal_root: Path, hwmon_root: Path,
             defaults = {}
     if state_dir is None:
         state_dir = STALL_MARKER_DIR
+    dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
     state, source = resolved_manual_state(defaults, state_dir)
     if source == "invalid":
         LOG.error("MANUAL_STATE must be a floor from 1 through 12; not applying")
@@ -1380,12 +1453,22 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     log_text = log_text or ""
     live_floor = latest_refused_floor(log_text)
     foreign_log = "refusing to replace existing lower floor" in log_text
-    unsupported = (
-        "registering hwmon telemetry only" in log_text
-        or "floor writes disabled" in log_text
-    )
+    profile = pinned_ec_name(log_text)
+    telemetry = telemetry_hwmon_present(hwmon_root)
+    device_count = None if devices is None else len(devices)
+    recognized = telemetry_only_firmware(log_text, profile, telemetry, device_count)
+    firmware_label = profile or "EC 3.13.7"
     verdict = floor_matches_last_set(live_floor, record)
-    if managed_off:
+    if recognized:
+        keep(
+            "firmware", "note",
+            f"control unsupported ({firmware_label}, telemetry only)",
+        )
+        keep(
+            "cooling-device", "note",
+            f"n/a ({firmware_label}: telemetry only, control unsupported)",
+        )
+    elif managed_off:
         keep("cooling-device", "note", "skipped (module disabled by module disable)")
     elif devices is None:
         keep("cooling-device", "unknown")
@@ -1404,8 +1487,13 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     elif devices is not None and len(devices) != 1:
         if module_loaded is not True:
             keep("cooling-device", "note", "skipped (module not loaded)")
-        elif unsupported:
-            keep("cooling-device", "fail", "unsupported firmware; telemetry only")
+        elif profile not in (None, "EC 3.13.7"):
+            keep(
+                "cooling-device", "fail",
+                "loaded but no cooling device registered; check dmesg | grep dgx_ec",
+            )
+        elif telemetry is False:
+            keep("cooling-device", "fail", "telemetry missing")
         else:
             keep(
                 "cooling-device", "fail",
@@ -1439,7 +1527,9 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
         and n_restarts >= DAEMON_RESTART_LOOP
         and not manual
     )
-    if service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
+    if recognized:
+        keep("daemon", "note", "n/a/stopped (unsupported firmware)")
+    elif service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
         keep("daemon", "unknown")
     elif service_active == "timeout" or service_enabled == "timeout":
         keep("daemon", "fail", "systemctl timed out")
@@ -1460,7 +1550,12 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     else:
         keep("daemon", "pass")
 
-    if record is not None and managed_off:
+    if recognized:
+        if record is not None:
+            keep("mode", "note", f"n/a (last-set {record[0]} kept)")
+        else:
+            keep("mode", "note", "n/a")
+    elif record is not None and managed_off:
         keep("mode", "fail", f"last-set floor is {record[0]} but the module is disabled")
     elif record is not None and verdict == "foreign":
         keep("mode", "fail", f"manual floor state {record[0]} is not what is held")
@@ -1510,7 +1605,9 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     else:
         keep("watchdog", "pass")
 
-    if ready == "not configured":
+    if recognized:
+        emit("ready: n/a")
+    elif ready == "not configured":
         emit("ready: not configured")
     elif ready == "pass":
         emit("ready: pass")
@@ -1608,6 +1705,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         boot_id = read_boot_id()
     if record is None:
         record = os.geteuid() == 0
+    # Plain health does not record. This one stale reason is still removed
+    # on read, including when the process cannot write and the unlink fails.
+    dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
     interactive = settle_seconds <= 0
     deadline = monotonic() + settle_seconds
     attempt = 0
@@ -1738,7 +1838,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
 
 
 def show_intervention() -> None:
-    banner = intervention_banner(STALL_MARKER_DIR / INTERVENTION_NAME)
+    path = STALL_MARKER_DIR / INTERVENTION_NAME
+    dismiss_unsupported_firmware_flag(path)
+    banner = intervention_banner(path)
     if banner:
         print(banner, end="")
 
@@ -2084,6 +2186,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         raise ValueError("stuck interval must be finite and non-negative")
     if marker_path is None:
         marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
+    dismiss_unsupported_firmware_flag(marker_path.parent / INTERVENTION_NAME)
     if boot_id is None:
         boot_id = read_boot_id()
     stop_requested = Event()
@@ -2758,6 +2861,7 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
         raise ValueError("poll interval must be finite and positive")
     if hwmon_root is None:
         hwmon_root = Path("/sys/class/hwmon")
+    dismiss_unsupported_firmware_flag(STALL_MARKER_DIR / INTERVENTION_NAME)
     selected = CURVES[curve_name(curve)]
     cooling_device = require_control(thermal_root, hwmon_root)
     filtered_temperature_c: float | None = None
@@ -3758,7 +3862,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             active, enabled = watchdog_unit_state()
             show_intervention()
-            print(CONTROL_UNSUPPORTED)
+            print(TELEMETRY_ONLY_STATUS)
             print(format_watchdog_status(active, enabled), end="")
             return 0
         LOG.error("%s", exc)

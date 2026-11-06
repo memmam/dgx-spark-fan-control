@@ -275,6 +275,7 @@ class ModuleModeTests(unittest.TestCase):
         self.assertEqual(actions, [])
         self.assertTrue(any("not alerting" in line for line in logs.output))
         self.assertFalse(any("is not active" in line for line in logs.output))
+        self.assertNotIn("needs intervention", "\n".join(logs.output))
 
     def test_acpi_max_refuses_a_loaded_module_unless_forced(self):
         with TemporaryDirectory() as directory:

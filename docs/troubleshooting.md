@@ -51,6 +51,12 @@ dgx-fan-control status
 ```
 
 That line is printed once. It is not also written to the log.
+`dgx-fan-control health` does not fail this state and does not set
+needs-intervention. The cooling device, the daemon, and the mode are
+`n/a`: telemetry is up and floor control is not. A last-set manual floor
+is kept for a later downgrade to EC 3.5.8. Fans, temperature, and the
+watchdog are still checked. Health fails only when a firmware that should
+accept floor control has no cooling device, or when telemetry is missing.
 
 `fan1_input` and `fan2_input` under the `dgx_ec_fan` hwmon device should still
 be readable. Do not register a second fan driver or send raw mailbox commands
