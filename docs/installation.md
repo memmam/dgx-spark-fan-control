@@ -353,11 +353,7 @@ not own is not cleared. Enabling the service adds our performance curve.
 `module enable` loads the module and does not enable the service.
 `sudo dgx-fan-control module enable --start-service` is the explicit choice,
 same as the table above. `start`/`stop` change the current session;
-`enable`/`disable` change future boots.
-`sudo systemctl disable --now dgx-fan-control.service` alone restores
-NVIDIA's curve only for the current session. A remaining last-set floor
-comes back at the next boot unless `automatic` cleared it, which is why
-`automatic` is explicit above. Do not substitute an ACPI level of 0 for
+`enable`/`disable` change future boots. Do not substitute an ACPI level of 0 for
 `automatic`.
 
 The watchdog is a separate unit. It reads the ACPI fans and `thermal_zone0`
