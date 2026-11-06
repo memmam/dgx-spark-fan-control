@@ -59,19 +59,20 @@ fan speed on this EC either.
 
 ## Mailbox timeout and the ACPI fan devices
 
-A failed **first** query is a different failure. EC 3.5.8 paired with October
-SoC firmware **2.158.15** (`0x02009e0f`) has failed the FF-A/eSPI mailbox on
-the first read-only query (eSPI status `0x05`, about 54 ms). This driver
-returns `-EIO` for submit status `0x05` and `-ETIMEDOUT` when a poll stays
-pending. Either one, before a capability profile matches, refuses the device.
-This driver's 3.5.8 fan-floor support assumes the pre-October SoC firmware.
-The kernel log says that. October SoC **2.158.15** (`0x02009e0f`) is the
-pairing that failed the first read-only query.
-The module does not bind, including no hwmon device, because the mailbox did
-not answer.
+A failed **first** query is a different failure from a later wedge. EC 3.5.8
+paired with October SoC firmware **2.158.15** (`0x02009e0f`) has failed the
+FF-A/eSPI mailbox on the first read-only query (eSPI status `0x05`, about 54
+ms) on some boots. The same pair has also completed probe on both DGX Sparks
+(kernel `7.0.0-1024-nvidia`, module 0.1.5): `pinned EC 3.5.8 capabilities
+fan0=1260..9000 fan1=1890..13500`, baseline about 2700/4050 RPM, and a cooling
+device. This driver returns `-EIO` for submit status `0x05` and `-ETIMEDOUT`
+when a poll stays pending. Either one, before a capability profile matches,
+refuses the device. The kernel log says the mailbox did not complete and
+names the ACPI fallback. It does not claim that October SoC firmware can
+never bind.
 
-On **EC 3.5.8 with that newer SoC**, the path that has been observed to work
-is the ACPI fan device, not this driver:
+When the mailbox does not complete, the module does not bind, including no
+hwmon device. The fallback is the ACPI fan device, with this module unloaded:
 
 ```sh
 for device in /sys/class/thermal/cooling_device*; do
@@ -84,10 +85,13 @@ done
 Look for type `Fan` and `max_state` 100. The BIOS maps a level to
 `975 + 33.75 * level` RPM. Observers measured about 4320 RPM at level 100,
 about 1940 at level 30, about 1620 at level 20 with the second fan stalling,
-and both fans stopped at level 0. Do not write a level below 30; those
-observers use 40. Writing either device on that hardware moved both fans.
-This project does not implement that path. On EC 3.13.7 the same write is
-accepted and ignored.
+and both fans stopped at level 0. **Never write a level below 30. Level 0
+stops both fans immediately and they stay at 0 RPM; the EC did not spin them
+back up at 39°C, and the write did not clear a foreign floor.** `acpi-max`
+refuses levels below 40. It also refuses while this module is loaded or the
+fan service is active. On EC 3.13.7 the same write is accepted and ignored.
+An ACPI level resets on reboot: both Sparks returned to about 2700/4050 RPM
+without another `acpi-max`.
 
 An older experimental driver may already own the relay. Do not load multiple
 fan drivers or run a direct packet client alongside the controller. Restore
@@ -108,7 +112,16 @@ probes or access controller MMIO: even a normal-world read of the secure-owned
 eSPI controller caused a watchdog reboot during the original investigation.
 
 An ownership mismatch (`ESTALE`) causes failure: the driver
-will not overwrite an unknown existing floor. Avoid concurrent writers. Version
+will not overwrite an unknown existing floor. ACPI `cur_state` writes that
+same register, so `acpi-max` while the module is loaded can move the floor
+(level 100 was observed as `0x10fe`, 4350 RPM, over a module state-12 floor
+of `0x34bc`). `status` then says the floor was changed outside this driver,
+with the observed and expected RPM when the kernel log still has them.
+Probe logs `refusing to replace existing lower floor` with the RPM and
+returns `-EBUSY`. It does not clear the floor. Do not write ACPI level 0 to
+recover; that stops both fans and leaves the floor in place. Unload the
+module before any ACPI write. A cold power cycle is the recovery that does
+not write a fan level. Avoid concurrent writers. Version
 0.1.5 uses `ESTALE` only for that mismatch. A reply-guard refusal, where
 recovery will not trust the shared response, returns `EPROTO`. The daemon
 retries `EPROTO` after 31 seconds, past the driver's 30-second cooldown, at
@@ -163,6 +176,16 @@ for the daemon's startup check that fan control is unsupported, and
 failure or crash does not use exit 69, so it still restarts. Exit 69 used to
 cover those runtime failures too, which left a stopped daemon holding a low
 floor while temperatures stayed under the alarms (observed for 1 day 19 hours).
+One later wedge is still open. On EC 3.5.8 with the October SoC, the daemon
+read the floor about 99 times, then near 188 seconds of uptime operation
+`0x4` stuck pending (state `0x2`, 100 polls, `-110`). Every later preflight
+timed out until reboot. It has not been reproduced on demand. It may have
+coincided with NVIDIA Sync's Resource Monitor and the DGX Dashboard
+telemetry freezing. Incident lines now include `realtime=` (`CLOCK_REALTIME`)
+and `uptime=` (`CLOCK_BOOTTIME`) so the next one can be compared with those
+tools. The driver still does not clear a foreign floor and does not treat
+this wedge as solved.
+
 `dgx-fan-control watchdog` does not alarm when the last exit is 69. It still
 logs and broadcasts when the unit is `failed`, or enabled but inactive with
 another exit code, before it applies the temperature rule. SIGTERM lets the
@@ -184,7 +207,7 @@ state, remove the driver's pending check, or submit raw reset packets. After
 communication and ownership are reconciled and status verifies state 0, restart explicitly:
 
 ```sh
-dgx-fan-control status                    # require state=0/12
+dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
 sudo systemctl reset-failed dgx-fan-control.service
 sudo systemctl start dgx-fan-control.service
 sudo journalctl -u dgx-fan-control.service -n 30

@@ -476,15 +476,46 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     return 0
 
 
-def require_control(thermal_root: Path, hwmon_root: Path) -> Path:
+def missing_cooling_reason(module_loaded: bool, log_text: str) -> str:
+    """Why status has no dgx_ec_fan_floor device. Never the bare count 'found 0'."""
+    if not module_loaded:
+        return (
+            "no dgx_ec_fan_floor cooling device: kernel module "
+            "dgx_ec_fan_control is not loaded"
+        )
+    if "refusing to replace existing lower floor" in log_text:
+        return (
+            "no dgx_ec_fan_floor cooling device: probe refused a foreign lower floor. "
+            "ACPI cur_state writes the same EC register. This driver will not clear it. "
+            "Do not write ACPI level 0; it stops both fans and does not clear the floor. "
+            "Unload the module before using ACPI."
+        )
+    if "EC mailbox did not complete" in log_text:
+        return (
+            "no dgx_ec_fan_floor cooling device: the EC mailbox did not complete. "
+            "On EC 3.5.8 the ACPI Fan device is the fallback when that happens. "
+            "Do not write an ACPI level below 30; level 0 stops both fans."
+        )
+    return "no dgx_ec_fan_floor cooling device: probe did not register one"
+
+
+def require_control(thermal_root: Path, hwmon_root: Path, *,
+                    module_loaded: bool | None = None,
+                    log_text: str | None = None) -> Path:
     matches = cooling_devices(thermal_root)
     if len(matches) == 1:
         return matches[0]
-    if len(matches) == 0 and find_fan_hwmon(hwmon_root) is not None:
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
+        )
+    if find_fan_hwmon(hwmon_root) is not None:
         raise ControlUnsupported(CONTROL_UNSUPPORTED)
-    raise RuntimeError(
-        f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
-    )
+    if module_loaded is None:
+        module_loaded = module_is_loaded()
+    if log_text is None:
+        log_text = read_kernel_log()
+    raise RuntimeError(missing_cooling_reason(module_loaded, log_text))
 
 
 def read_hottest_temperature_c(thermal_root: Path) -> float:
@@ -545,9 +576,61 @@ def next_state(current: int, filtered_temperature_c: float,
     return max(chosen, MIN_CURVE_STATE)
 
 
+def read_kernel_log() -> str:
+    try:
+        completed = subprocess.run(
+            ["dmesg"], check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        return ""
+    return completed.stdout or ""
+
+
+def latest_floor_mismatch(log_text: str) -> tuple[int | None, int | None]:
+    """RPM pair from the newest ownership-mismatch line, if the log has one."""
+    observed = expected = None
+    for match in re.finditer(
+        r"floor ownership mismatch: observed=0x[0-9a-fA-F]+ \((\d+) RPM\)"
+        r"(?: confirmed=0x[0-9a-fA-F]+ \((\d+) RPM\))?",
+        log_text,
+    ):
+        observed = int(match.group(1))
+        expected = int(match.group(2)) if match.group(2) else None
+    return observed, expected
+
+
+def floor_changed_message(observed: int | None = None,
+                          expected: int | None = None) -> str:
+    """ESTALE is the EC floor moving under this driver, usually from ACPI."""
+    if observed is not None and expected is not None:
+        numbers = f"observed {observed} RPM, expected {expected}"
+    elif observed is not None:
+        numbers = f"observed {observed} RPM"
+    else:
+        numbers = "the EC floor does not match the floor this driver set"
+    return (
+        f"floor was changed outside this driver ({numbers}); likely ACPI cur_state. "
+        "Recovery: stop the daemon and unload the module with "
+        "'dgx-fan-control module disable' before any ACPI write. "
+        "This driver will not clear a floor it does not own. "
+        "Do not write ACPI level 0; it stops both fans and does not clear the floor."
+    )
+
+
+def normalize_cooling_error(exc: OSError) -> Exception:
+    """Turn a sysfs ESTALE into one sentence. Other OSErrors pass through."""
+    if exc.errno != errno.ESTALE:
+        return exc
+    observed, expected = latest_floor_mismatch(read_kernel_log())
+    return RuntimeError(floor_changed_message(observed, expected))
+
+
 def read_state(cooling_device: Path) -> int:
-    state = int((cooling_device / "cur_state").read_text(encoding="ascii").strip())
-    maximum = int((cooling_device / "max_state").read_text(encoding="ascii").strip())
+    try:
+        state = int((cooling_device / "cur_state").read_text(encoding="ascii").strip())
+        maximum = int((cooling_device / "max_state").read_text(encoding="ascii").strip())
+    except OSError as exc:
+        raise normalize_cooling_error(exc) from None
     if maximum != MAX_STATE or not 0 <= state <= maximum:
         raise RuntimeError(
             f"unexpected cooling-device contract: state={state} max_state={maximum}"
@@ -558,10 +641,21 @@ def read_state(cooling_device: Path) -> int:
 def write_state(cooling_device: Path, state: int) -> None:
     if not 0 <= state <= MAX_STATE:
         raise ValueError(f"state must be between 0 and {MAX_STATE}")
-    (cooling_device / "cur_state").write_text(f"{state}\n", encoding="ascii")
+    try:
+        (cooling_device / "cur_state").write_text(f"{state}\n", encoding="ascii")
+    except OSError as exc:
+        raise normalize_cooling_error(exc) from None
     observed = read_state(cooling_device)
     if observed != state:
         raise RuntimeError(f"cooling-state readback mismatch: wrote {state}, read {observed}")
+
+
+def format_cooling_status(state: int, hottest_c: float) -> str:
+    """State 0 is the EC curve. The label says so, so it does not read as fans off."""
+    text = f"state={state}/{MAX_STATE}"
+    if state == 0:
+        text += " (no floor; EC curve)"
+    return f"{text} hottest={hottest_c:.1f}C"
 
 
 def run_daemon(thermal_root: Path, poll_seconds: float,
@@ -602,8 +696,11 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
                             hottest - filtered_temperature_c
                         )
                     desired = next_state(current, filtered_temperature_c, selected)
-                except (OSError, RuntimeError, ValueError):
-                    LOG.exception("temperature observation failed; requesting maximum cooling")
+                except (OSError, RuntimeError, ValueError) as exc:
+                    LOG.error(
+                        "temperature observation failed; requesting maximum cooling: %s",
+                        exc,
+                    )
                     hottest = math.nan
                     filtered_temperature_c = None
                     desired = MAX_STATE
@@ -622,6 +719,12 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
                 if failures:
                     LOG.info("fan communication recovered after %d failed attempts", failures)
                 failures = 0
+            except RuntimeError as exc:
+                if "floor was changed outside this driver" not in str(exc):
+                    raise
+                LOG.error("%s", exc)
+                mark_reported(exc)
+                raise
             except OSError as exc:
                 failures += 1
                 filtered_temperature_c = None
@@ -648,7 +751,16 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
         try:
             write_state(cooling_device, 0)
         except Exception as exc:
-            LOG.exception("automatic restoration failed; current fan floor is unverified")
+            # The ownership failure is already logged. A second copy, or a
+            # traceback, is the line operators saw as a bare ESTALE.
+            duplicate = (
+                primary_failure and "floor was changed outside this driver" in str(exc)
+            )
+            if not duplicate:
+                LOG.error(
+                    "automatic restoration failed; current fan floor is unverified: %s",
+                    exc,
+                )
             mark_reported(exc)
             if not primary_failure:
                 raise
@@ -722,17 +834,6 @@ def describe_control(kind: str, profile: str | None = None) -> str:
 def module_is_loaded(module: str = MODULE_NAME, module_root: Path | None = None) -> bool:
     root = module_root if module_root is not None else Path("/sys/module")
     return (root / module).is_dir()
-
-
-def warn_if_module_competes(module_loaded: bool | None = None) -> None:
-    loaded = module_is_loaded() if module_loaded is None else module_loaded
-    if not loaded:
-        return
-    LOG.warning(
-        "kernel module %s is loaded; it or its daemon may compete with ACPI "
-        "fan control. Run: dgx-fan-control module disable",
-        MODULE_NAME,
-    )
 
 
 def uncommented_lines(text: str) -> list[str]:
@@ -922,11 +1023,14 @@ def disable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
 def enable_kernel_module(etc: Path, *, runner, loaded: bool,
                          control_supported: bool | None = None,
                          force_service: bool = False,
+                         start_service: bool = False,
                          profile: str | None = None) -> None:
-    """Undo a managed disable, load the module, and start the service.
+    """Undo a managed disable and load the module.
 
-    On a telemetry-only bind the service stays disabled unless force_service
-    is set. Exit 69 is reserved for that startup check, not for later crashes.
+    The performance service is not enabled unless start_service or
+    force_service is set. On a telemetry-only bind the service stays
+    disabled unless force_service is set. Exit 69 is reserved for that
+    startup check, not for later crashes.
     """
     modprobe_dir, modules_load, managed = module_paths(etc)
     if managed.is_file():
@@ -956,6 +1060,14 @@ def enable_kernel_module(etc: Path, *, runner, loaded: bool,
         print(
             f"fan control unsupported on {label}; telemetry only, "
             "service left disabled; use acpi-max on EC 3.5.8"
+        )
+        note_initramfs(etc)
+        return
+    if not (start_service or force_service):
+        print(
+            "module loaded; dgx-fan-control.service was not enabled. "
+            "Enable the performance curve only if you want it: "
+            "sudo dgx-fan-control module enable --start-service"
         )
         note_initramfs(etc)
         return
@@ -999,18 +1111,63 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
     return "\n".join(lines) + "\n"
 
 
+def acpi_result_note(profile: str | None) -> str:
+    """3.13.7 accepts the write and ignores RPM. 3.5.8 does change RPM."""
+    if profile == "EC 3.5.8":
+        return "check fan RPM"
+    return ACPI_RPM_NOTE
+
+
+def acpi_write_refusal(module_loaded: bool, service_active: str) -> str | None:
+    """ACPI cur_state and this module write the same EC lower-floor register."""
+    if service_active == "active":
+        return (
+            "refusing ACPI write: dgx-fan-control.service is active and shares "
+            "the EC lower-floor register with ACPI cur_state. "
+            "Stop the service and unload the module first, or pass --force. "
+            "Do not write ACPI level 0."
+        )
+    if module_loaded:
+        return (
+            "refusing ACPI write: kernel module dgx_ec_fan_control is loaded and "
+            "shares the EC lower-floor register with ACPI cur_state. "
+            "Run 'dgx-fan-control module disable' first, or pass --force. "
+            "Do not write ACPI level 0."
+        )
+    return None
+
+
 def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
-                  module_loaded: bool | None = None) -> None:
+                  module_loaded: bool | None = None,
+                  service_active: str | None = None,
+                  force: bool = False,
+                  profile: str | None = None) -> None:
     """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
 
-    Does not use this project's kernel module. A level below 40 is refused
-    before any write. EC 3.13.7 accepts the ACPI write and ignores it.
+    Refuses while this module is loaded or its daemon is active, unless force
+    is set. A level below 40 is refused before any write. Level 0 stops both
+    fans. EC 3.13.7 accepts the ACPI write and ignores RPM.
     """
     if level < ACPI_MIN_LEVEL or level > ACPI_MAX_LEVEL:
         raise ValueError(
-            f"ACPI fan level must be between {ACPI_MIN_LEVEL} and {ACPI_MAX_LEVEL}"
+            f"refusing ACPI fan level {level}: this command only writes "
+            f"{ACPI_MIN_LEVEL} through {ACPI_MAX_LEVEL}. "
+            "Levels below 30 are unsafe. Level 0 stops both fans immediately "
+            "and they stay stopped. Level 20 has stalled one fan. Do not write 0."
         )
-    warn_if_module_competes(module_loaded)
+    if module_loaded is None:
+        module_loaded = module_is_loaded()
+    if service_active is None:
+        service_active = systemctl_is_active()
+    refusal = acpi_write_refusal(module_loaded, service_active)
+    if refusal and not force:
+        raise RuntimeError(refusal)
+    if refusal and force:
+        LOG.warning(
+            "forcing an ACPI write while the kernel module or the fan service "
+            "is active. This overwrites the shared EC lower floor. "
+            "Do not write level 0; it stops both fans."
+        )
     devices = acpi_fan_devices(thermal_root)
     if not devices:
         raise RuntimeError("no ACPI Fan cooling device found")
@@ -1021,8 +1178,10 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
         for device in devices:
             try:
                 write_acpi_fan_level(device, ACPI_MAX_LEVEL)
-            except (OSError, RuntimeError, ValueError):
-                LOG.exception("fail-hot ACPI write of %s failed", ACPI_MAX_LEVEL)
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.error(
+                    "fail-hot ACPI write of %s failed: %s", ACPI_MAX_LEVEL, exc,
+                )
 
     failures: list[BaseException] = []
     summaries: list[str] = []
@@ -1039,7 +1198,7 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
             )
         for line in summaries:
             print(line)
-        print(ACPI_RPM_NOTE)
+        print(acpi_result_note(profile))
     except BaseException:
         fail_hot()
         raise
@@ -1081,6 +1240,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="set ACPI Fan cooling devices without this kernel module",
     )
     acpi_max.add_argument("--level", type=int, default=ACPI_MAX_LEVEL)
+    acpi_max.add_argument(
+        "--force",
+        action="store_true",
+        help="write ACPI even if this kernel module or its daemon is active",
+    )
     module = subparsers.add_parser(
         "module",
         help="enable or disable the kernel module for ACPI-only fan control",
@@ -1090,6 +1254,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-service",
         action="store_true",
         help="start the daemon even when fan control is unsupported",
+    )
+    module.add_argument(
+        "--start-service",
+        action="store_true",
+        help="enable and start the performance service; otherwise leave it disabled",
     )
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
@@ -1116,7 +1285,10 @@ def main(argv: list[str] | None = None) -> int:
                 action=args.action,
             )
         if args.command == "acpi-max":
-            set_acpi_fans(args.thermal_root, args.level)
+            set_acpi_fans(
+                args.thermal_root, args.level, force=args.force,
+                profile=pinned_ec_name(read_kernel_log()),
+            )
             return 0
         if args.command == "module":
             if os.geteuid() != 0:
@@ -1128,7 +1300,9 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.action == "enable":
                 enable_kernel_module(
-                    etc, runner=None, loaded=loaded, force_service=args.force_service,
+                    etc, runner=None, loaded=loaded,
+                    force_service=args.force_service,
+                    start_service=args.start_service,
                 )
                 return 0
             kind = classify_fan_binding(
@@ -1163,10 +1337,16 @@ def main(argv: list[str] | None = None) -> int:
             write_state(cooling_device, 0)
             return 0
         if args.command == "status":
-            print(
-                f"state={read_state(cooling_device)}/{MAX_STATE} "
-                f"hottest={read_hottest_temperature_c(args.thermal_root):.1f}C"
-            )
+            try:
+                state = read_state(cooling_device)
+            except RuntimeError as exc:
+                if "floor was changed outside this driver" in str(exc):
+                    print(exc)
+                    return 1
+                raise
+            print(format_cooling_status(
+                state, read_hottest_temperature_c(args.thermal_root),
+            ))
             return 0
     except ControlUnsupported as exc:
         # status is interactive: print the reason once. Logging it as well
@@ -1181,6 +1361,12 @@ def main(argv: list[str] | None = None) -> int:
             return UNSUPPORTED_FIRMWARE_EXIT
         return 1
     except (OSError, RuntimeError, ValueError) as exc:
+        if args.command == "status" and (
+            str(exc).startswith("no dgx_ec_fan_floor")
+            or "floor was changed outside this driver" in str(exc)
+        ):
+            print(exc)
+            return 1
         if not was_reported(exc):
             LOG.error("%s", exc)
         return 1

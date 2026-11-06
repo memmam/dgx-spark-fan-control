@@ -514,8 +514,10 @@ class UserlandFailureTests(unittest.TestCase):
                 "--thermal-root", str(thermal), "acpi-max", "--level", "20",
             ])
             self.assertEqual(code, 1)
-            self.assertEqual((stdout + stderr).count("must be between"), 1)
-            self.assertNotIn("must be between", stdout)
+            self.assertEqual((stdout + stderr).count("refusing ACPI fan level 20"), 1)
+            self.assertIn("stops both fans", stderr)
+            self.assertNotIn("refusing ACPI fan level", stdout)
+            self.assertNotIn("Traceback", stdout + stderr)
             self.assertEqual((first / "cur_state").read_text(), "40\n")
             self.assertEqual((second / "cur_state").read_text(), "40\n")
             code, stdout, stderr = run_cli([
@@ -567,6 +569,10 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(stdout, "")
             self.assertEqual(stderr, "")
             self.assertEqual((device / "cur_state").read_text(), "0\n")
+            code, stdout, stderr = run_cli([*argv, "status"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout, "state=0/12 (no floor; EC curve) hottest=50.0C\n")
+            self.assertEqual(stderr, "")
 
     def test_unknown_curve_and_unprivileged_module_are_reported_once(self):
         with patch.dict("os.environ", {"DGX_FAN_CURVE": "nope"}):
@@ -618,11 +624,11 @@ class UserlandFailureTests(unittest.TestCase):
         combined = stdout + stderr
         self.assertEqual(code, 1)
         self.assertEqual(combined.count("automatic restoration failed"), 1)
-        self.assertFalse(any(
-            line.startswith("ERROR ") and "cleanup busy" in line
-            for line in combined.splitlines()
-        ))
-        self.assertTrue(any("cleanup busy" in line for line in combined.splitlines()))
+        self.assertEqual(sum(
+            1 for line in combined.splitlines()
+            if line.startswith("ERROR ") and "cleanup busy" in line
+        ), 1)
+        self.assertNotIn("Traceback", combined)
         self.assertNotIn("cleanup busy", stdout)
 
     def test_watchdog_alert_is_logged_once_and_not_printed(self):
@@ -653,6 +659,139 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertEqual(combined.count(alerts[0]), 1)
         self.assertEqual(combined.count("fan-stall watchdog watching"), 1)
         self.assertEqual(stdout.getvalue(), "")
+
+    def test_status_explains_a_missing_cooling_device(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon"
+            thermal.mkdir()
+            hwmon.mkdir()
+            argv = ["--thermal-root", str(thermal), "--hwmon-root", str(hwmon), "status"]
+            with patch.object(CONTROL, "module_is_loaded", return_value=False):
+                code, stdout, stderr = run_cli(argv)
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertIn("dgx_ec_fan_control is not loaded", combined)
+            self.assertNotIn("found 0", combined)
+            self.assertEqual(combined.count("is not loaded"), 1)
+            self.assertNotIn("Traceback", combined)
+
+            foreign = "refusing to replace existing lower floor 0x10fe (4350 RPM)\n"
+            with patch.object(CONTROL, "module_is_loaded", return_value=True), \
+                 patch.object(CONTROL, "read_kernel_log", return_value=foreign):
+                code, stdout, stderr = run_cli(argv)
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertIn("probe refused a foreign lower floor", combined)
+            self.assertIn("Do not write ACPI level 0", combined)
+            self.assertNotIn("found 0", combined)
+            self.assertEqual(combined.count("foreign lower floor"), 1)
+
+            device = hwmon / "hwmon0"
+            device.mkdir()
+            (device / "name").write_text(CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii")
+            code, stdout, stderr = run_cli(argv)
+            combined = stdout + stderr
+            self.assertEqual(code, 0)
+            self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stderr)
+
+    def test_estale_names_the_outside_floor_change_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thermal = Path(directory)
+            device = thermal / "cooling_device0"
+            device.mkdir()
+            (device / "type").write_text(CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii")
+            (device / "cur_state").write_text("12\n", encoding="ascii")
+            (device / "max_state").write_text("12\n", encoding="ascii")
+            zone = thermal / "thermal_zone0"
+            zone.mkdir()
+            (zone / "temp").write_text("39000\n", encoding="ascii")
+            log = (
+                "floor ownership mismatch: observed=0x10fe (4350 RPM) "
+                "confirmed=0x34bc (13500 RPM)\n"
+            )
+            original = Path.read_text
+
+            def stale_cur_state(self, *args, **kwargs):
+                if self.name == "cur_state":
+                    raise OSError(errno.ESTALE, "Stale file handle")
+                return original(self, *args, **kwargs)
+
+            argv = ["--thermal-root", str(thermal), "status"]
+            with patch.object(Path, "read_text", stale_cur_state), \
+                 patch.object(CONTROL, "read_kernel_log", return_value=log):
+                code, stdout, stderr = run_cli(argv)
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertIn(
+                "floor was changed outside this driver (observed 4350 RPM, expected 13500)",
+                combined,
+            )
+            self.assertEqual(combined.count("floor was changed outside this driver"), 1)
+            self.assertNotIn("Stale file handle", combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertIn("Do not write ACPI level 0", combined)
+
+    def test_cur_state_timeout_exits_once_without_a_traceback(self):
+        timeout = TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "read_state", side_effect=timeout), \
+             patch.object(CONTROL, "write_state"), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL.Event, "wait", return_value=False):
+            code, stdout, stderr = run_cli(["daemon"])
+        combined = stdout + stderr
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", combined)
+        self.assertEqual(combined.count("fan control unavailable"), 1)
+        self.assertEqual(combined.count("Connection timed out"), 3)
+        self.assertNotIn("Connection timed out", stdout)
+
+    def test_acpi_max_refuses_a_live_module_and_level_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thermal, first, _second = self._acpi_tree(Path(directory))
+            argv = ["--thermal-root", str(thermal), "acpi-max"]
+            with patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(CONTROL, "systemctl_is_active", return_value="active"):
+                code, stdout, stderr = run_cli(argv)
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertEqual(combined.count("refusing ACPI write"), 1)
+            self.assertIn("service is active", combined)
+            self.assertIn("Do not write ACPI level 0", combined)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+
+            with patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(CONTROL, "systemctl_is_active", return_value="inactive"):
+                code, stdout, stderr = run_cli([*argv, "--level", "0"])
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertIn("stops both fans", combined)
+            self.assertEqual(combined.count("refusing ACPI fan level 0"), 1)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+
+            stdout_buffer = io.StringIO()
+            with redirect_stdout(stdout_buffer):
+                CONTROL.set_acpi_fans(
+                    thermal, 100, module_loaded=False, service_active="inactive",
+                    profile="EC 3.13.7",
+                )
+            lines = stdout_buffer.getvalue().strip().splitlines()
+            self.assertEqual(lines[-1], CONTROL.ACPI_RPM_NOTE)
+            stdout_buffer = io.StringIO()
+            with redirect_stdout(stdout_buffer):
+                CONTROL.set_acpi_fans(
+                    thermal, 100, module_loaded=False, service_active="inactive",
+                    profile=None,
+                )
+            self.assertEqual(
+                stdout_buffer.getvalue().strip().splitlines()[-1],
+                CONTROL.ACPI_RPM_NOTE,
+            )
 
     def test_runtime_daemon_error_stays_restartable(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")):

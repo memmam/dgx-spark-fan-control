@@ -14,8 +14,10 @@
  *
  * EC 3.13.7 reports a different capability span. Probe on that profile is
  * read-only (capabilities and telemetry only) unless allow_unverified_writes
- * is set. A mailbox timeout refuses the device: EC 3.5.8 control assumes
- * the older SoC firmware this driver was validated with.
+ * is set. A mailbox timeout refuses the device. EC 3.5.8 with October SoC
+ * 2.158.15 (0x02009e0f) has completed this probe on DGX Spark; the same pair
+ * has also timed out on other boots, so a timeout is not proof of that pair
+ * and a success is not a promise for every boot.
  */
 
 #include <linux/arm_ffa.h>
@@ -37,6 +39,7 @@
 #include <linux/sched.h>
 #include <linux/string.h>
 #include <linux/thermal.h>
+#include <linux/timekeeping.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 #include <linux/uuid.h>
@@ -258,15 +261,24 @@ static void dgx_ec_log_trace(struct dgx_ec_fan_control_data *data,
 
 static void dgx_ec_log_incident(struct dgx_ec_fan_control_data *data)
 {
+	struct timespec64 wall, uptime;
 	u64 now = ktime_get_ns();
 	u64 first = data->trace_seq > DGX_EC_TRACE_LENGTH ?
 		data->trace_seq - DGX_EC_TRACE_LENGTH : 0;
 	u64 seq;
 
+	/*
+	 * mono_ns stays the kernel monotonic clock used for elapsed math.
+	 * realtime is CLOCK_REALTIME and uptime is CLOCK_BOOTTIME so a wedge
+	 * can be lined up with userspace tools. Neither clock is sent to the EC.
+	 */
+	ktime_get_real_ts64(&wall);
+	ktime_get_boottime_ts64(&uptime);
 	dev_warn(&data->ffa_dev->dev,
-		"incident=%llu begin driver=%s op=%#x phase=%s mono_ns=%llu confirmed_state=%lu attempted_floor=%#x uncertain=%u unverified=%u telemetry_valid=%u cached_rpm=%u,%u telemetry_age_ms=%u\n",
+		"incident=%llu begin driver=%s op=%#x phase=%s mono_ns=%llu realtime=%lld.%09ld uptime=%lld.%09ld confirmed_state=%lu attempted_floor=%#x uncertain=%u unverified=%u telemetry_valid=%u cached_rpm=%u,%u telemetry_age_ms=%u\n",
 		data->incident, DGX_EC_DRIVER_VERSION, data->requested_operation, data->request_phase,
-		now, data->current_state, data->attempted_floor, data->floor_uncertain,
+		now, (s64)wall.tv_sec, wall.tv_nsec, (s64)uptime.tv_sec, uptime.tv_nsec,
+		data->current_state, data->attempted_floor, data->floor_uncertain,
 		data->recovery_unverified, data->telemetry_valid, data->rpm[0], data->rpm[1],
 		jiffies_to_msecs(jiffies - data->last_updated));
 	dev_warn(&data->ffa_dev->dev,
@@ -952,9 +964,15 @@ static int dgx_ec_reconcile_floor(struct dgx_ec_fan_control_data *data, u16 floo
 			return -ESTALE;
 		data->current_state = state;
 	} else {
-		dev_warn_ratelimited(&data->ffa_dev->dev,
-			"floor ownership mismatch: observed=%#x confirmed=%#x\n",
-			floor, floors[data->current_state]);
+		if (floors[data->current_state] == DGX_EC_LIMIT_UNSET)
+			dev_warn_ratelimited(&data->ffa_dev->dev,
+				"floor ownership mismatch: observed=%#x (%u RPM) confirmed=unset (NVIDIA curve). The lower floor changed outside this driver, likely an ACPI cur_state write to the same EC register. This driver will not overwrite it\n",
+				floor, floor);
+		else
+			dev_warn_ratelimited(&data->ffa_dev->dev,
+				"floor ownership mismatch: observed=%#x (%u RPM) confirmed=%#x (%u RPM). The lower floor changed outside this driver, likely an ACPI cur_state write to the same EC register. This driver will not overwrite it\n",
+				floor, floor, floors[data->current_state],
+				floors[data->current_state]);
 		return -ESTALE;
 	}
 
@@ -1209,7 +1227,7 @@ static int dgx_ec_probe_failed(struct ffa_device *ffa_dev, int ret)
 	 */
 	if (ret == -ETIMEDOUT || ret == -EIO)
 		return dev_err_probe(&ffa_dev->dev, ret,
-			"EC mailbox did not complete. EC 3.5.8 fan-floor support assumes the pre-October SoC firmware. October SoC 2.158.15 (0x02009e0f) fails the first read-only query. On EC 3.5.8 the alternative is an ACPI cooling device of type Fan (max_state 100). The BIOS target is 975 + 33.75 * level RPM. Do not write a level below 30: level 0 stops both fans. This driver does not operate that ACPI device\n");
+			"EC mailbox did not complete. This is not specific to one firmware pair: EC 3.5.8 with October SoC 2.158.15 (0x02009e0f) has completed this probe on DGX Spark and has also timed out on other boots. When the mailbox does not complete, the fallback is an ACPI cooling device of type Fan (max_state 100). The BIOS target is 975 + 33.75 * level RPM. Do not write a level below 30: level 0 stops both fans and they stay stopped. This driver does not write that ACPI device\n");
 	return dev_err_probe(&ffa_dev->dev, ret,
 			     "refusing fan-floor cooling device\n");
 }
@@ -1262,9 +1280,14 @@ static int dgx_ec_fan_control_probe(struct ffa_device *ffa_dev)
 			if (ret)
 				goto unlock;
 		} else if (floor != DGX_EC_LIMIT_UNSET) {
+			/*
+			 * Do not clear a floor this driver does not own. ACPI
+			 * cur_state writes the same register; level 0 stops both fans
+			 * and still leaves the foreign value in place.
+			 */
 			dev_err(&ffa_dev->dev,
-				"refusing to replace existing lower floor %#x\n",
-				floor);
+				"refusing to replace existing lower floor %#x (%u RPM). This driver did not set it. An ACPI Fan cur_state write uses the same EC lower-floor register (level 100 is 4350 RPM, 0x10fe). The floor was not cleared. Do not write ACPI level 0: it stops both fans and does not clear the floor. Unload this module before using ACPI. A cold power cycle is the recovery that avoids writing a fan level\n",
+				floor, floor);
 			ret = -EBUSY;
 			goto unlock;
 		}

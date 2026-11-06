@@ -76,12 +76,13 @@ States 2–11 are `2000 + (4350 - 2000) * (state - 1) / 11`. The profile
 validator rejects any EC 3.13.7 state 1–12 entry below 2000. The numbers are
 still unverified as floor-register values.
 
-EC 3.5.8 fan-floor support assumes the pre-October SoC firmware. Upstream's
-README does not name one SoC build. This tree's validation record used
-**2.155.11** (`0x02009b0b`). October SoC **2.158.15** (`0x02009e0f`) has been
-observed to time out the first read-only query.
-`-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan` cooling
-device as the alternative on EC 3.5.8. This driver does not operate that device.
+EC 3.5.8 fan-floor support was first validated with pre-October SoC firmware.
+Upstream's README does not name one SoC build. This tree's earlier record used
+**2.155.11** (`0x02009b0b`). October SoC **2.158.15** (`0x02009e0f`) has both
+completed probe on DGX Spark and timed out the first read-only query on other
+boots. `-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan`
+cooling device as the fallback. This driver does not write that ACPI device,
+and it does not clear a non-zero floor it does not own.
 
 RPM readings above 30,000 are still rejected. The driver does not also cap
 readings at the capability maximum: the two profiles do not share one unit,

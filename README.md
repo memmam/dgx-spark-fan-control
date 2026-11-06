@@ -35,7 +35,7 @@ workload normally. When finished, remove the added floor:
 
 ```sh
 sudo dgx-fan-control automatic
-dgx-fan-control status             # state=0/12 means NVIDIA automatic control
+dgx-fan-control status             # state=0/12 (no floor; EC curve)
 ```
 
 Leave the service stopped to keep NVIDIA's curve active. Starting the service
@@ -61,9 +61,12 @@ Fan-floor **control** was tested on **NVIDIA DGX Spark, board P4242**, with
 `6.17.0-1029-nvidia`. Later checks used kernel `7.0.0-1019-nvidia`. Upstream
 does not pin one SoC build in the compatibility statement. The validation
 record for this tree used SoC 2.155.11 (`0x02009b0b`). **EC 3.5.8 with October
-SoC firmware 2.158.15** (`0x02009e0f`) times out the FF-A/eSPI mailbox on the
-first read-only query, so this driver does not bind.
-Probe says so and points at the ACPI fan devices below.
+SoC firmware 2.158.15** (`0x02009e0f`) has done both of the following on DGX
+Spark: completed probe (`pinned EC 3.5.8 capabilities fan0=1260..9000
+fan1=1890..13500`, cooling device registered) and, on other boots reported
+earlier, timed out the first read-only query so the driver did not bind.
+A timeout is still a reason to use the ACPI fan devices. It is not proof that
+this pair can never bind.
 
 **EC 3.13.7** (`fwupdmgr` `0x03000d07`) has been observed on the same board,
 including kernel `7.0.0-1024-nvidia`. The capability reply is still revision 1,
@@ -84,14 +87,17 @@ Floor writes require `allow_unverified_writes=1` at module load, which logs a
 warning. The 3.13.7 state table behind that switch is **not qualified**. Do
 not enable it to test a machine whose fans have stopped.
 
-On **EC 3.5.8 plus the October SoC**, the alternative that has been observed to
-work is the ACPI fan device: `/sys/class/thermal/cooling_device*` with type
-`Fan` and `max_state` 100. The BIOS maps a level to `975 + 33.75 × level` RPM.
-Reported measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
-about 1620 with the second fan stalling, and level 0 stops both fans. Do not
-write a level below 30; the observers use 40. This project does not drive those
-ACPI devices. On EC 3.13.7 the same ACPI write is accepted and does not change
-fan speed.
+On **EC 3.5.8**, ACPI `Fan` `cur_state` and this module's lower floor are the
+same EC register. The BIOS maps an ACPI level to `975 + 33.75 × level` RPM.
+Forum measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
+about 1620 with the second fan stalling, and level 0 stops both fans. **Never
+write an ACPI level below 30. Level 0 stops both fans immediately and they
+stay stopped; it also does not clear a foreign floor.** This command refuses
+levels below 40. `acpi-max` refuses while `dgx_ec_fan_control` is loaded or
+`dgx-fan-control.service` is active, unless `--force` is passed. On EC 3.13.7
+the same ACPI write is accepted and does not change fan speed. An ACPI level
+does not survive reboot: these machines returned to about 2700/4050 RPM
+without another `acpi-max`.
 
 Other GB10 boards, generic kernels, and any capability reply other than the
 two profiles above are rejected. The driver does not relax validation to make
@@ -186,12 +192,13 @@ that is inactive for another reason.
 
 ## Firmware pairing
 
-The kernel module's FF-A path does not provide fan control when EC 3.5.8 is
-paired with the October SoC (2.158.15). tenhkspark's firmware notes report a
-relay timeout and tachometers reading 0/0 on that mix. Separately, NVIDIA
-forum topic 386805 post 21 reports that ACPI `cur_state` does work on EC 3.5.8
-after an EC-only downgrade onto that October SoC. `dgx-fan-control acpi-max`
-is the documented route for that pairing. It is not a kernel-module path.
+EC 3.5.8 with the October SoC (2.158.15, `0x02009e0f`) has completed the
+fan-floor probe on both DGX Sparks in this tree's 6 Nov 2026 retest: baseline
+about 2700/4050 RPM, and `set-state` changed speed while the daemon was
+stopped. tenhkspark's notes and NVIDIA forum topic 386805 post 21 also
+describe a mailbox timeout and 0/0 tachometers on that mix. Both outcomes
+are real. If probe times out, `acpi-max` is the fallback, and only while
+this module is not loaded. The two writers share one lower-floor register.
 
 ## ACPI-only mode
 
@@ -204,8 +211,11 @@ is `sudo dkms remove dgx-spark-fan-control/0.1.5 --all` (the version in
 sudo dgx-fan-control module disable
 sudo dgx-fan-control module status
 sudo dgx-fan-control acpi-max
-sudo dgx-fan-control module enable
 ```
+
+Do not load the module again while that ACPI level is still the EC floor.
+Probe refuses a floor it did not set, and it does not clear it. `module
+enable` also does not start the performance service.
 
 `module disable` stops and disables `dgx-fan-control.service`, unloads
 `dgx_ec_fan_control` when it is loaded, writes
@@ -215,8 +225,10 @@ sudo dgx-fan-control module enable
 project installs. Running it again changes nothing else. Any other file in
 `/etc/modprobe.d` that blacklists the module or install-overrides it is
 reported and left untouched. `module enable` removes only the managed
-blacklist, restores the modules-load.d entry, loads the module, and enables
-and starts the service when fan control is supported. On EC 3.13.7, where the
+blacklist, restores the modules-load.d entry, and loads the module. It does
+**not** enable or start `dgx-fan-control.service`. That is a separate choice:
+`sudo dgx-fan-control module enable --start-service` or
+`sudo systemctl enable --now dgx-fan-control.service`. On EC 3.13.7, where the
 module registers telemetry only, enable loads the module and leaves the
 service disabled. It prints once that fan control is unsupported and points
 at `acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
@@ -236,13 +248,14 @@ unsupported fan control. `module status` reports that exit, with the time it
 happened, when the unit is failed or still enabled and inactive. It still
 alerts when the unit is `failed`, or enabled but inactive after another exit.
 
-`acpi-max` warns if `dgx_ec_fan_control` is loaded, because the module and the
-ACPI write can compete, and suggests `module disable`. It still writes. On
-success it prints each Fan device's `cur_state/max_state` (for example
-`cooling_device0 (Fan): 100/100`) and notes that firmware may accept the write
-without changing RPM, which EC 3.13.7 does, so fan RPM should be checked
-afterward. It exits nonzero when no Fan cooling device is found or a write
-fails.
+`acpi-max` refuses while `dgx_ec_fan_control` is loaded or the fan service is
+active, because both write the same EC lower floor. `--force` writes anyway
+and logs a warning. It refuses levels below 40. Level 0 stops both fans; do
+not use it as a recovery step. On success it prints each Fan device's
+`cur_state/max_state` (for example `cooling_device0 (Fan): 100/100`). On EC
+3.13.7, or when the EC is unknown, it adds that firmware may accept the write
+without changing RPM. On EC 3.5.8 it prints `check fan RPM`. It exits nonzero
+when no Fan cooling device is found or a write fails.
 
 This project does not put the module in the initramfs. `modules-load.d` loads
 it after the root filesystem is mounted, so `module disable` does not run

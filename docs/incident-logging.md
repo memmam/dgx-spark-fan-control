@@ -17,10 +17,12 @@ can still appear.
 
 The `begin` line identifies the requested operation and failure phase:
 `preflight`, `completion`, or `blocked` by an earlier unverified recovery.
-It records driver version, monotonic time, confirmed cooling state, attempted
-floor, uncertain-write and recovery flags, and cached RPM with its validity
-and age. Cached values are not fresh sensor observations. Temperature is not
-sampled as part of diagnosis.
+It records driver version, monotonic time, `CLOCK_REALTIME` (`realtime=`),
+`CLOCK_BOOTTIME` (`uptime=`), confirmed cooling state, attempted floor,
+uncertain-write and recovery flags, and cached RPM with its validity and age.
+The wall clock and uptime are there so a wedge can be compared with other
+tools on the same machine. Cached values are not fresh sensor observations.
+Temperature is not sampled as part of diagnosis.
 
 `totals` contains cumulative submitted capabilities reads, floor reads, floor
 writes, and telemetry reads since module load. These include recovery requests
@@ -37,7 +39,9 @@ steady two-second floor polling usually retains about eight requests. Each
 - Operation, input/output lengths, and requested floor for setters. A zero
   `floor` in a read/preflight entry is a placeholder, not a requested setting.
 - Calling thread ID (`pid`) and CPU at entry; CPU migration afterward is possible.
-- Kernel monotonic `start_ns`, submit-path duration in microseconds, and total
+- Kernel monotonic `start_ns`, plus the incident `begin` line's `realtime=`
+  (`CLOCK_REALTIME`, seconds and nanoseconds) and `uptime=` (`CLOCK_BOOTTIME`).
+  Submit-path duration is in microseconds, and total
   elapsed time through completion or failure. The submit duration includes
   the small bookkeeping immediately around the FF-A call, not just EC work.
 - Submit transport return and raw secure-partition status. `sp` is meaningful

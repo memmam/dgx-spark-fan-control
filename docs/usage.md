@@ -56,7 +56,7 @@ sudo dgx-fan-control automatic
 dgx-fan-control status
 ```
 
-Expect **`state=0/12`**. Leave the service stopped to retain the factory curve.
+Expect **`state=0/12 (no floor; EC curve)`**. That is NVIDIA's curve, not fans stopped. Leave the service stopped to retain it. Enabling the service is a separate command; `module enable` does not do it.
 Firmware hysteresis can keep fans fast for a while after the floor is removed.
 
 ## Return to NVIDIA automatic control
@@ -186,6 +186,13 @@ by 900; states 9–12 step by 1125. This table is unchanged.
 | 5 | 6,300 | 12 | 13,500 |
 | 6 | 7,200 | | |
 
+On EC 3.5.8 with October SoC `0x02009e0f`, module floors go well above the
+ACPI ceiling of about 4320 RPM (level 100). With the daemon stopped,
+`set-state 6` measured about 7560/7155 RPM. State 12 writes floor `0x34bc`
+(13500) and was louder than ACPI level 100. The idle curve on that pair was
+about 2700/4050 RPM, which is what `state=0/12 (no floor; EC curve)` means.
+State 0 is not fans off. ACPI level 0 is fans off. Do not write ACPI level 0.
+
 ### EC 3.13.7 (unverified, and likely unused)
 
 Both fans report 975–4350. That span matches `975 + 33.75 × level` for an ACPI
@@ -269,13 +276,17 @@ sudo dgx-fan-control acpi-max --level 40
 ```
 
 On success it prints one line per Fan device with the read-back level, for
-example `cooling_device0 (Fan): 100/100`, then notes that firmware may accept
-the write without changing RPM. Check fan RPM afterward. EC 3.13.7 accepts
-the write and leaves RPM unchanged. The command exits nonzero when it finds
-no Fan cooling device or a write fails.
+example `cooling_device0 (Fan): 100/100`. On EC 3.13.7, or when the kernel
+log does not name an EC, it also says firmware may accept the write without
+changing RPM. On EC 3.5.8 the trailing line is `check fan RPM`. The command
+exits nonzero when it finds no Fan cooling device, a write fails, the kernel
+module is loaded, or the fan service is active.
 
-`--level` below 40 is refused and does not write. On EC 3.5.8 with the
-October SoC, this is the path that has been observed to change fan speed.
-Level 100 is the maximum (about 4320 RPM in the forum measurements). If a
-level below 100 fails partway, or the command is interrupted after it has
-found the devices, it tries to write 100 to each of them.
+The module and ACPI `cur_state` write the same EC lower floor. `acpi-max`
+refuses in that case. `--force` overrides the refusal and logs a warning.
+`--level` below 40 is refused and does not write. **Never write a level
+below 30. Level 0 stops both fans and is not a recovery step.** Level 20 has
+stalled one fan. Level 100 is about 4320 RPM, quieter than module state 12
+on EC 3.5.8. The level resets on reboot. If a level below 100 fails partway,
+or the command is interrupted after it has found the devices, it tries to
+write 100 to each of them. It never writes 0 from that path.

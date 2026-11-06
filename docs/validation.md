@@ -1,5 +1,65 @@
 # Validation and provenance
 
+## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
+
+Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
+the EC blocked in `DisabledDevices`. SoC/UEFI stayed October `0x02009e0f`.
+Kernel `7.0.0-1024-nvidia`. Module 0.1.5.
+
+Probe bound. The kernel log showed `pinned EC 3.5.8 capabilities
+fan0=1260..9000 fan1=1890..13500`, baseline 2700/4050 RPM, a cooling device,
+and state 1 floor `0xa8c`. With the daemon stopped, `set-state 6` measured
+about 7560/7155 RPM. State 12 wrote floor `0x34bc`. This is the opposite of
+the earlier report that this pair always times out the mailbox. That timeout
+has also been seen, on other boots, so it stays the fallback when probe
+fails. It is not the only outcome.
+
+One mailbox wedge is open. The daemon, enabled at boot, read the floor about
+99 times at a 2-second interval, then near 188 seconds of uptime operation
+`0x4` stuck pending (state `0x2`, 100 polls, `-110`). Later preflights timed
+out until reboot. It was not reproduced on demand afterward. NVIDIA Sync
+Resource Monitor and the DGX Dashboard telemetry froze around the same time;
+that is a correlation to check, not a cause. Incident logs now include
+`realtime=` and `uptime=` for the next occurrence.
+
+ACPI `cur_state` and the module write the same EC lower floor. After state
+12 (`0x34bc`), `acpi-max` (ACPI level 100) replaced it with `0x10fe` (4350
+RPM). The module then logged `floor ownership mismatch: observed=0x10fe
+confirmed=0x34bc`. Unload logged `failed to restore automatic fan policy for
+module removal: -116`. The next probe logged `refusing to replace existing
+lower floor 0x10fe` and did not register a cooling device. Writing ACPI
+level 0 stopped both fans immediately; they stayed at 0/0 RPM at 39°C, and
+the EC did not intervene. Level 0 also left the foreign floor in place.
+ACPI level 100 measured about 4320 RPM and was quieter than module state 12.
+After reboot, both machines were back near 2700/4050 RPM without another
+`acpi-max`.
+
+The fan service was enabled and started at boot even though an earlier step
+had left it disabled. `module enable` had been enabling it whenever fan
+control was supported. It no longer does that.
+
+Not observed on these boots: the quiet curve, the watchdog trip, and a
+repeated copy of the 188-second wedge. `allow_unverified_writes` stayed off.
+No step in the notes below writes ACPI level 0.
+
+Recheck, on each Spark, after installing this command and module:
+
+1. If `systemctl is-enabled dgx-fan-control.service` is already `enabled`
+   from the previous `module enable`, run `sudo systemctl disable --now
+   dgx-fan-control.service` once. After that, `module enable` must leave it
+   `disabled`. `dgx-fan-control status` shows `state=0/12 (no floor; EC curve)`
+   when the module is loaded and the service is stopped.
+2. With the service stopped, `sudo dgx-fan-control set-state 6`, read both
+   `fan*_input` values, then `sudo dgx-fan-control automatic`. Status returns
+   to `state=0/12 (no floor; EC curve)`.
+3. `sudo dgx-fan-control acpi-max` while the module is still loaded exits
+   nonzero and does not change `cur_state`. Then `sudo dgx-fan-control module
+   disable` and `sudo dgx-fan-control acpi-max` (level 100). Fans should move
+   to about 4320 RPM. Do not pass `--level` below 40.
+4. Reboot. Idle fans should be back near 2700/4050 RPM without another
+   `acpi-max`. Only then `sudo dgx-fan-control module enable`, and only if
+   status does not say the probe refused a foreign floor.
+
 ## Version 0.1.5 on EC 3.13.7
 
 Hardware check on DGX Spark, kernel `7.0.0-1024-nvidia`, EC 3.13.7.

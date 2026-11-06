@@ -50,9 +50,13 @@ class KernelContractTests(unittest.TestCase):
             "module_param(allow_unverified_writes, bool, 0444)",
             "October SoC 2.158.15",
             "Do not write a level below 30",
+            "has completed this probe",
+            "has also timed out",
+            "refusing to replace existing lower floor",
+            "Do not write ACPI level 0",
+            "realtime=%lld.%09ld uptime=%lld.%09ld",
             "ret = -EAGAIN",
             "ret = -EPROTO",
-            "pre-October SoC firmware",
             "floor ownership mismatch",
         ):
             self.assertIn(requirement, SOURCE)

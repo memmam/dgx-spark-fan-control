@@ -55,6 +55,7 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef unsigned long long u64;
+typedef long long s64;
 #define U16_MAX UINT16_MAX
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define dev_info(...) ((void)0)
@@ -69,6 +70,13 @@ typedef unsigned long long u64;
 static unsigned long jiffies;
 static u64 clock_ns = 1000000000;
 static u64 ktime_get_ns(void) { return clock_ns + jiffies * 1000000ULL; }
+struct timespec64 { long long tv_sec; long tv_nsec; };
+static void ktime_get_real_ts64(struct timespec64 *ts) {
+ ts->tv_sec = 1762380000LL; ts->tv_nsec = 125000000L;
+}
+static void ktime_get_boottime_ts64(struct timespec64 *ts) {
+ ts->tv_sec = 188LL; ts->tv_nsec = 0L;
+}
 static char incident_log[65536];
 static size_t incident_log_length;
 static void capture_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -81,7 +89,7 @@ static void capture_log(const char *fmt, ...) {
 #define dev_warn(dev, ...) capture_log(__VA_ARGS__)
 #define dev_emerg(dev, ...) ((void)snprintf(log_text, sizeof(log_text), __VA_ARGS__))
 #define dev_warn_ratelimited(dev, ...) ((void)snprintf(log_text, sizeof(log_text), __VA_ARGS__))
-static char log_text[256];
+static char log_text[1024];
 struct mutex { int unused; };
 struct notifier_block { int unused; };
 struct ffa_device;
@@ -224,6 +232,8 @@ int main(int argc, char **argv) {
    assert(strstr(incident_log, "mailbox=0x8,0x8,0x8"));
    assert(strstr(incident_log, "response_final=07:04:00:94:11 cached_floor=0x1194"));
    assert(strstr(incident_log, "incident=1 end ret=0"));
+   assert(strstr(incident_log, "realtime=1762380000.125000000"));
+   assert(strstr(incident_log, "uptime=188.000000000"));
    fputs(incident_log, stdout);
   } else if (!strcmp(argv[1], "logging_write")) {
    recovery_enabled = 1; wedge_operation = 5;

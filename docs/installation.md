@@ -197,13 +197,17 @@ sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
 
-Status must start with **`state=0/12`**: the device was found and its added floor
-is unset. On EC 3.13.7, status may instead print
+Status must start with **`state=0/12 (no floor; EC curve)`**: the device was
+found and its added floor is unset. That is NVIDIA's curve, not fans stopped.
+On EC 3.13.7, status may instead print
 `control unsupported on this firmware`: telemetry is up and floor writes were
 rejected. A mailbox timeout prints an error and does not create the hwmon
-device; that is the observed result of EC 3.5.8 with October SoC firmware
-2.158.15. Successful `modprobe` alone is insufficient; device probing can still
-reject the firmware contract. See [troubleshooting](troubleshooting.md) if needed.
+device. EC 3.5.8 with October SoC 2.158.15 has both completed this probe and
+timed out on other boots, so a timeout is a fallback case, not the only
+result for that pair. If status says the probe refused a foreign floor, do
+not write ACPI level 0. Successful `modprobe` alone is insufficient; device
+probing can still reject the firmware contract. See
+[troubleshooting](troubleshooting.md) if needed.
 
 ## 5. Choose your startup mode
 
@@ -233,10 +237,14 @@ dgx-fan-control status
 
 The module loads at boot on NVIDIA's curve (state 0) whether or not the
 service is enabled. State 0 is that curve, not fans stopped. A latched lower
-clamp of 0 is cleared during load. Enabling the service adds our performance
-curve. `start`/`stop` change the current session; `enable`/`disable` change
-future boots. Disabling the service alone does not clear a manually set
-non-zero floor, which is why `automatic` is explicit above.
+clamp of exactly 0 is cleared during load. A non-zero floor this driver does
+not own is not cleared. Enabling the service adds our performance curve.
+`module enable` loads the module and does not enable the service.
+`sudo dgx-fan-control module enable --start-service` is the explicit choice,
+same as the table above. `start`/`stop` change the current session;
+`enable`/`disable` change future boots. Disabling the service alone does not
+clear a manually set non-zero floor, which is why `automatic` is explicit
+above. Do not substitute an ACPI level of 0 for `automatic`.
 
 For the performance service, verify startup:
 

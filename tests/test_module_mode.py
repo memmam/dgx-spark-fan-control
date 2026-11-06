@@ -88,6 +88,17 @@ class ModuleModeTests(unittest.TestCase):
             [cmd for cmd in self.commands if cmd[:1] == ["modprobe"] and "-r" not in cmd],
             [["modprobe", CONTROL.MODULE_NAME]],
         )
+        self.assertNotIn(
+            ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
+        )
+        self.commands.clear()
+        CONTROL.enable_kernel_module(
+            self.etc, runner=self.runner, loaded=True,
+            control_supported=True, start_service=True,
+        )
+        self.assertIn(
+            ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
+        )
 
     def test_status_reports_acpi_only_and_initramfs_without_editing_it(self):
         initramfs = self.etc / "initramfs-tools" / "modules"
@@ -245,7 +256,7 @@ class ModuleModeTests(unittest.TestCase):
         self.assertTrue(any("not alerting" in line for line in logs.output))
         self.assertFalse(any("is not active" in line for line in logs.output))
 
-    def test_acpi_max_warns_when_the_module_is_loaded_but_still_writes(self):
+    def test_acpi_max_refuses_a_loaded_module_unless_forced(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             thermal = root / "thermal"
@@ -258,14 +269,28 @@ class ModuleModeTests(unittest.TestCase):
             import io
             from contextlib import redirect_stdout
             stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                with self.assertRaises(RuntimeError) as refused:
+                    CONTROL.set_acpi_fans(
+                        thermal, 100, module_loaded=True, service_active="inactive",
+                    )
+            self.assertIn("refusing ACPI write", str(refused.exception))
+            self.assertIn("Do not write ACPI level 0", str(refused.exception))
+            self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "40\n")
+            self.assertEqual(stdout.getvalue(), "")
+            stdout = io.StringIO()
             with redirect_stdout(stdout), self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
-                CONTROL.set_acpi_fans(thermal, 100, module_loaded=True)
+                CONTROL.set_acpi_fans(
+                    thermal, 100, module_loaded=True, service_active="inactive",
+                    force=True, profile="EC 3.5.8",
+                )
             text = stdout.getvalue()
             self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "100\n")
-            self.assertEqual(sum("module disable" in line for line in logs.output), 1)
+            self.assertEqual(sum("forcing an ACPI write" in line for line in logs.output), 1)
             self.assertEqual(text.count("cooling_device0 (Fan): 100/100\n"), 1)
-            self.assertEqual(text.count(CONTROL.ACPI_RPM_NOTE), 1)
-            self.assertFalse(any("100/100" in line or CONTROL.ACPI_RPM_NOTE in line for line in logs.output))
+            self.assertEqual(text.count("check fan RPM"), 1)
+            self.assertNotIn("3.13.7", text)
+            self.assertFalse(any("100/100" in line or "check fan RPM" in line for line in logs.output))
 
 
 if __name__ == "__main__":
