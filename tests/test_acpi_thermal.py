@@ -537,6 +537,100 @@ class ThermalTests(unittest.TestCase):
         process.kill.assert_not_called()
         self.assertIsNone(self.guard.hook_process)
 
+    def test_resume_hook_is_off_until_the_next_boot_and_runs_once(self):
+        self.assertEqual(C.maybe_run_acpi_resume_hook({}), "disabled")
+        calls = []
+
+        def runner(argv, env):
+            calls.append((argv, dict(env)))
+            return 0
+
+        defaults = {"ACPI_THERMAL_RESUME_HOOK": "/opt/resume-job --once"}
+        with patch.object(C.os, "geteuid", return_value=0):
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner),
+                "skipped-no-incident",
+            )
+            C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner),
+                "skipped-same-boot",
+            )
+        self.assertEqual(calls, [])
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.os, "geteuid", return_value=0):
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "ran",
+            )
+            self.assertEqual(calls[0][0], ["/opt/resume-job", "--once"])
+            self.assertEqual(calls[0][1]["DGX_ACPI_INCIDENT_BOOT"], "test-boot")
+            self.assertEqual(calls[0][1]["DGX_ACPI_RESUME_BOOT"], "next-boot")
+            self.assertTrue(C.acpi_incident_latched())
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "already",
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_resume_hook_skips_non_root_hold_and_failure_without_retry(self):
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        calls = []
+
+        def runner(argv, env):
+            calls.append(argv)
+            return 1
+
+        defaults = {"ACPI_THERMAL_RESUME_HOOK": "/opt/resume-job"}
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.os, "geteuid", return_value=1):
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner),
+                "skipped-not-root",
+            )
+        self.assertEqual(calls, [])
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.os, "geteuid", return_value=0):
+            C.record_acpi_boot(C.ACPI_HOLD_NAME)
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner),
+                "skipped-acpi-hold",
+            )
+            (C.STALL_MARKER_DIR / C.ACPI_HOLD_NAME).unlink()
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "failed",
+            )
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "already",
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_recording_health_invokes_resume_hook_and_plain_health_does_not(self):
+        thermal, hwmon = self.fake_fans(40000)
+        calls = []
+
+        def health(record):
+            with patch.object(
+                C, "maybe_run_acpi_resume_hook",
+                side_effect=lambda *args, **kwargs: calls.append(record) or "disabled",
+            ):
+                return C.run_health(
+                    thermal, hwmon, record=record, settle_seconds=0,
+                    defaults={}, state_dir=C.STALL_MARKER_DIR,
+                    observer=lambda: {
+                        "service_active": "inactive",
+                        "service_enabled": "disabled",
+                        "watchdog_active": "active",
+                        "module_loaded": False,
+                        "log_text": "",
+                    },
+                    notifier=lambda *_: None,
+                    notify=lambda *_: None,
+                )
+
+        health(False)
+        self.assertEqual(calls, [])
+        health(True)
+        self.assertEqual(calls, [True])
+
     def test_hook_is_async_argv_without_shell(self):
         guard = C.AcpiThermalGuard({"ACPI_THERMAL_STOP_HOOK": "/opt/stop-job --reason hot"})
         with patch.object(C.subprocess, "Popen") as popen:

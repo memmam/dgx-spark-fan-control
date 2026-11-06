@@ -207,7 +207,7 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    SIGTERM to eligible workload processes immediately. Otherwise allow
    **10 seconds** for the hook to cool the hottest zone below **83 C**;
    if it does not, send SIGTERM. A timed-out hook is killed without waiting
-   for it. There is no workload restart or resume action.
+   for it. The stop hook does not resume the job.
 3. **90 C:** preempt the hook and all SIGTERM grace, and send SIGKILL.
    Otherwise, after **10 seconds** following SIGTERM, send SIGKILL if a
    selected process is still alive or the hottest zone remains at least
@@ -239,9 +239,12 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    bypass this recovery verification; the hot true-zero shutdown still
    takes precedence.
 
-The incident latch survives reboot. It inhibits `acpi-max`, the sweep,
-stall-repair ACPI writes, daemon curve startup, boot restoration of a manual
-floor, and `set-state`. After the reboot, inspect cooling and explicitly run:
+The reboot restores stock EC control. It is not an in-place ACPI recovery,
+and it does not relaunch the process that was stopped. The incident latch
+survives that reboot and inhibits `acpi-max`, the sweep, stall-repair ACPI
+writes, daemon curve startup, boot restoration of a manual floor, and
+`set-state`. It does not forbid a workload from running again under the
+restored EC curve. After the reboot, inspect cooling and explicitly run:
 
 ```sh
 sudo dgx-fan-control acpi-incident-reset
@@ -249,11 +252,36 @@ sudo dgx-fan-control acpi-incident-reset
 
 Reset refuses in the incident/ACPI-hold boot or unless the hottest zone is
 below MAX minus HYSTERESIS (78 C by default). It writes no fan level and
-starts no service or job. `automatic` does not clear this latch. Existing
-external workload/service restart policies are outside this tool: configure
-those policies or the stop hook to respect `/var/lib/dgx-fan-control/acpi-incident`
-if they must remain stopped across reboot. The fan tool itself never starts
-or resumes a workload.
+starts no service or job. `automatic` does not clear this latch.
+
+### Optional resume after the next boot
+
+`ACPI_THERMAL_RESUME_HOOK` is empty by default. Nothing is resumed until an
+administrator sets it. The tool does not guess the killed command line and
+does not assume the job can be checkpointed. A non-checkpointable job does
+not continue; only this hook, or the workload manager the hook calls, can
+start work again.
+
+`dgx-fan-health.service` (`health --record`) is what runs the hook, once, on
+the boot **after** the incident boot. A plain `health` run does not. The
+hook is skipped unless every one of these is true:
+
+- the command is set, and this process is root
+- `/var/lib/dgx-fan-control/acpi-incident` exists and names an **earlier**
+  boot, so this is a new boot and ACPI writes are still inhibited
+- this boot has not armed an ACPI hold
+- this boot has not already attempted the hook
+
+The attempt is recorded **before** the command starts. A failure, a timeout
+(30 seconds), or a second `health --record` does not run it again until the
+next boot. The hook inherits the health unit's sandbox: home directories are
+hidden, so use an absolute program outside `$HOME`, usually `systemctl start`
+of a unit that knows how to resume. The command is split with `shlex` and is
+not a shell. It receives `DGX_ACPI_INCIDENT=1`,
+`DGX_ACPI_INCIDENT_BOOT` (the incident boot id), `DGX_ACPI_INCIDENT_PATH`,
+and `DGX_ACPI_RESUME_BOOT` (this boot). It must exit promptly. What to start,
+and whether that job can resume at all, is not something this repository can
+know.
 
 Defaults are deliberately early: on kensaki the hottest zone rose about
 **0.07 C/s between 88 and 95 C** under `gpu_burn`, while others reported
@@ -287,6 +315,7 @@ explicitly when customizing. Missing keys use these defaults:
 | `ACPI_THERMAL_HYSTERESIS_C` | `2` | STOP minus this is adequate hook cooling; MAX minus this is the manual reset temperature. Not a reboot delay |
 | `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this new shutdown stage, not true-zero poweroff or recovery reboot |
 | `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable/script plus arguments, parsed with `shlex`, **not a shell expression** |
+| `ACPI_THERMAL_RESUME_HOOK` | empty | Optional post-boot resume. Empty disables it. Not a relaunch of the killed command |
 | `ACPI_THERMAL_PIDS` | empty | Additional comma/space-separated PIDs |
 | `ACPI_THERMAL_PROCESS_NAMES` | empty | Additional comma/space-separated exact Linux `comm` names (normally at most 15 characters) |
 
@@ -319,10 +348,10 @@ TCP and UDP, so the hook cannot call a Kubernetes, Slurm, or HTTP API
 itself. `systemctl` over the system bus is allowed. Docker, Slurm,
 Kubernetes, and systemd `Restart=` policies are not stopped by the fan
 tool. Root and `/system.slice` jobs are not signaled either. Those have to
-be stopped by the hook, or the final shutdown is the fallback. None of them
-may start the workload again while
-`/var/lib/dgx-fan-control/acpi-incident` exists. The incident file is
-retried until this boot's copy has been synced to disk.
+be stopped by the hook, or the final shutdown is the fallback. The incident
+file blocks later ACPI writes from this project. It does not block a
+workload manager from starting work again under the restored EC curve. The
+file is retried until this boot's copy has been synced to disk.
 
 `acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
 must explicitly raise it, for example `--max-temp 95`; that changes only

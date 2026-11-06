@@ -78,9 +78,15 @@ ACPI_THERMAL_HYSTERESIS_C=2
 # Shutdown is the failure path. A confirmed stop reboots immediately.
 ACPI_THERMAL_SHUTDOWN=yes
 # Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
-# A confirmed stop reboots with no cool-down wait. Jobs are never restarted.
+# A confirmed stop reboots with no cool-down wait. That reboot restores the
+# EC curve and does not relaunch the killed command.
 # Incident latch survives reboot; reset explicitly with acpi-incident-reset.
 ACPI_THERMAL_STOP_HOOK=
+# Optional. Empty disables resume. The boot health unit runs this once on the
+# boot after an ACPI incident. It must exit promptly. It is not a shell and
+# it is not the killed command line. A job that cannot checkpoint does not
+# resume unless this command, or the manager it calls, starts it again.
+ACPI_THERMAL_RESUME_HOOK=
 # These additional targets never bypass root/system-process exclusions.
 ACPI_THERMAL_PIDS=
 ACPI_THERMAL_PROCESS_NAMES=

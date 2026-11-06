@@ -657,10 +657,14 @@ before that reboot do not come back by themselves:
   watchdog still reboots only the machine whose fans stopped or whose floor
   is foreign, or whose ACPI thermal incident has a confirmed stopped workload.
 
-For ACPI incident recovery, do not automatically restart the workload. The
-incident latch must be inspected and explicitly reset after reboot; external
-workload managers must honor it too. The fan tool never starts a job. The
-stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
+The ACPI reboot restores the EC curve. It does not relaunch the stopped
+job. The incident latch blocks another ACPI hold until
+`acpi-incident-reset`; it does not forbid resuming work under that restored
+EC curve. A non-checkpointable job does not continue unless the workload
+manager, or the optional `ACPI_THERMAL_RESUME_HOOK`, knows how to start it
+again. That hook is empty by default and runs at most once from the boot
+health unit. See [optional resume](ec-curve.md#optional-resume-after-the-next-boot).
+The stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
 system bus, and it cannot open a network connection to Kubernetes, Slurm,
 or an HTTP API. Root jobs and system services are not killed directly.
 
@@ -672,7 +676,8 @@ watchdog must be active before these commands write; it forces 100 at 80 C,
 stops work at 85 C, and kills at 90 C or timeout. A confirmed stop reboots
 immediately. Shutdown at 95 C is only for an unverified stop or a failed
 reboot, not for residual heat after a reboot was accepted. The incident
-latch survives that reboot; the tool never restarts the workload.
+latch survives that reboot and blocks ACPI reapplication. Workload resume
+is a separate, optional post-boot hook.
 See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 
 

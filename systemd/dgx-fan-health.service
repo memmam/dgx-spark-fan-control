@@ -13,8 +13,10 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/dgx-fan-control health --record --settle 45
 TimeoutStartSec=120s
 
-# READY_CHECK and the notify hook may be a URL or another networked command.
-# PrivateNetwork is left unset so that optional check can run.
+# READY_CHECK, the notify hook, and the optional ACPI resume hook may be a
+# URL or another networked command. PrivateNetwork is left unset so that
+# optional check can run. The resume hook is a child of this unit, so
+# ProtectHome still hides home directories.
 # ProtectKernelLogs is left unset so a missing cooling device can be
 # classified from the probe line in the kernel log.
 # RestrictAddressFamilies is left unset for the same optional URL.

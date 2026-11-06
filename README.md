@@ -9,7 +9,8 @@
 > 80 C, stops work via hook/SIGTERM at 85 C, and kills at 90 C (or timeout).
 > A confirmed stop reboots immediately to restore the EC curve. Poweroff at
 > 95 C is only the failure path when that stop cannot be verified or the
-> reboot fails. There is no cool-down wait and no workload restart.
+> reboot fails. There is no cool-down wait. The reboot does not relaunch
+> the job. An optional post-boot resume hook is off until configured.
 > An incident stays latched across reboot until explicit manual reset.
 > Read [escalation, recovery, configuration, and safeguards](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 > The burn view's GPU temperature can read about 10 C below the hottest
