@@ -220,10 +220,14 @@ EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
 back, are in
 [EC firmware pairing and downgrade](#ec-firmware-pairing-and-downgrade).
 
-Finish by refreshing the stored health record. A reinstall marks the old
-record stale. `--record` saves the current result and, on a healthy run,
-also clears the stored needs-intervention flag and the stall and
-watchdog-reboot markers. The plain command is not sudo and does not write.
+Finish by refreshing the stored health record. Installing a different
+build marks the old record stale, so the first `health` run after an
+install or update prints `stored health: ... stale (written by a different
+install)`. That is expected and is not a fault. The `--record` run that
+follows replaces it with the current result and, on a healthy run, also
+clears the stored needs-intervention flag and the stall and watchdog-reboot
+markers. The plain command runs under `sudo` but does not write
+(`recorded: no`).
 Do not write an ACPI level to make this health check pass or to provoke a
 result. That does not apply to `sudo dgx-fan-control acpi-max` when a
 downgrade to EC 3.5.8 leaves a fan at 0 RPM.
@@ -457,6 +461,8 @@ sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
+The first `health` run prints the old record as `stale (written by a
+different install)`; that is expected, and the `--record` run replaces it.
 Why that refresh is required, and what `--record` clears, is in
 [section 4](#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
