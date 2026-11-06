@@ -4650,6 +4650,17 @@ def main(argv: list[str] | None = None) -> int:
             print(TELEMETRY_ONLY_STATUS)
             print(format_watchdog_status(active, enabled), end="")
             return 0
+        # automatic on telemetry-only firmware: there is no floor to clear in
+        # ACPI/sysfs. Still drop a stale last-set record, then exit 0.
+        if args.command == "automatic":
+            clear_persisted_manual_floor(STALL_MARKER_DIR)
+            profile = pinned_ec_name(read_kernel_log()) or "EC 3.13.7"
+            LOG.info(
+                "automatic: nothing to do (%s, telemetry only; "
+                "EC runs its own curve)",
+                profile,
+            )
+            return 0
         LOG.error("%s", exc)
         if args.command == "daemon":
             return UNSUPPORTED_FIRMWARE_EXIT

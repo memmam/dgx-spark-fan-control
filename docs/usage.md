@@ -95,6 +95,7 @@ dgx-fan-control status
 ```
 
 Expect **`state=0/12 (no floor; EC curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` also clears the persisted manual floor. Leave the service stopped to retain the curve. Enabling the service is a separate command; `module enable` does not do it.
+On EC 3.13.7 telemetry-only there is no floor to clear in sysfs, so `automatic` is a no-op that still clears a stale last-set record and exits 0.
 Firmware hysteresis can keep fans fast for a while after the floor is removed.
 
 ## Return to NVIDIA automatic control
@@ -547,7 +548,9 @@ The core checks are fan and thermal only:
   A service left enabled reports
   `daemon: n/a (unsupported firmware; service enabled but idle)`. The
   watchdog does not broadcast for exit 69 or for this firmware. A last-set
-  floor is kept. This does not set needs-intervention
+  floor is kept. `automatic` still clears that record without writing
+  sysfs; `set-state` and other control writes still error. This does not
+  set needs-intervention
 
 `READY_CHECK` runs in the same pass. Empty means not configured, and the
 fan checks alone decide. A command succeeds on exit 0. A URL succeeds on

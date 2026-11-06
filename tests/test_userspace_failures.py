@@ -298,13 +298,67 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
             self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
 
-            for command in (["set-state", "1"], ["automatic"]):
-                code, stdout, stderr = run_cli([*argv, *command])
-                self.assertEqual(code, 1)
-                combined = stdout + stderr
-                self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
-                self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
-                self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
+            code, stdout, stderr = run_cli([*argv, "set-state", "1"])
+            self.assertEqual(code, 1)
+            combined = stdout + stderr
+            self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
+
+    def test_automatic_on_unsupported_firmware_is_noop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon" / "hwmon0"
+            state = root / "state"
+            etc = root / "etc"
+            thermal.mkdir()
+            hwmon.mkdir(parents=True)
+            state.mkdir()
+            (etc / "modprobe.d").mkdir(parents=True)
+            (hwmon / "name").write_text(CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii")
+            acpi = thermal / "cooling_device0"
+            acpi.mkdir()
+            (acpi / "type").write_text("Fan\n", encoding="ascii")
+            cur_state = acpi / "cur_state"
+            cur_state.write_text("40\n", encoding="ascii")
+            CONTROL.write_last_manual_state(state, 6, floor=2700, profile="EC 3.5.8")
+            (etc / "modprobe.d" / CONTROL.OWNED_MODPROBE_NAME).write_text(
+                "options dgx_ec_fan_control owned_state=6 owned_floor=2700\n",
+                encoding="ascii",
+            )
+            argv = [
+                "--thermal-root", str(thermal),
+                "--hwmon-root", str(root / "hwmon"),
+            ]
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL, "clear_owned_module_option") as clear_owned, \
+                 patch.object(CONTROL, "disable_manual_oneshot") as disable_oneshot, \
+                 patch.object(
+                     CONTROL, "read_kernel_log",
+                     return_value=(
+                         "dgx_ec_fan_control: EC 3.13.7 floor writes disabled; "
+                         "registering hwmon telemetry only\n"
+                     ),
+                 ), \
+                 patch.object(CONTROL, "write_state") as write_state, \
+                 patch.object(CONTROL, "write_acpi_fan_level") as write_acpi:
+                code, stdout, stderr = run_cli([*argv, "automatic"])
+            self.assertEqual(code, 0)
+            combined = stdout + stderr
+            self.assertIn(
+                "automatic: nothing to do (EC 3.13.7, telemetry only; "
+                "EC runs its own curve)",
+                combined,
+            )
+            self.assertNotIn("ERROR", combined)
+            self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, combined)
+            self.assertFalse((state / CONTROL.MANUAL_STATE_NAME).exists())
+            clear_owned.assert_called_once()
+            disable_oneshot.assert_called_once()
+            write_state.assert_not_called()
+            write_acpi.assert_not_called()
+            self.assertEqual(cur_state.read_text(encoding="ascii"), "40\n")
 
     def test_quiet_curve_never_selects_zero_and_is_monotonic(self):
         thresholds = [temperature for temperature, _state in CONTROL.QUIET_CURVE]
