@@ -29,6 +29,24 @@ WATCHDOG_SOC_CELSIUS = 70.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 DAEMON_UNIT = "dgx-fan-control.service"
 DAEMON_ALERT_INTERVAL_SECONDS = 60.0
+MODULE_NAME = "dgx_ec_fan_control"
+MANAGED_BLACKLIST_NAME = "dgx-spark-fan-control-disable.conf"
+MODULES_LOAD_NAME = "dgx_ec_fan_control.conf"
+MANAGED_BLACKLIST_TEXT = (
+    "# Managed by dgx-fan-control module disable. Do not edit.\n"
+    "# Remove with: dgx-fan-control module enable\n"
+    "blacklist dgx_ec_fan_control\n"
+    "install dgx_ec_fan_control /bin/false\n"
+)
+MODULES_LOAD_TEXT = (
+    "# Load the exact-kernel, locally signed additive fan-floor driver at boot.\n"
+    "dgx_ec_fan_control\n"
+)
+MODULES_LOAD_DISABLED_TEXT = (
+    "# Disabled by dgx-fan-control module disable.\n"
+    "# Restore with: dgx-fan-control module enable\n"
+    "# dgx_ec_fan_control\n"
+)
 MAX_STATE = 12
 MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
@@ -163,10 +181,10 @@ def fans_stalled(fan_rpms: list[int], soc_c: float, held_seconds: float, *,
     return held_seconds > zero_seconds
 
 
-def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
+def systemctl_query(verb: str, unit: str = DAEMON_UNIT) -> str:
     try:
         completed = subprocess.run(
-            ["systemctl", "is-active", unit],
+            ["systemctl", verb, unit],
             check=False, capture_output=True, text=True,
         )
     except OSError:
@@ -175,8 +193,38 @@ def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
     return lines[0] if lines else "unknown"
 
 
+def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
+    return systemctl_query("is-active", unit)
+
+
+def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str]:
+    return (systemctl_query("is-active", unit), systemctl_query("is-enabled", unit))
+
+
 def daemon_is_down(state: str) -> bool:
     return state != "active"
+
+
+def daemon_needs_alarm(active: str, enabled: str = "enabled") -> bool:
+    """Alarm unless the unit is running, or disabled and merely inactive.
+
+    A failed unit always alarms, including when it is also disabled.
+    Enabled but inactive alarms. Disabled and inactive is ACPI-only mode.
+    """
+    if active == "active":
+        return False
+    if active == "failed":
+        return True
+    if enabled == "disabled" and active == "inactive":
+        return False
+    return True
+
+
+def split_unit_state(reported: str | tuple[str, str]) -> tuple[str, str]:
+    if isinstance(reported, tuple):
+        active, enabled = reported
+        return active, enabled
+    return reported, "enabled"
 
 
 def broadcast_alert(message: str) -> None:
@@ -209,7 +257,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     if runner is None:
         runner = run_watchdog_action
     if unit_state is None:
-        unit_state = systemctl_is_active
+        unit_state = read_daemon_unit
     if notifier is None:
         notifier = broadcast_alert
     stop_requested = Event()
@@ -230,13 +278,14 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     while not stop_requested.is_set():
         # A dead daemon can leave a low floor while temperatures stay under
         # every stall threshold. Check it before those thresholds.
-        service_state = unit_state()
-        if daemon_is_down(service_state):
+        active_state, enabled_state = split_unit_state(unit_state())
+        if daemon_needs_alarm(active_state, enabled_state):
             now = monotonic()
             if (last_daemon_alert is None or
                     now - last_daemon_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
                 message = (
-                    f"dgx-fan-control: {DAEMON_UNIT} is not active ({service_state})"
+                    f"dgx-fan-control: {DAEMON_UNIT} is not active "
+                    f"({active_state}, {enabled_state})"
                 )
                 LOG.critical(message)
                 try:
@@ -492,7 +541,246 @@ def write_acpi_fan_level(device: Path, level: int) -> None:
         )
 
 
-def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL) -> None:
+def module_is_loaded(module: str = MODULE_NAME, module_root: Path | None = None) -> bool:
+    root = module_root if module_root is not None else Path("/sys/module")
+    return (root / module).is_dir()
+
+
+def warn_if_module_competes(module_loaded: bool | None = None) -> None:
+    loaded = module_is_loaded() if module_loaded is None else module_loaded
+    if not loaded:
+        return
+    LOG.warning(
+        "kernel module %s is loaded; it or its daemon may compete with ACPI "
+        "fan control. Run: dgx-fan-control module disable",
+        MODULE_NAME,
+    )
+
+
+def uncommented_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.split("#", 1)[0].strip()
+        if stripped:
+            lines.append(stripped)
+    return lines
+
+
+def conf_blocks_module(text: str, module: str = MODULE_NAME) -> bool:
+    """True for a blacklist line or an install override of this module."""
+    for line in uncommented_lines(text):
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] == "blacklist" and module in parts[1:]:
+            return True
+        if parts[0] == "install" and parts[1] == module:
+            return True
+    return False
+
+
+def text_selects_module(text: str, module: str = MODULE_NAME) -> bool:
+    for line in uncommented_lines(text):
+        if module in line.split():
+            return True
+    return False
+
+
+def modules_load_is_project_file(text: str, module: str = MODULE_NAME) -> bool:
+    """True when the file only loads this module, or only comments that name."""
+    active = uncommented_lines(text)
+    if active:
+        return active == [module]
+    return module in text
+
+
+def foreign_blacklist_files(modprobe_dir: Path, module: str = MODULE_NAME) -> list[Path]:
+    if not modprobe_dir.is_dir():
+        return []
+    found = []
+    for path in sorted(modprobe_dir.glob("*.conf")):
+        if path.name == MANAGED_BLACKLIST_NAME:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if conf_blocks_module(text, module):
+            found.append(path)
+    return found
+
+
+def initramfs_module_files(etc: Path, module: str = MODULE_NAME) -> list[Path]:
+    """Files under etc that would put this module in an early boot image."""
+    found = []
+    singles = (
+        etc / "initramfs-tools" / "modules",
+        etc / "dracut.conf",
+    )
+    directories = (
+        etc / "initramfs-tools" / "modules.d",
+        etc / "dracut.conf.d",
+    )
+    for path in singles:
+        if path.is_file() and text_selects_module(_read_text(path), module):
+            found.append(path)
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and text_selects_module(_read_text(path), module):
+                found.append(path)
+    return found
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def write_text_if_changed(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        try:
+            if path.read_text(encoding="utf-8") == text:
+                return
+        except (OSError, UnicodeError):
+            pass
+    path.write_text(text, encoding="utf-8")
+
+
+def warn_about_foreign_blacklists(modprobe_dir: Path, *, on_enable: bool = False) -> list[Path]:
+    foreign = foreign_blacklist_files(modprobe_dir)
+    for path in foreign:
+        if on_enable:
+            LOG.warning(
+                "%s blacklists or install-overrides %s. module enable will not "
+                "edit or delete it, so it can still block loading",
+                path, MODULE_NAME,
+            )
+        else:
+            LOG.warning(
+                "leaving %s in place; it blacklists or install-overrides %s "
+                "and was not created by this command",
+                path, MODULE_NAME,
+            )
+    return foreign
+
+
+def note_initramfs(etc: Path) -> list[Path]:
+    listed = initramfs_module_files(etc)
+    if not listed:
+        return []
+    names = ", ".join(str(path) for path in listed)
+    LOG.warning(
+        "%s is listed for the initramfs in %s. This project does not install "
+        "it there and does not run update-initramfs or dracut. After changing "
+        "mode, rebuild that image (sudo update-initramfs -u, or sudo dracut -f) "
+        "or early boot can still load the module.",
+        MODULE_NAME, names,
+    )
+    return listed
+
+
+def module_paths(etc: Path) -> tuple[Path, Path, Path]:
+    modprobe_dir = etc / "modprobe.d"
+    modules_load = etc / "modules-load.d" / MODULES_LOAD_NAME
+    managed = modprobe_dir / MANAGED_BLACKLIST_NAME
+    return modprobe_dir, modules_load, managed
+
+
+def neutralize_modules_load(modules_load: Path) -> None:
+    if not modules_load.exists():
+        return
+    text = _read_text(modules_load)
+    if not modules_load_is_project_file(text):
+        LOG.warning(
+            "not editing %s; it is not the modules-load.d file this project installs",
+            modules_load,
+        )
+        return
+    write_text_if_changed(modules_load, MODULES_LOAD_DISABLED_TEXT)
+
+
+def restore_modules_load(modules_load: Path) -> None:
+    if modules_load.exists():
+        text = _read_text(modules_load)
+        if not modules_load_is_project_file(text):
+            LOG.warning(
+                "not editing %s; it is not the modules-load.d file this project installs",
+                modules_load,
+            )
+            return
+    write_text_if_changed(modules_load, MODULES_LOAD_TEXT)
+
+
+def run_module_command(argv: list[str], runner) -> None:
+    if runner is None:
+        completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+        if completed.returncode == 0:
+            return
+        detail = (completed.stderr or completed.stdout or "").strip()
+        lowered = detail.lower()
+        if any(token in lowered for token in ("not currently loaded", "does not exist", "not found", "not loaded")):
+            return
+        raise RuntimeError(f"{' '.join(argv)} failed: {detail or completed.returncode}")
+    runner(argv)
+
+
+def disable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
+    """Stop autoload and the service. Idempotent. Does not delete foreign files."""
+    run_module_command(["systemctl", "disable", "--now", DAEMON_UNIT], runner)
+    if loaded:
+        run_module_command(["modprobe", "-r", MODULE_NAME], runner)
+    _modprobe_dir, modules_load, managed = module_paths(etc)
+    write_text_if_changed(managed, MANAGED_BLACKLIST_TEXT)
+    neutralize_modules_load(modules_load)
+    warn_about_foreign_blacklists(_modprobe_dir)
+    note_initramfs(etc)
+
+
+def enable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
+    """Undo a managed disable, load the module, and start the service."""
+    modprobe_dir, modules_load, managed = module_paths(etc)
+    if managed.is_file():
+        managed.unlink()
+    warn_about_foreign_blacklists(modprobe_dir, on_enable=True)
+    restore_modules_load(modules_load)
+    if not loaded:
+        run_module_command(["modprobe", MODULE_NAME], runner)
+    run_module_command(["systemctl", "enable", "--now", DAEMON_UNIT], runner)
+    note_initramfs(etc)
+
+
+def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabled: str) -> str:
+    modprobe_dir, _modules_load, managed = module_paths(etc)
+    foreign = foreign_blacklist_files(modprobe_dir)
+    initramfs = initramfs_module_files(etc)
+    managed_on = managed.is_file()
+    if managed_on and not loaded and service_enabled == "disabled":
+        mode = "ACPI-only"
+    elif loaded or service_enabled == "enabled":
+        mode = "module"
+    else:
+        mode = "ACPI-only"
+    if managed_on and loaded:
+        mode = "inconsistent"
+    lines = [
+        f"loaded: {'yes' if loaded else 'no'}",
+        f"managed-blacklist: {'yes' if managed_on else 'no'}",
+        "other-blacklists: " + (", ".join(str(path) for path in foreign) if foreign else "none"),
+        f"service-enabled: {service_enabled}",
+        f"service-active: {service_active}",
+        f"mode: {mode}",
+        "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
+                  module_loaded: bool | None = None) -> None:
     """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
 
     Does not use this project's kernel module. A level below 40 is refused
@@ -502,6 +790,7 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL) -> None:
         raise ValueError(
             f"ACPI fan level must be between {ACPI_MIN_LEVEL} and {ACPI_MAX_LEVEL}"
         )
+    warn_if_module_competes(module_loaded)
     devices = acpi_fan_devices(thermal_root)
     if not devices:
         raise RuntimeError("no ACPI Fan cooling device found")
@@ -567,6 +856,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="set ACPI Fan cooling devices without this kernel module",
     )
     acpi_max.add_argument("--level", type=int, default=ACPI_MAX_LEVEL)
+    module = subparsers.add_parser(
+        "module",
+        help="enable or disable the kernel module for ACPI-only fan control",
+    )
+    module.add_argument("action", choices=("disable", "enable", "status"))
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
     subparsers.add_parser("automatic", help="restore firmware-automatic policy")
@@ -593,6 +887,24 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.command == "acpi-max":
             set_acpi_fans(args.thermal_root, args.level)
+            return 0
+        if args.command == "module":
+            if os.geteuid() != 0:
+                raise PermissionError("dgx-fan-control module requires root")
+            etc = Path("/etc")
+            loaded = module_is_loaded()
+            if args.action == "disable":
+                disable_kernel_module(etc, runner=None, loaded=loaded)
+                return 0
+            if args.action == "enable":
+                enable_kernel_module(etc, runner=None, loaded=loaded)
+                return 0
+            print(module_status(
+                etc,
+                loaded=loaded,
+                service_active=systemctl_query("is-active"),
+                service_enabled=systemctl_query("is-enabled"),
+            ), end="")
             return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":

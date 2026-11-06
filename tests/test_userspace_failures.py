@@ -317,6 +317,8 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertTrue(any("not active" in line for line in logs.output))
         self.assertFalse(CONTROL.daemon_is_down("active"))
         self.assertTrue(CONTROL.daemon_is_down("failed"))
+        self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled"))
+        self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled"))
 
     def test_stall_requires_both_fans_hot_for_more_than_ten_seconds(self):
         self.assertFalse(CONTROL.fans_stalled([0, 0], 70.0, 10.0))

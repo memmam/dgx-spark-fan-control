@@ -191,6 +191,50 @@ forum topic 386805 post 21 reports that ACPI `cur_state` does work on EC 3.5.8
 after an EC-only downgrade onto that October SoC. `dgx-fan-control acpi-max`
 is the documented route for that pairing. It is not a kernel-module path.
 
+## ACPI-only mode
+
+Use this when fans should be driven with `acpi-max` and the kernel module
+should stay unloaded. `disable` does not uninstall the driver. Full removal
+is `sudo dkms remove dgx-spark-fan-control/0.1.5 --all` (the version in
+`dkms.conf`).
+
+```sh
+sudo dgx-fan-control module disable
+sudo dgx-fan-control module status
+sudo dgx-fan-control acpi-max
+sudo dgx-fan-control module enable
+```
+
+`module disable` stops and disables `dgx-fan-control.service`, unloads
+`dgx_ec_fan_control` when it is loaded, writes
+`/etc/modprobe.d/dgx-spark-fan-control-disable.conf` (`blacklist` and
+`install ... /bin/false`), and comments out
+`/etc/modules-load.d/dgx_ec_fan_control.conf` when that file is the one this
+project installs. Running it again changes nothing else. Any other file in
+`/etc/modprobe.d` that blacklists the module or install-overrides it is
+reported and left untouched. `module enable` removes only the managed
+blacklist, restores the modules-load.d entry, loads the module, and enables
+and starts the service. If one of those other files is still present, enable
+warns that it can still block loading.
+
+`module status` prints whether the module is loaded, whether the managed
+blacklist or another blacklist is present, whether the service is enabled and
+active, and the mode (`module` or `ACPI-only`).
+
+The watchdog does not treat a disabled, inactive service as a fault. It still
+alerts when the unit is `failed`, or enabled but inactive.
+
+`acpi-max` warns if `dgx_ec_fan_control` is loaded, because the module and the
+ACPI write can compete, and suggests `module disable`. It still writes.
+
+This project does not put the module in the initramfs. `modules-load.d` loads
+it after the root filesystem is mounted, so `module disable` does not run
+`update-initramfs` or `dracut`. If you have separately listed
+`dgx_ec_fan_control` in `/etc/initramfs-tools/modules` or a dracut
+configuration, `module status` names that file. Rebuild the image yourself
+(`sudo update-initramfs -u` or `sudo dracut -f`) or early boot can still load
+the module.
+
 ## Development
 
 Run `./scripts/check` (Python 3.10+ and a C compiler) for hardware-free policy,
