@@ -109,8 +109,8 @@ different install)`; that is expected, and the `--record` run replaces it.
 Why that refresh is required, and what `--record` clears, is in
 [Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+result. The exception after an EC downgrade is in
+[EC firmware pairing and downgrade](installation.md#ec-firmware-pairing-and-downgrade).
 
 ### Decide whether the kernel module changed
 
@@ -232,8 +232,8 @@ modinfo dgx_ec_fan_control | grep ^version:
 Why that refresh is required, and what `--record` clears, is in
 [Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+result. The exception after an EC downgrade is in
+[EC firmware pairing and downgrade](installation.md#ec-firmware-pairing-and-downgrade).
 
 ## Switch from manual installation to DKMS
 
