@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import math
+import os
 import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
@@ -3048,8 +3049,10 @@ class UserlandFailureTests(unittest.TestCase):
             root_code, root_out, root_err = run(0)
             self.assertEqual(user_code, 0, user_out + user_err)
             self.assertEqual(root_code, 0, root_out + root_err)
-            self.assertIn("progress: built-in (GPU utilization)", user_out)
-            self.assertIn("progress: built-in (GPU utilization)", root_out)
+            self.assertIn("progress: built-in (GPU utilization; recorded ", user_out)
+            self.assertIn("progress: built-in (GPU utilization; recorded ", root_out)
+            self.assertIn(" UTC)", user_out)
+            self.assertIn(" UTC)", root_out)
             self.assertNotIn("job: warn", user_out)
             self.assertNotIn("job: warn", root_out)
             self.assertEqual(
@@ -3067,8 +3070,10 @@ class UserlandFailureTests(unittest.TestCase):
             root_code, root_out, root_err = run(0)
             self.assertEqual(user_code, 0, user_out + user_err)
             self.assertEqual(root_code, 0, root_out + root_err)
-            self.assertIn("progress: off (no job running)", user_out)
-            self.assertIn("progress: off (no job running)", root_out)
+            self.assertIn("progress: off (no job running; recorded ", user_out)
+            self.assertIn("progress: off (no job running; recorded ", root_out)
+            self.assertIn(" UTC)", user_out)
+            self.assertIn(" UTC)", root_out)
 
             real_read = Path.read_text
 
@@ -3084,6 +3089,114 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn("progress: off", stdout)
             self.assertNotIn("progress: built-in", stdout)
             self.assertIn("health: healthy", stdout)
+
+    def test_legacy_nvidia_smi_failed_after_restart_uses_the_gap_wording(self):
+        stamp = 1793949945.0
+        shown = CONTROL.format_utc_stamp(stamp)
+        gap = CONTROL.gpu_gap_sentence()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            watch = state / CONTROL.JOB_WATCH_NAME
+            CONTROL.write_state_text(
+                watch,
+                "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+            os.utime(watch, (stamp, stamp))
+            CONTROL.write_state_text(
+                state / CONTROL.WATCHDOG_STARTED_NAME,
+                f"time={stamp + 30:.3f}\n",
+            )
+
+            def run():
+                with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                     patch.object(CONTROL.os, "geteuid", return_value=1000), \
+                     patch.object(CONTROL, "read_boot_id", return_value="boot-now"), \
+                     patch.object(CONTROL, "read_kernel_log", return_value=""), \
+                     patch.object(
+                         CONTROL, "read_daemon_facts",
+                         return_value=("inactive", "disabled", None, None, None),
+                     ), \
+                     patch.object(
+                         CONTROL, "watchdog_unit_state",
+                         return_value=("active", "enabled"),
+                     ), \
+                     patch.object(CONTROL, "_module_loaded_now", return_value=True):
+                    return run_cli([
+                        "--thermal-root", str(root / "thermal"),
+                        "--hwmon-root", str(root / "hwmon"),
+                        "health",
+                    ])
+
+            code, stdout, stderr = run()
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertNotIn("nvidia-smi failed", stdout)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn("progress: waiting for first watchdog sample ", stdout)
+            self.assertIn(f"previous sample at {shown}: {gap}", stdout)
+            self.assertEqual(
+                watch.read_text(encoding="ascii"),
+                "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+
+            (state / CONTROL.WATCHDOG_STARTED_NAME).unlink()
+            with patch.object(CONTROL, "watchdog_active_since", return_value=None):
+                code, stdout, stderr = run()
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertNotIn("nvidia-smi failed", stdout)
+            self.assertNotIn("waiting for first watchdog sample", stdout)
+            self.assertIn(f"progress: unknown ({gap}; recorded {shown})", stdout)
+
+    def test_first_gpu_sample_waits_until_the_startup_grace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (2700, 4050), 40.0)
+            state = root / "state"
+            watch = state / CONTROL.JOB_WATCH_NAME
+            CONTROL.write_state_text(
+                watch,
+                "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+            clock = [0.0]
+            stop = Event()
+            calls = []
+
+            def gpu():
+                calls.append(clock[0])
+                if len(calls) == 1:
+                    self.assertIn(
+                        "detail=nvidia-smi failed\n",
+                        watch.read_text(encoding="ascii"),
+                    )
+                return False
+
+            def wait(_delay):
+                clock[0] += 2
+                if clock[0] > 6:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="INFO"):
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, monotonic=lambda: clock[0],
+                    wall_time=lambda: 1000.0,
+                    runner=lambda action: 0,
+                    unit_state=lambda: "active",
+                    notifier=lambda _message: None,
+                    gpu_jobs=gpu,
+                    marker_path=state / "true-zero-reboot",
+                    defaults={},
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(calls, [6.0])
+            self.assertNotIn("nvidia-smi failed", watch.read_text(encoding="ascii"))
 
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"

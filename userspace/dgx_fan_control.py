@@ -64,6 +64,14 @@ NVIDIA_SMI_ATTEMPTS = 3
 NVIDIA_SMI_BACKOFF_SECONDS = (0.5, 1.0)
 NVIDIA_SMI_TIMEOUT_SECONDS = 2.0
 PROBE_BUDGET_SECONDS = 3.0
+# The first poll after a restart can overlap NVML still coming back, and the
+# 3s probe budget can turn that into a false miss. Fans and the true-zero
+# poweroff do not wait. Only the GPU sample does.
+GPU_SAMPLE_GRACE_SECONDS = 5.0
+# Written by progress_source before the sampling-gap wording. Health still
+# has to display files left by that code.
+LEGACY_GPU_FAILURE = "nvidia-smi failed"
+WATCHDOG_STARTED_NAME = "watchdog-started"
 _probe_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
     "dgx_probe_deadline", default=None,
 )
@@ -303,8 +311,11 @@ def read_daemon_facts(unit: str = DAEMON_UNIT) -> tuple:
     )
 
 
-def systemctl_show_properties(unit: str, names: tuple[str, ...]) -> dict[str, str]:
+def systemctl_show_properties(unit: str, names: tuple[str, ...],
+                              timestamp: str | None = None) -> dict[str, str]:
     command = ["systemctl", "show"]
+    if timestamp:
+        command.append(f"--timestamp={timestamp}")
     for name in names:
         command.extend(["-p", name])
     command.append(unit)
@@ -923,10 +934,8 @@ def clear_nvidia_smi_failure() -> None:
     run_nvidia_smi.last_failure = None
 
 
-def gpu_sample_gap_detail() -> str:
-    """Parenthetical for a GPU sample that failed after the short retry."""
-    failure = getattr(run_nvidia_smi, "last_failure", None)
-    code, extra = failure if failure else ("unknown", "")
+def gpu_gap_sentence(code: str = "unknown", extra: str = "") -> str:
+    """Sampling-gap sentence. This does not run nvidia-smi."""
     text = (
         f"could not sample GPU: nvidia-smi exited {code}; "
         "transient after a restart is normal"
@@ -934,6 +943,13 @@ def gpu_sample_gap_detail() -> str:
     if extra:
         text += f"; {extra}"
     return text
+
+
+def gpu_sample_gap_detail() -> str:
+    """Parenthetical for a GPU sample that failed after the short retry."""
+    failure = getattr(run_nvidia_smi, "last_failure", None)
+    code, extra = failure if failure else ("unknown", "")
+    return gpu_gap_sentence(code, extra)
 
 
 def read_builtin_progress() -> tuple[float | None, dict[int, int] | None]:
@@ -1056,8 +1072,22 @@ def _with_recorded_time(text: str, job_watch: dict[str, str]) -> str:
     return text[:-1] + f"; recorded {shown})"
 
 
+def translate_legacy_job_watch(fields: dict[str, str]) -> dict[str, str]:
+    """Map a pre-gap ``nvidia-smi failed`` sample onto the sampling-gap sentence.
+
+    The exit code was not stored, so it is ``unknown``. This does not probe.
+    """
+    if fields.get("detail", "").strip() != LEGACY_GPU_FAILURE:
+        return fields
+    updated = dict(fields)
+    updated["source"] = "unknown"
+    updated["detail"] = gpu_gap_sentence()
+    return updated
+
+
 def recorded_work_text(fields: dict[str, str]) -> str | None:
     """What the last job-watch sample said, without taking a new sample."""
+    fields = translate_legacy_job_watch(fields)
     if not fields or fields.get("unreadable") == "yes":
         return None
     source = fields.get("source", "").strip()
@@ -1102,33 +1132,155 @@ def _recorded_work_fields(state: dict, state_dir: Path) -> dict[str, str] | None
     return found
 
 
-def format_progress(job_watch: dict[str, str]) -> str:
+def job_watch_sample_time(state_dir: Path | None,
+                          fields: dict[str, str]) -> float | None:
+    """Unix time of the stored sample. ``recorded=`` wins; otherwise the mtime."""
+    raw = fields.get("recorded", "").strip()
+    if raw:
+        try:
+            stamp = float(raw)
+        except ValueError:
+            stamp = None
+        else:
+            if math.isfinite(stamp):
+                return stamp
+    if state_dir is None:
+        return None
+    try:
+        return (state_dir / JOB_WATCH_NAME).stat().st_mtime
+    except OSError:
+        return None
+
+
+def parse_systemctl_timestamp(raw: str) -> float | None:
+    """Seconds from ``systemctl show --timestamp=us`` or ``unix``."""
+    text = raw.strip()
+    if text.startswith("@"):
+        text = text[1:]
+    if text in {"", "n/a", "0"}:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if value > 10**14:
+        value /= 1_000_000
+    return value
+
+
+_systemd_timestamp_unavailable = False
+
+
+def watchdog_active_since(state_dir: Path | None) -> float | None:
+    """Unix time the current watchdog process started.
+
+    The watchdog writes ``watchdog-started`` before its first poll. If that
+    file is not there yet, ask systemd. A bus failure is remembered so a
+    health pass does not pay for it again.
+    """
+    global _systemd_timestamp_unavailable
+    if state_dir is not None:
+        try:
+            text = (state_dir / WATCHDOG_STARTED_NAME).read_text(encoding="ascii")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "time":
+                try:
+                    stamp = float(value.strip())
+                except ValueError:
+                    break
+                if math.isfinite(stamp) and stamp > 0:
+                    return stamp
+                break
+    if _systemd_timestamp_unavailable:
+        return None
+    try:
+        properties = systemctl_show_properties(
+            WATCHDOG_UNIT, ("ActiveEnterTimestamp",), timestamp="us",
+        )
+    except Exception:
+        _systemd_timestamp_unavailable = True
+        return None
+    if not properties:
+        _systemd_timestamp_unavailable = True
+        return None
+    return parse_systemctl_timestamp(properties.get("ActiveEnterTimestamp", ""))
+
+
+def job_watch_predates(sample_time: float | None, started: float | None) -> bool:
+    """True when the file was written before this watchdog process started."""
+    if sample_time is None or started is None:
+        return False
+    return sample_time < started
+
+
+def _waiting_for_sample(fields: dict[str, str], sample_time: float | None) -> str:
+    shown = format_utc_stamp(sample_time)
+    detail = fields.get("detail", "").strip()
+    gap = (
+        fields.get("source") == "unknown"
+        or detail.startswith("could not sample GPU")
+    )
+    if gap and detail and shown:
+        return (
+            "waiting for first watchdog sample "
+            f"(previous sample at {shown}: {detail})"
+        )
+    if gap and detail:
+        return f"waiting for first watchdog sample (previous sample: {detail})"
+    if shown:
+        return f"waiting for first watchdog sample (previous sample at {shown})"
+    return "waiting for first watchdog sample"
+
+
+def format_progress(job_watch: dict[str, str], *,
+                    sample_time: float | None = None,
+                    watchdog_started: float | None = None) -> str:
     """Progress note, including why. Every uid prints the same stored sample.
 
     Health does not run nvidia-smi or PROGRESS_CHECK itself. Those probes
     run in the root watchdog, and a second probe can disagree by uid.
+    A file from before this watchdog start is not the current sample.
     """
     if job_watch.get("unreadable") == "yes":
         return NEEDS_ROOT
-    source = job_watch.get("source", "")
+    fields = translate_legacy_job_watch(job_watch)
+    if sample_time is None:
+        sample_time = job_watch_sample_time(None, fields)
+    elif "recorded" not in fields and sample_time is not None:
+        fields = dict(fields)
+        fields["recorded"] = f"{sample_time:.3f}"
+    if job_watch_predates(sample_time, watchdog_started):
+        return _waiting_for_sample(fields, sample_time)
+    source = fields.get("source", "")
     if source == "unknown":
         # A sampling gap is not a health failure. The next good sample
         # overwrites this file, so one transient miss does not stick.
-        gap = job_watch.get("detail", "").strip() or "could not sample GPU"
-        return _with_recorded_time(f"unknown ({gap})", job_watch)
-    if source not in {"hook", "built-in", "off"}:
+        gap = fields.get("detail", "").strip() or "could not sample GPU"
+        return _with_recorded_time(f"unknown ({gap})", fields)
+    if source not in {"hook", "built-in", "off", "waiting"}:
         source = "off"
-    detail = job_watch.get("detail", "").strip()
+    detail = fields.get("detail", "").strip()
     if not detail:
-        if not job_watch:
+        if not fields:
             detail = "no watchdog sample"
         elif source == "hook":
             detail = "PROGRESS_CHECK"
         elif source == "built-in":
             detail = "GPU utilization"
+        elif source == "waiting":
+            detail = "waiting for first watchdog sample"
         else:
             detail = "no job running"
-    return _with_recorded_time(f"{source} ({detail})", job_watch)
+    if source == "waiting":
+        return _with_recorded_time(
+            f"waiting ({detail})", fields,
+        )
+    return _with_recorded_time(f"{source} ({detail})", fields)
 
 
 def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
@@ -1884,11 +2036,24 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     )
     if job_watch is None:
         job_watch = read_job_watch(state_dir) if state_dir is not None else {}
-    keep("progress", "note", format_progress(job_watch))
+    sample_time = job_watch_sample_time(state_dir, job_watch)
+    watchdog_started = (
+        watchdog_active_since(state_dir) if watchdog_active == "active" else None
+    )
+    keep(
+        "progress", "note",
+        format_progress(
+            job_watch, sample_time=sample_time, watchdog_started=watchdog_started,
+        ),
+    )
     progress_source = job_watch.get("source", "off")
     if progress_source not in {"hook", "built-in", "off"}:
         progress_source = "off"
-    if job_watch.get("stuck") == "yes" and job_watch.get("unreadable") != "yes":
+    if (
+        job_watch.get("stuck") == "yes"
+        and job_watch.get("unreadable") != "yes"
+        and not job_watch_predates(sample_time, watchdog_started)
+    ):
         seconds = job_watch.get("no_progress_seconds", "0")
         keep(
             "job", "warn",
@@ -2649,6 +2814,13 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         raise ValueError("stuck interval must be finite and non-negative")
     if marker_path is None:
         marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
+    try:
+        write_state_text(
+            marker_path.parent / WATCHDOG_STARTED_NAME,
+            f"time={wall_time():.3f}\n",
+        )
+    except OSError:
+        pass
     dismiss_unsupported_firmware_flag(marker_path.parent / INTERVENTION_NAME)
     if boot_id is None:
         boot_id = read_boot_id()
@@ -2677,7 +2849,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     reboot_requested = False
     deferred_logged = False
     smi_warned = False
+    gpu_grace_noted = False
     job_state: dict = {}
+    started_mono = monotonic()
     LOG.info(
         "hot-under-load tracking warns after %.0fs without progress; "
         "it does not stop a job, reboot, or power off",
@@ -2717,6 +2891,45 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 )
         last_observed_c = hottest
         last_observed_at = when
+
+    def sample_work(now: float, fan_rpms: list[int] | None,
+                    hottest: float | None) -> tuple[bool, str]:
+        """GPU sample for this poll, after the startup grace.
+
+        During the grace this does not call nvidia-smi, BUSY_CHECK, or
+        PROGRESS_CHECK, and it does not replace the previous job-watch file.
+        The caller still treats work as in progress so a reboot waits.
+        """
+        nonlocal smi_warned, gpu_grace_noted
+        if now - started_mono < GPU_SAMPLE_GRACE_SECONDS:
+            if not gpu_grace_noted:
+                LOG.info(
+                    "delaying the first GPU sample until %.0fs after start "
+                    "so a restart does not record a miss",
+                    GPU_SAMPLE_GRACE_SECONDS,
+                )
+                gpu_grace_noted = True
+            return True, "startup-grace"
+        with probe_budget():
+            busy, how = work_is_in_progress(defaults, gpu_jobs)
+            if how == "nvidia-smi-failed" and not smi_warned:
+                LOG.warning(
+                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                )
+                smi_warned = True
+            if how == "busy-check-failed" and not smi_warned:
+                LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                smi_warned = True
+            observe_hot_job(
+                now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
+                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                stuck_seconds=stuck_seconds, state=job_state,
+                progress_reader=progress_reader, builtin_reader=builtin_reader,
+                busy_how=how,
+            )
+            return busy, how
+
     while not stop_requested.is_set():
         active_state, enabled_state, exec_status, unit_result, n_restarts = (
             split_unit_state(unit_state())
@@ -2742,30 +2955,13 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 hottest = None
             note_observed_rise(hottest, now)
             # Reboot can wait on this sample. The budget keeps it from
-            # stretching the next iteration.
-            with probe_budget():
-                busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
-                if busy_how == "nvidia-smi-failed" and not smi_warned:
-                    LOG.warning(
-                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
-                    )
-                    smi_warned = True
-                if busy_how == "busy-check-failed" and not smi_warned:
-                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                    smi_warned = True
-                try:
-                    foreign_rpms = read_named_fan_rpms(hwmon_root)
-                except (OSError, UnicodeError, ValueError, RuntimeError):
-                    foreign_rpms = None
-                observe_hot_job(
-                    now=now, fan_rpms=foreign_rpms, hottest=hottest, busy=busy,
-                    defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
-                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                    stuck_seconds=stuck_seconds, state=job_state,
-                    progress_reader=progress_reader, builtin_reader=builtin_reader,
-                    busy_how=busy_how,
-                )
-            if held >= reboot_seconds:
+            # stretching the next iteration. The startup grace skips it.
+            try:
+                foreign_rpms = read_named_fan_rpms(hwmon_root)
+            except (OSError, UnicodeError, ValueError, RuntimeError):
+                foreign_rpms = None
+            busy, busy_how = sample_work(now, foreign_rpms, hottest)
+            if busy_how != "startup-grace" and held >= reboot_seconds:
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
                     marker is not None and boot_id is not None and marker[0] != boot_id
@@ -2939,25 +3135,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             note_observed_rise(spinning_hottest, now)
             # Fans are spinning, so this sample is not on the poweroff path.
             # The budget is what keeps it from delaying the next fan read.
-            with probe_budget():
-                spinning_busy, spinning_how = work_is_in_progress(defaults, gpu_jobs)
-                if spinning_how == "nvidia-smi-failed" and not smi_warned:
-                    LOG.warning(
-                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
-                    )
-                    smi_warned = True
-                if spinning_how == "busy-check-failed" and not smi_warned:
-                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                    smi_warned = True
-                observe_hot_job(
-                    now=now, fan_rpms=fan_rpms, hottest=spinning_hottest,
-                    busy=spinning_busy, defaults=defaults,
-                    state_dir=marker_path.parent, notifier=notifier,
-                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                    stuck_seconds=stuck_seconds, state=job_state,
-                    progress_reader=progress_reader, builtin_reader=builtin_reader,
-                    busy_how=spinning_how,
-                )
+            # The startup grace skips it entirely.
+            sample_work(now, fan_rpms, spinning_hottest)
         else:
             announced_shortage = False
             nonzero_since = None
@@ -3019,25 +3198,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                         loaded,
                     )
                     recover_fan_stall(thermal_root, module_loaded=loaded)
-            with probe_budget():
-                busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
-                if busy_how == "nvidia-smi-failed" and not smi_warned:
-                    LOG.warning(
-                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
-                    )
-                    smi_warned = True
-                if busy_how == "busy-check-failed" and not smi_warned:
-                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                    smi_warned = True
-                observe_hot_job(
-                    now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
-                    defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
-                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                    stuck_seconds=stuck_seconds, state=job_state,
-                    progress_reader=progress_reader, builtin_reader=builtin_reader,
-                    busy_how=busy_how,
-                )
-            if held >= reboot_seconds:
+            busy, busy_how = sample_work(now, fan_rpms, hottest)
+            if busy_how != "startup-grace" and held >= reboot_seconds:
                 if busy:
                     detail = (
                         "a GPU job is running and the fans are still at 0 RPM"

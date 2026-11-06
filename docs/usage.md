@@ -514,9 +514,14 @@ The core checks are fan and thermal only:
   `off (no watchdog sample)`.
   `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
   means nvidia-smi still failed after a short retry. It does not fail health
-  and does not set needs-intervention. The watchdog still treats that sample
-  as a running job and defers a reboot. The next successful sample replaces
-  the line. Health does not
+  and does not set needs-intervention. An older file that still says
+  `nvidia-smi failed` is shown with that same sentence, not the old words.
+  The watchdog still treats that sample as a running job and defers a reboot.
+  The next successful sample replaces the line. A file written before the
+  current watchdog start is
+  `waiting for first watchdog sample (previous sample at YYYY-MM-DD HH:MM:SS UTC: ...)`.
+  The first GPU sample waits 5 seconds after the watchdog starts, so a
+  restart does not record a miss while NVML is still settling. Health does not
   run `nvidia-smi` or `PROGRESS_CHECK` itself, so a normal user and root
   print the same line from that file. A failed probe is not called GPU
   utilization. No sample yet is `off (no watchdog sample)`.

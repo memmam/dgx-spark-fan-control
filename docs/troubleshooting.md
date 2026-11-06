@@ -87,8 +87,13 @@ records `ready=n/a`.
 `built-in (GPU utilization; recorded 2026-11-06 09:41:12 UTC)`. The clock
 is absolute UTC. Root and a normal user read that same file. `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
 means a short retry still could not run nvidia-smi. It is not a fault:
-health stays healthy, and the next good sample replaces it. The watchdog
-still defers a reboot on that sample. A true-zero poweroff at 85°C logs
+health stays healthy, and the next good sample replaces it. A file left by
+an older watchdog that says `nvidia-smi failed` is printed with that same
+sentence. If the file is older than the current watchdog start, the line is
+`waiting for first watchdog sample` and names that previous sample with its
+UTC time. The watchdog waits 5 seconds before the first GPU sample so the
+restart itself is not recorded as a miss. The watchdog
+still defers a reboot on a real sampling gap. A true-zero poweroff at 85°C logs
 the hottest zone and the last job-watch sample with a UTC timestamp, or
 `(not sampled now; no earlier work-state record)` when that file cannot
 be read. It does not sample the GPU before powering off. The stuck-job
