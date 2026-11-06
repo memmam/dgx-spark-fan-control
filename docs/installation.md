@@ -583,6 +583,8 @@ The unblocked EC row looks like a generic UEFI device: summary
 `UEFI System Resource Table device (Updated via capsule-on-disk)`, current
 version `0x03000508` on 3.5.8. A blocked EC is missing from this list, from
 `fwupdmgr get-devices --show-all`, and from `fwupdmgr get-updates`.
+To read a blocked EC's version, see
+[Block or allow EC firmware updates](troubleshooting.md#block-or-allow-ec-firmware-updates).
 
 ### Upgrade to 3.13.7 or downgrade to 3.5.8
 

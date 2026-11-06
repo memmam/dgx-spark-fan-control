@@ -169,6 +169,19 @@ grep -ri DisabledDevices /etc/fwupd /var/lib/fwupd
 sudo grep -rIl 3d13c989 /etc /var/lib/fwupd /usr/share/fwupd
 ```
 
+Because the blocked EC is absent from those lists, they cannot show its
+version either. While it is blocked, read the version from the driver's
+probe line in this boot's kernel log:
+
+```sh
+sudo journalctl -k -b | grep "pinned EC"
+```
+
+`pinned EC 3.5.8 capabilities` means 3.5.8 and `pinned EC 3.13.7
+capabilities` means 3.13.7. The line is there only if `dgx_ec_fan_control`
+probed during this boot. Without it, check the block with the command
+below, unblock, then read the version from `fwupdmgr get-devices`.
+
 The line that shows the block:
 
 ```sh
