@@ -265,7 +265,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertIn(CONTROL.CONTROL_UNSUPPORTED, output.getvalue())
             self.assertTrue(any(CONTROL.CONTROL_UNSUPPORTED in line for line in logs.output))
             with self.assertLogs(CONTROL.LOG, level="ERROR"):
-                self.assertEqual(CONTROL.main([*argv, "daemon"]), 0)
+                self.assertEqual(CONTROL.main([*argv, "daemon"]), CONTROL.UNSUPPORTED_FIRMWARE_EXIT)
                 self.assertEqual(CONTROL.main([*argv, "set-state", "1"]), 1)
                 self.assertEqual(CONTROL.main([*argv, "automatic"]), 1)
 
@@ -465,10 +465,10 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual((first / "cur_state").read_text(), "100\n")
             self.assertEqual((second / "cur_state").read_text(), "100\n")
 
-    def test_expected_daemon_error_uses_nonrestart_exit_status(self):
+    def test_runtime_daemon_error_stays_restartable(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")), \
              self.assertLogs(CONTROL.LOG, level="ERROR"):
-            self.assertEqual(CONTROL.main(["daemon"]), 69)
+            self.assertEqual(CONTROL.main(["daemon"]), 1)
 
 
 if __name__ == "__main__":

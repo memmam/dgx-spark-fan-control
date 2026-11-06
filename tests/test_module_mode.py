@@ -67,9 +67,13 @@ class ModuleModeTests(unittest.TestCase):
             CONTROL.disable_kernel_module(self.etc, runner=self.runner, loaded=True)
         self.commands.clear()
         with self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
-            CONTROL.enable_kernel_module(self.etc, runner=self.runner, loaded=self.loaded)
+            CONTROL.enable_kernel_module(
+                self.etc, runner=self.runner, loaded=self.loaded, control_supported=True,
+            )
         self.assertTrue(any("still block loading" in line for line in logs.output))
-        CONTROL.enable_kernel_module(self.etc, runner=self.runner, loaded=True)
+        CONTROL.enable_kernel_module(
+            self.etc, runner=self.runner, loaded=True, control_supported=True,
+        )
         managed = self.etc / "modprobe.d" / CONTROL.MANAGED_BLACKLIST_NAME
         self.assertFalse(managed.exists())
         load = (self.etc / "modules-load.d" / CONTROL.MODULES_LOAD_NAME).read_text(
@@ -113,11 +117,85 @@ class ModuleModeTests(unittest.TestCase):
             CONTROL.disable_kernel_module(self.etc, runner=self.runner, loaded=False)
         self.assertEqual(load.read_text(encoding="utf-8"), "dgx_ec_fan_control\ncustom_module\n")
 
+    def test_enable_leaves_the_service_disabled_when_control_is_unsupported(self):
+        self.loaded = False
+        output = __import__("io").StringIO()
+        from contextlib import redirect_stdout
+        with redirect_stdout(output):
+            CONTROL.enable_kernel_module(
+                self.etc, runner=self.runner, loaded=False,
+                control_supported=False, profile="EC 3.13.7",
+            )
+        text = output.getvalue()
+        self.assertIn(
+            "fan control unsupported on EC 3.13.7; telemetry only, "
+            "service left disabled; use acpi-max on EC 3.5.8",
+            text,
+        )
+        self.assertIn(["modprobe", CONTROL.MODULE_NAME], self.commands)
+        self.assertNotIn(
+            ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
+        )
+        self.assertIn(
+            ["systemctl", "disable", "--now", CONTROL.DAEMON_UNIT], self.commands,
+        )
+        self.commands.clear()
+        CONTROL.enable_kernel_module(
+            self.etc, runner=self.runner, loaded=True,
+            control_supported=False, profile="EC 3.13.7", force_service=True,
+        )
+        self.assertIn(
+            ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
+        )
+
+    def test_status_names_unsupported_control(self):
+        report = CONTROL.module_status(
+            self.etc, loaded=True, service_active="inactive", service_enabled="disabled",
+            control=CONTROL.describe_control("unsupported", "EC 3.13.7"),
+            exec_status=69,
+        )
+        self.assertIn("control: unsupported (EC 3.13.7, telemetry only)\n", report)
+        self.assertIn("service-exit: 69\n", report)
+        self.assertEqual(CONTROL.describe_control("supported", "EC 3.5.8"), "supported")
+        self.assertEqual(
+            CONTROL.pinned_ec_name(
+                "pinned EC 3.13.7 capabilities fan0=975..4350 fan1=975..4350\n"
+            ),
+            "EC 3.13.7",
+        )
+
     def test_watchdog_ignores_disabled_inactive_and_alarms_on_failed(self):
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled"))
         self.assertTrue(CONTROL.daemon_needs_alarm("inactive", "enabled"))
         self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled"))
         self.assertFalse(CONTROL.daemon_needs_alarm("active", "enabled"))
+
+    def test_watchdog_does_not_alarm_on_unsupported_firmware_exit(self):
+        from threading import Event
+        from unittest.mock import patch
+        self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "enabled", 69))
+        self.assertTrue(CONTROL.daemon_needs_alarm("inactive", "enabled", 1))
+        self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled", 69))
+        alerts = []
+        actions = []
+        stop = Event()
+        with patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+             self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+            status = CONTROL.run_watchdog(
+                Path("/tmp/dgx-fan-missing"),
+                Path("/tmp/dgx-fan-missing"),
+                unit_state=lambda: ("inactive", "enabled", 69),
+                notifier=alerts.append,
+                runner=lambda action: actions.append(action),
+                monotonic=lambda: 0.0,
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(alerts, [])
+        self.assertEqual(actions, [])
+        self.assertTrue(any("not alerting" in line for line in logs.output))
+        self.assertFalse(any("is not active" in line for line in logs.output))
 
     def test_acpi_max_warns_when_the_module_is_loaded_but_still_writes(self):
         with TemporaryDirectory() as directory:

@@ -7,13 +7,14 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/dgx-fan-control daemon
-# Restart after every exit, including 69. Preventing that restart left a low
-# floor in place for 1 d 19 h (tenhkspark, 2026-10-31). StartLimitIntervalSec=0
-# means systemd does not give up. An immediate exit, including unsupported
-# firmware (exit 0), is retried every RestartSec. The watchdog reports a unit
-# that is not active.
+# Restart after every exit except 69. Exit 69 is only the daemon's startup
+# check that fan control is unsupported. A transport failure or crash uses
+# another status and is restarted. Preventing every 69 used to leave a live
+# daemon dead for 1 d 19 h (tenhkspark, 2026-10-31); that failure was not
+# this startup check. StartLimitIntervalSec=0 means crash retries continue.
 Restart=always
 RestartSec=30s
+RestartPreventExitStatus=69
 TimeoutStopSec=30s
 CapabilityBoundingSet=
 LockPersonality=yes

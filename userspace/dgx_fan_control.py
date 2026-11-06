@@ -8,6 +8,7 @@ import errno
 import logging
 import math
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -61,6 +62,7 @@ RETRY_INITIAL_SECONDS = 2.0
 # stays EAGAIN and keeps the 2s/4s backoff.
 RECOVERY_COOLDOWN_SECONDS = 31.0
 CONTROLLER_UNAVAILABLE_EXIT = 69
+UNSUPPORTED_FIRMWARE_EXIT = 69
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
     errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
@@ -197,34 +199,61 @@ def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
     return systemctl_query("is-active", unit)
 
 
-def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str]:
-    return (systemctl_query("is-active", unit), systemctl_query("is-enabled", unit))
+def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str, int | None]:
+    return (
+        systemctl_query("is-active", unit),
+        systemctl_query("is-enabled", unit),
+        systemctl_exec_main_status(unit),
+    )
+
+
+def systemctl_exec_main_status(unit: str = DAEMON_UNIT) -> int | None:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "show", "-p", "ExecMainStatus", "--value", unit],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        return None
+    text = (completed.stdout or "").strip().splitlines()
+    if not text:
+        return None
+    try:
+        return int(text[0])
+    except ValueError:
+        return None
 
 
 def daemon_is_down(state: str) -> bool:
     return state != "active"
 
 
-def daemon_needs_alarm(active: str, enabled: str = "enabled") -> bool:
-    """Alarm unless the unit is running, or disabled and merely inactive.
+def daemon_needs_alarm(active: str, enabled: str = "enabled",
+                       exec_status: int | None = None) -> bool:
+    """Alarm unless the unit is running, deliberately stopped, or unsupported.
 
-    A failed unit always alarms, including when it is also disabled.
-    Enabled but inactive alarms. Disabled and inactive is ACPI-only mode.
+    A failed unit always alarms. Enabled but inactive alarms when the last
+    exit is not the startup unsupported-firmware code. Disabled and inactive
+    is ACPI-only mode and does not alarm. Exit 69 is only that startup check.
     """
     if active == "active":
         return False
     if active == "failed":
         return True
+    if exec_status == UNSUPPORTED_FIRMWARE_EXIT:
+        return False
     if enabled == "disabled" and active == "inactive":
         return False
     return True
 
 
-def split_unit_state(reported: str | tuple[str, str]) -> tuple[str, str]:
+def split_unit_state(reported: str | tuple) -> tuple[str, str, int | None]:
     if isinstance(reported, tuple):
-        active, enabled = reported
-        return active, enabled
-    return reported, "enabled"
+        if len(reported) >= 3:
+            return reported[0], reported[1], reported[2]
+        if len(reported) == 2:
+            return reported[0], reported[1], None
+    return reported, "enabled", None
 
 
 def broadcast_alert(message: str) -> None:
@@ -275,11 +304,12 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     fault_since: float | None = None
     announced_shortage = False
     last_daemon_alert: float | None = None
+    reported_unsupported = False
     while not stop_requested.is_set():
         # A dead daemon can leave a low floor while temperatures stay under
         # every stall threshold. Check it before those thresholds.
-        active_state, enabled_state = split_unit_state(unit_state())
-        if daemon_needs_alarm(active_state, enabled_state):
+        active_state, enabled_state, exec_status = split_unit_state(unit_state())
+        if daemon_needs_alarm(active_state, enabled_state, exec_status):
             now = monotonic()
             if (last_daemon_alert is None or
                     now - last_daemon_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
@@ -295,6 +325,14 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 last_daemon_alert = now
         else:
             last_daemon_alert = None
+            if (exec_status == UNSUPPORTED_FIRMWARE_EXIT and
+                    not reported_unsupported):
+                LOG.warning(
+                    "dgx-fan-control: %s last exited %s "
+                    "(fan control unsupported); not alerting",
+                    DAEMON_UNIT, exec_status,
+                )
+                reported_unsupported = True
         try:
             fan_rpms = read_named_fan_rpms(hwmon_root)
             soc_c = read_thermal_zone_c(thermal_root)
@@ -541,6 +579,30 @@ def write_acpi_fan_level(device: Path, level: int) -> None:
         )
 
 
+def pinned_ec_name(log_text: str) -> str | None:
+    match = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
+    return match.group(1) if match else None
+
+
+def classify_fan_binding(thermal_root: Path, hwmon_root: Path) -> str:
+    """supported, unsupported (telemetry only), or absent."""
+    if cooling_devices(thermal_root):
+        return "supported"
+    if find_fan_hwmon(hwmon_root) is not None:
+        return "unsupported"
+    return "absent"
+
+
+def describe_control(kind: str, profile: str | None = None) -> str:
+    if kind == "supported":
+        return "supported"
+    if kind == "unsupported":
+        if profile:
+            return f"unsupported ({profile}, telemetry only)"
+        return "unsupported (telemetry only)"
+    return "unknown"
+
+
 def module_is_loaded(module: str = MODULE_NAME, module_root: Path | None = None) -> bool:
     root = module_root if module_root is not None else Path("/sys/module")
     return (root / module).is_dir()
@@ -741,8 +803,15 @@ def disable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
     note_initramfs(etc)
 
 
-def enable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
-    """Undo a managed disable, load the module, and start the service."""
+def enable_kernel_module(etc: Path, *, runner, loaded: bool,
+                         control_supported: bool | None = None,
+                         force_service: bool = False,
+                         profile: str | None = None) -> None:
+    """Undo a managed disable, load the module, and start the service.
+
+    On a telemetry-only bind the service stays disabled unless force_service
+    is set. Exit 69 is reserved for that startup check, not for later crashes.
+    """
     modprobe_dir, modules_load, managed = module_paths(etc)
     if managed.is_file():
         managed.unlink()
@@ -750,11 +819,38 @@ def enable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
     restore_modules_load(modules_load)
     if not loaded:
         run_module_command(["modprobe", MODULE_NAME], runner)
+    if control_supported is None:
+        kind = classify_fan_binding(Path("/sys/class/thermal"), Path("/sys/class/hwmon"))
+        supported = kind != "unsupported"
+    else:
+        supported = control_supported
+    if not supported and profile is None:
+        try:
+            logged = subprocess.run(
+                ["dmesg"], check=False, capture_output=True, text=True,
+            )
+            profile = pinned_ec_name(logged.stdout or "")
+        except OSError:
+            profile = None
+    if not supported and not force_service:
+        run_module_command(["systemctl", "disable", "--now", DAEMON_UNIT], runner)
+        label = profile or "this firmware"
+        message = (
+            f"fan control unsupported on {label}; telemetry only, "
+            "service left disabled; use acpi-max on EC 3.5.8"
+        )
+        print(message)
+        LOG.warning("%s", message)
+        note_initramfs(etc)
+        return
+    if not supported and force_service:
+        LOG.warning("starting the service despite unsupported fan control")
     run_module_command(["systemctl", "enable", "--now", DAEMON_UNIT], runner)
     note_initramfs(etc)
 
 
-def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabled: str) -> str:
+def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabled: str,
+                  control: str = "unknown", exec_status: int | None = None) -> str:
     modprobe_dir, _modules_load, managed = module_paths(etc)
     foreign = foreign_blacklist_files(modprobe_dir)
     initramfs = initramfs_module_files(etc)
@@ -773,9 +869,12 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
         "other-blacklists: " + (", ".join(str(path) for path in foreign) if foreign else "none"),
         f"service-enabled: {service_enabled}",
         f"service-active: {service_active}",
+        f"control: {control}",
         f"mode: {mode}",
         "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),
     ]
+    if exec_status is not None:
+        lines.append(f"service-exit: {exec_status}")
     return "\n".join(lines) + "\n"
 
 
@@ -861,6 +960,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable or disable the kernel module for ACPI-only fan control",
     )
     module.add_argument("action", choices=("disable", "enable", "status"))
+    module.add_argument(
+        "--force-service",
+        action="store_true",
+        help="start the daemon even when fan control is unsupported",
+    )
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
     subparsers.add_parser("automatic", help="restore firmware-automatic policy")
@@ -897,13 +1001,28 @@ def main(argv: list[str] | None = None) -> int:
                 disable_kernel_module(etc, runner=None, loaded=loaded)
                 return 0
             if args.action == "enable":
-                enable_kernel_module(etc, runner=None, loaded=loaded)
+                enable_kernel_module(
+                    etc, runner=None, loaded=loaded, force_service=args.force_service,
+                )
                 return 0
+            kind = classify_fan_binding(
+                Path("/sys/class/thermal"), Path("/sys/class/hwmon"),
+            )
+            profile = None
+            try:
+                logged = subprocess.run(
+                    ["dmesg"], check=False, capture_output=True, text=True,
+                )
+                profile = pinned_ec_name(logged.stdout or "")
+            except OSError:
+                profile = None
             print(module_status(
                 etc,
                 loaded=loaded,
                 service_active=systemctl_query("is-active"),
                 service_enabled=systemctl_query("is-enabled"),
+                control=describe_control(kind, profile),
+                exec_status=systemctl_exec_main_status(),
             ), end="")
             return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
@@ -923,12 +1042,15 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("%s", exc)
         if args.command == "status":
             print(CONTROL_UNSUPPORTED)
-        # Permanent firmware limitation. Exit 0 so systemd does not restart the
-        # daemon. set-state and automatic still fail because they cannot write.
-        return 0 if args.command in ("status", "daemon") else 1
+            return 0
+        # Exit 69 is only this startup check. Runtime failures use exit 1 so
+        # systemd keeps restarting a daemon that died on supported firmware.
+        if args.command == "daemon":
+            return UNSUPPORTED_FIRMWARE_EXIT
+        return 1
     except (OSError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
-        return CONTROLLER_UNAVAILABLE_EXIT if args.command == "daemon" else 1
+        return 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 

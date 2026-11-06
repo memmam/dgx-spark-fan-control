@@ -155,16 +155,16 @@ recovery. Retain the logs when this occurs. Do not repeatedly restart the
 service to work around the cooldown or discard ownership by reloading.
 
 The service uses `Restart=always` with a 30-second delay and
-`StartLimitIntervalSec=0`, so systemd does not stop trying. Exit 69 used to be
-excluded from restart, which left a stopped daemon holding a low floor while
-temperatures stayed under the alarms (observed for 1 day 19 hours). A later
-three-start cap would fail the unit again after about 90 seconds of crash
-looping. Unsupported firmware exits 0 and therefore also restarts every 30
-seconds. That log noise is accepted. `dgx-fan-control watchdog` logs and
-broadcasts when this unit is not `active`, before it applies the temperature
-rule, which covers the gap while a restart has not yet brought the daemon
-back. SIGTERM lets the daemon perform its own cleanup, without a competing
-`ExecStop` writer.
+`StartLimitIntervalSec=0`, so a crash is retried forever. Exit 69 is reserved
+for the daemon's startup check that fan control is unsupported, and
+`RestartPreventExitStatus=69` stops only that exit from looping. A transport
+failure or crash does not use exit 69, so it still restarts. Exit 69 used to
+cover those runtime failures too, which left a stopped daemon holding a low
+floor while temperatures stayed under the alarms (observed for 1 day 19 hours).
+`dgx-fan-control watchdog` does not alarm when the last exit is 69. It still
+logs and broadcasts when the unit is `failed`, or enabled but inactive with
+another exit code, before it applies the temperature rule. SIGTERM lets the
+daemon perform its own cleanup, without a competing `ExecStop` writer.
 
 On 2026-09-07, both machines had an **idle physical mailbox with a stale pending
 flag**. A guarded, one-shot read-lower-floor retry recovered communication on

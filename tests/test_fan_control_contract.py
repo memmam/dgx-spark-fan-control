@@ -115,7 +115,7 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("Restart=always\n", SERVICE)
         self.assertIn("RestartSec=30s\n", SERVICE)
         self.assertIn("StartLimitIntervalSec=0\n", SERVICE)
-        self.assertNotIn("RestartPreventExitStatus", SERVICE)
+        self.assertIn("RestartPreventExitStatus=69\n", SERVICE)
         self.assertNotIn("StartLimitBurst", SERVICE)
 
 

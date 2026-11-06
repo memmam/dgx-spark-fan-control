@@ -1,17 +1,32 @@
 # Validation and provenance
 
+## Version 0.1.5 on EC 3.13.7
+
+Hardware check on one DGX Spark, kernel `7.0.0-1024-nvidia`, EC 3.13.7.
+DKMS 0.1.5 built and loaded on aarch64. The kernel log showed partition
+`0x8003`, properties `0x109`, FF-A 1.2, `pinned EC 3.13.7 capabilities
+fan0=975..4350 fan1=975..4350`, floor writes disabled, baseline fans about
+2101 and 2141 RPM, and hwmon telemetry with no cooling device. `module
+status`, `module disable`, and `module enable` matched that state: disable
+left the module unloaded with the managed blacklist and mode ACPI-only;
+enable loaded it again with the service enabled and active and mode module.
+DKMS did not replace `/usr/local/sbin/dgx-fan-control`; the previous 0.1.4
+command stayed until it was installed by hand.
+
+Not checked on that machine: `acpi-max`, the watchdog, the quiet curve, and
+the EC 3.5.8 floor-write path. The 3.13.7 floor table was not written.
+`allow_unverified_writes` stayed off.
+
 ## Version 0.1.5 profiles and read-only EC 3.13.7
 
-Not yet run on DGX hardware. The hardware-free suite covers exact capability
-matches for EC 3.5.8 and EC 3.13.7, rejection of a one-byte change, both floor
-tables, EC 3.13.7 floor writes refused with `-EPERM` unless
-`allow_unverified_writes` is set, poll state `0xFF` as `-EOPNOTSUPP`,
-reply-guard `EAGAIN` versus ownership `ESTALE`, the daemon's 31-second retry,
-a curve that never selects state 0 while running, and a read-only ACPI
-fan-stall watchdog. Probe on EC 3.13.7 sends no floor command by default.
-The EC 3.13.7 floor numbers are **not** confirmed on a machine. EC 3.5.8 with
-SoC 2.158.15, the ACPI `Fan` levels, and the November 2026 stopped-fan reports
-are documented from the owner, not reproduced here.
+The hardware-free suite covers exact capability matches, rejection of a
+one-count change, both floor tables, `-EPERM` without
+`allow_unverified_writes`, poll state `0xFF` as `-EOPNOTSUPP`, reply-guard
+`EPROTO` versus idle-guard `EAGAIN` and ownership `ESTALE`, both curves
+staying off state 0, and the module toggle against a temporary directory.
+EC 3.5.8 with SoC 2.158.15, the ACPI `Fan` levels, and the November 2026
+stopped-fan reports are documented from the owner and the forum, not
+reproduced as a controlled test here.
 
 ## Version 0.1.4 zero-clamp restore
 

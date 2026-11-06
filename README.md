@@ -176,11 +176,13 @@ A systemd drop-in can set `Environment=DGX_FAN_CURVE=quiet`. Both curves keep
 the state-1 pin and never select state 0 while the daemon runs.
 
 The service restarts every 30 seconds with no start-rate limit
-(`Restart=always`, `RestartSec=30s`, `StartLimitIntervalSec=0`). A crash loop
-is retried forever instead of being left failed. Unsupported firmware exits 0,
-so that case also restarts every 30 seconds. The repeating log line is the
-accepted tradeoff. `dgx-fan-control watchdog` still reports a unit that is not
-`active`.
+(`Restart=always`, `RestartSec=30s`, `StartLimitIntervalSec=0`). A crash is
+retried forever. Exit 69 is only the startup check that fan control is
+unsupported, and systemd does not restart that exit. `module enable` on EC
+3.13.7 loads telemetry and leaves the service disabled unless
+`--force-service` is set. `dgx-fan-control watchdog` does not alarm when the
+unit's last exit is 69. It still reports a failed unit, and an enabled unit
+that is inactive for another reason.
 
 ## Firmware pairing
 
@@ -214,15 +216,20 @@ project installs. Running it again changes nothing else. Any other file in
 `/etc/modprobe.d` that blacklists the module or install-overrides it is
 reported and left untouched. `module enable` removes only the managed
 blacklist, restores the modules-load.d entry, loads the module, and enables
-and starts the service. If one of those other files is still present, enable
-warns that it can still block loading.
+and starts the service when fan control is supported. On EC 3.13.7, where the
+module registers telemetry only, enable loads the module and leaves the
+service disabled. It prints that fan control is unsupported and points at
+`acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
 
 `module status` prints whether the module is loaded, whether the managed
 blacklist or another blacklist is present, whether the service is enabled and
-active, and the mode (`module` or `ACPI-only`).
+active, whether fan control is `supported` or `unsupported (EC 3.13.7,
+telemetry only)`, and the mode (`module` or `ACPI-only`).
 
-The watchdog does not treat a disabled, inactive service as a fault. It still
-alerts when the unit is `failed`, or enabled but inactive.
+The watchdog does not treat a disabled, inactive service as a fault. It also
+stays quiet when the unit's last exit status is 69, the startup result for
+unsupported fan control, and `module status` reports that exit. It still
+alerts when the unit is `failed`, or enabled but inactive after another exit.
 
 `acpi-max` warns if `dgx_ec_fan_control` is loaded, because the module and the
 ACPI write can compete, and suggests `module disable`. It still writes.

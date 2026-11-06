@@ -85,15 +85,17 @@ Then follow the route you originally installed:
 
 - **Manual:** repeat the manual build/sign/install commands for the running
   kernel. Also rebuild for other installed kernels you intend to boot.
-- **DKMS:** remove the old registered version with
-  `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`
-  when upgrading from 0.1.0 (check `dkms status` for your installed version),
-  then repeat the source-copy, add, build, and install steps in the installation
-  guide. Use the
-  version in the new checkout's `dkms.conf` (currently `0.1.5`) wherever the
-  commands name a version. This also refreshes a changed checkout that retains
-  the same version; `git pull` alone does not refresh DKMS's stored source.
+- **DKMS:** remove the old registered version. Upgrading from 0.1.4:
+  `sudo dkms remove dgx-spark-fan-control/0.1.4 --all`
+  (from 0.1.0: `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`).
+  Check `dkms status` for the installed version, then repeat the source-copy,
+  add, build, and install steps in the installation guide. Use the version in
+  the new checkout's `dkms.conf` (currently `0.1.5`) wherever the commands
+  name a version. This also refreshes a changed checkout that retains the
+  same version; `git pull` alone does not refresh DKMS's stored source.
   Build for every additional installed kernel you intend to boot.
+  DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
+  in the next step or the previous CLI remains.
 
 Refresh the command and service definition, then load and check the new module:
 

@@ -157,7 +157,10 @@ modinfo -F signer dgx_ec_fan_control
 ```
 
 Expect `installed` for the running kernel and the intended certificate subject
-in `signer`. Continue with step 4. If previously installed manually, use the
+in `signer`. **DKMS installs only the kernel module.** It does not replace
+`/usr/local/sbin/dgx-fan-control`. Continue with step 4 and install that
+command before loading the module, or a previous 0.1.4 CLI stays in place.
+If previously installed manually, use the
 [migration instructions](maintenance.md#switch-from-manual-installation-to-dkms)
 first so an old module does not mask the DKMS version.
 
@@ -181,9 +184,12 @@ For a system without signature enforcement, replace `./scripts/build-sign`
 with `make -C kernel`, then use the same installation commands. An unsigned
 module will not load under enforced Secure Boot.
 
-## 4. Load the driver and verify automatic mode
+## 4. Install the command, then load the driver
 
-Both build routes join here:
+**Do this after every DKMS or manual module build.** DKMS does not install
+the Python command. If `/usr/local/sbin/dgx-fan-control` is left over from
+0.1.4, the new module will be controlled by the old CLI until this copy
+replaces it.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
