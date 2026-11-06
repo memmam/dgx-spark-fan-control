@@ -120,20 +120,31 @@ class ModuleModeTests(unittest.TestCase):
 
     def test_enable_leaves_the_service_disabled_when_control_is_unsupported(self):
         self.loaded = False
-        output = __import__("io").StringIO()
-        from contextlib import redirect_stdout
+        import io
+        import logging
+        from contextlib import redirect_stderr, redirect_stdout
+        stdout, stderr = io.StringIO(), io.StringIO()
         sentence = (
             "fan control unsupported on EC 3.13.7; telemetry only, "
             "service left disabled; use acpi-max on EC 3.5.8"
         )
-        with redirect_stdout(output), self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
-            CONTROL.enable_kernel_module(
-                self.etc, runner=self.runner, loaded=False,
-                control_supported=False, profile="EC 3.13.7",
-            )
-        text = output.getvalue()
-        self.assertEqual(text.count(sentence), 1)
-        self.assertFalse(any(sentence in line for line in logs.output))
+        root = logging.getLogger()
+        handler = logging.StreamHandler(stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        root.addHandler(handler)
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr), \
+                 self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+                CONTROL.enable_kernel_module(
+                    self.etc, runner=self.runner, loaded=False,
+                    control_supported=False, profile="EC 3.13.7",
+                )
+        finally:
+            root.removeHandler(handler)
+        combined = stdout.getvalue() + stderr.getvalue() + "\n".join(logs.output)
+        self.assertEqual(combined.count(sentence), 1)
+        self.assertEqual(stdout.getvalue().count(sentence), 1)
+        self.assertNotIn(sentence, stderr.getvalue())
         self.assertIn(["modprobe", CONTROL.MODULE_NAME], self.commands)
         self.assertNotIn(
             ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
@@ -244,10 +255,17 @@ class ModuleModeTests(unittest.TestCase):
             (fan / "type").write_text("Fan\n", encoding="ascii")
             (fan / "cur_state").write_text("40\n", encoding="ascii")
             (fan / "max_state").write_text("100\n", encoding="ascii")
-            with self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+            import io
+            from contextlib import redirect_stdout
+            stdout = io.StringIO()
+            with redirect_stdout(stdout), self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
                 CONTROL.set_acpi_fans(thermal, 100, module_loaded=True)
+            text = stdout.getvalue()
             self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "100\n")
-            self.assertTrue(any("module disable" in line for line in logs.output))
+            self.assertEqual(sum("module disable" in line for line in logs.output), 1)
+            self.assertEqual(text.count("cooling_device0 (Fan): 100/100\n"), 1)
+            self.assertEqual(text.count(CONTROL.ACPI_RPM_NOTE), 1)
+            self.assertFalse(any("100/100" in line or CONTROL.ACPI_RPM_NOTE in line for line in logs.output))
 
 
 if __name__ == "__main__":

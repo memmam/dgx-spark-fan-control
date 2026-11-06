@@ -160,9 +160,9 @@ requests state 12 immediately. Individual invalid sensors are skipped.
 Constants live in [`userspace/dgx_fan_control.py`](../userspace/dgx_fan_control.py).
 The daemon rereads the kernel state each sample, including after suspend/resume.
 Brief transport failures receive two retries, after two and four seconds. Three
-consecutive failures stop the service with exit status 69 and an attempted
-automatic restoration. Systemd leaves it failed for operator recovery instead
-of restarting indefinitely. See [troubleshooting](troubleshooting.md).
+consecutive failures attempt automatic restoration and exit 1. Exit 69 is only
+the startup check that fan control is unsupported. Systemd restarts exit 1
+every 30 seconds and does not restart exit 69. See [troubleshooting](troubleshooting.md).
 
 ## Choose a fan floor
 

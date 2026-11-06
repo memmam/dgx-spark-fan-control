@@ -50,6 +50,8 @@ dgx-fan-control status
 # control unsupported on this firmware
 ```
 
+That line is printed once. It is not also written to the log.
+
 `fan1_input` and `fan2_input` under the `dgx_ec_fan` hwmon device should still
 be readable. Do not register a second fan driver or send raw mailbox commands
 to work around the rejection. The ACPI `Fan` cooling device does not change
@@ -135,7 +137,7 @@ for that distinction, other failure paths, and the subsequent live recovery.
 
 Versions 0.1.1 and later log preflight timeouts separately from submission failures. The
 daemon retries transient transport errors after two and four seconds; after
-three consecutive failures it attempts automatic restoration and exits 69.
+three consecutive failures it attempts automatic restoration and exits 1.
 Non-retryable errors, including an ownership mismatch, stop immediately. Both
 the initiating error and any restoration failure remain in the journal. A
 failed restoration means the current floor is **unverified**, not automatic.

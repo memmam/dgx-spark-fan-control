@@ -3,8 +3,9 @@
 
 import errno
 import io
+import logging
 import math
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
 import tempfile
 import unittest
@@ -12,6 +13,26 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_fan_control_contract import CONTROL
+
+
+def run_cli(argv):
+    """Run main() and return (code, stdout, stderr), including log lines."""
+    stdout, stderr = io.StringIO(), io.StringIO()
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    for handler in saved_handlers:
+        root.removeHandler(handler)
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = CONTROL.main(list(argv))
+        return code, stdout.getvalue(), stderr.getvalue()
+    finally:
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        for handler in saved_handlers:
+            root.addHandler(handler)
+        root.setLevel(saved_level)
 
 
 class UserlandFailureTests(unittest.TestCase):
@@ -259,15 +280,28 @@ class UserlandFailureTests(unittest.TestCase):
                 "--thermal-root", str(thermal),
                 "--hwmon-root", str(root / "hwmon"),
             ]
-            output = io.StringIO()
-            with redirect_stdout(output), self.assertLogs(CONTROL.LOG, level="ERROR") as logs:
-                self.assertEqual(CONTROL.main([*argv, "status"]), 0)
-            self.assertIn(CONTROL.CONTROL_UNSUPPORTED, output.getvalue())
-            self.assertTrue(any(CONTROL.CONTROL_UNSUPPORTED in line for line in logs.output))
-            with self.assertLogs(CONTROL.LOG, level="ERROR"):
-                self.assertEqual(CONTROL.main([*argv, "daemon"]), CONTROL.UNSUPPORTED_FIRMWARE_EXIT)
-                self.assertEqual(CONTROL.main([*argv, "set-state", "1"]), 1)
-                self.assertEqual(CONTROL.main([*argv, "automatic"]), 1)
+            code, stdout, stderr = run_cli([*argv, "status"])
+            self.assertEqual(code, 0)
+            combined = stdout + stderr
+            self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertEqual(stdout.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stderr)
+            self.assertNotIn("ERROR", stdout)
+
+            code, stdout, stderr = run_cli([*argv, "daemon"])
+            self.assertEqual(code, CONTROL.UNSUPPORTED_FIRMWARE_EXIT)
+            combined = stdout + stderr
+            self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+            self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
+
+            for command in (["set-state", "1"], ["automatic"]):
+                code, stdout, stderr = run_cli([*argv, *command])
+                self.assertEqual(code, 1)
+                combined = stdout + stderr
+                self.assertEqual(combined.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+                self.assertEqual(stderr.count(CONTROL.CONTROL_UNSUPPORTED), 1)
+                self.assertNotIn(CONTROL.CONTROL_UNSUPPORTED, stdout)
 
     def test_quiet_curve_never_selects_zero_and_is_monotonic(self):
         thresholds = [temperature for temperature, _state in CONTROL.QUIET_CURVE]
@@ -428,35 +462,34 @@ class UserlandFailureTests(unittest.TestCase):
     def test_acpi_max_writes_only_fan_devices(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, second = self._acpi_tree(Path(directory))
-            stdout = io.StringIO()
-            with redirect_stdout(stdout):
-                self.assertEqual(CONTROL.main([
-                    "--thermal-root", str(thermal), "acpi-max",
-                ]), 0)
-            text = stdout.getvalue()
+            code, stdout, stderr = run_cli([
+                "--thermal-root", str(thermal), "acpi-max",
+            ])
+            text = stdout + stderr
+            self.assertEqual(code, 0)
             self.assertEqual((first / "cur_state").read_text(), "100\n")
             self.assertEqual((second / "cur_state").read_text(), "100\n")
             self.assertEqual(
                 (thermal / "cooling_device0" / "cur_state").read_text(), "0\n"
             )
-            self.assertIn("cooling_device1 (Fan): 100/100\n", text)
-            self.assertIn("cooling_device2 (Fan): 100/100\n", text)
+            self.assertEqual(stdout.count("cooling_device1 (Fan): 100/100\n"), 1)
+            self.assertEqual(stdout.count("cooling_device2 (Fan): 100/100\n"), 1)
+            self.assertNotIn("cooling_device", stderr)
             self.assertNotIn("cooling_device0", text)
             self.assertEqual(text.count(CONTROL.ACPI_RPM_NOTE), 1)
-            self.assertIn("without changing RPM", text)
-            self.assertIn("check fan RPM afterward", text)
+            self.assertIn("without changing RPM", stdout)
+            self.assertIn("check fan RPM afterward", stdout)
 
     def test_acpi_max_exits_nonzero_without_a_fan_or_when_a_write_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             empty = root / "empty"
             empty.mkdir()
-            stdout = io.StringIO()
-            with redirect_stdout(stdout), self.assertLogs(CONTROL.LOG, level="ERROR"):
-                self.assertEqual(CONTROL.main([
-                    "--thermal-root", str(empty), "acpi-max",
-                ]), 1)
-            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout.getvalue())
+            code, stdout, stderr = run_cli(["--thermal-root", str(empty), "acpi-max"])
+            self.assertEqual(code, 1)
+            self.assertEqual((stdout + stderr).count("no ACPI Fan cooling device found"), 1)
+            self.assertNotIn("no ACPI Fan cooling device found", stdout)
+            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout + stderr)
 
             thermal, first, second = self._acpi_tree(root)
             original = CONTROL.write_acpi_fan_level
@@ -466,28 +499,32 @@ class UserlandFailureTests(unittest.TestCase):
                     raise OSError("write failed")
                 original(device, level)
 
-            stdout = io.StringIO()
-            with redirect_stdout(stdout), \
-                 patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write), \
-                 self.assertLogs(CONTROL.LOG, level="ERROR"):
-                self.assertEqual(CONTROL.main([
-                    "--thermal-root", str(thermal), "acpi-max",
-                ]), 1)
-            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout.getvalue())
-            self.assertNotIn("cooling_device", stdout.getvalue())
+            with patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write):
+                code, stdout, stderr = run_cli(["--thermal-root", str(thermal), "acpi-max"])
+            self.assertEqual(code, 1)
+            self.assertEqual((stdout + stderr).count("failed on 1 device"), 1)
+            self.assertNotIn("failed on 1 device", stdout)
+            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout + stderr)
+            self.assertNotIn("cooling_device", stdout)
 
     def test_acpi_level_refuses_below_forty_and_fail_hot_rewrites_one_hundred(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, second = self._acpi_tree(Path(directory))
-            with self.assertLogs(CONTROL.LOG, level="ERROR"):
-                self.assertEqual(CONTROL.main([
-                    "--thermal-root", str(thermal), "acpi-max", "--level", "20",
-                ]), 1)
+            code, stdout, stderr = run_cli([
+                "--thermal-root", str(thermal), "acpi-max", "--level", "20",
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual((stdout + stderr).count("must be between"), 1)
+            self.assertNotIn("must be between", stdout)
             self.assertEqual((first / "cur_state").read_text(), "40\n")
             self.assertEqual((second / "cur_state").read_text(), "40\n")
-            self.assertEqual(CONTROL.main([
+            code, stdout, stderr = run_cli([
                 "--thermal-root", str(thermal), "acpi-max", "--level", "40",
-            ]), 0)
+            ])
+            self.assertEqual(code, 0)
+            self.assertEqual((stdout + stderr).count(CONTROL.ACPI_RPM_NOTE), 1)
+            self.assertEqual(stdout.count("cooling_device1 (Fan): 40/100\n"), 1)
+            self.assertNotIn("40/100", stderr)
             self.assertEqual((first / "cur_state").read_text(), "40\n")
             (second / "cur_state").write_text("7\n", encoding="ascii")
 
@@ -504,10 +541,125 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual((first / "cur_state").read_text(), "100\n")
             self.assertEqual((second / "cur_state").read_text(), "100\n")
 
+    def test_supported_commands_do_not_repeat_their_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thermal = Path(directory)
+            device = thermal / "cooling_device0"
+            device.mkdir()
+            (device / "type").write_text(CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii")
+            (device / "cur_state").write_text("4\n", encoding="ascii")
+            (device / "max_state").write_text("12\n", encoding="ascii")
+            zone = thermal / "thermal_zone0"
+            zone.mkdir()
+            (zone / "temp").write_text("50000\n", encoding="ascii")
+            argv = ["--thermal-root", str(thermal)]
+            code, stdout, stderr = run_cli([*argv, "status"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout, "state=4/12 hottest=50.0C\n")
+            self.assertEqual(stderr, "")
+            code, stdout, stderr = run_cli([*argv, "set-state", "6"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout, "")
+            self.assertEqual(stderr, "")
+            self.assertEqual((device / "cur_state").read_text(), "6\n")
+            code, stdout, stderr = run_cli([*argv, "automatic"])
+            self.assertEqual(code, 0)
+            self.assertEqual(stdout, "")
+            self.assertEqual(stderr, "")
+            self.assertEqual((device / "cur_state").read_text(), "0\n")
+
+    def test_unknown_curve_and_unprivileged_module_are_reported_once(self):
+        with patch.dict("os.environ", {"DGX_FAN_CURVE": "nope"}):
+            code, stdout, stderr = run_cli(["daemon"])
+        self.assertEqual(code, 1)
+        self.assertEqual((stdout + stderr).count("unknown fan curve"), 1)
+        self.assertNotIn("unknown fan curve", stdout)
+        with patch.object(CONTROL.os, "geteuid", return_value=1000):
+            for action in ("status", "enable", "disable"):
+                code, stdout, stderr = run_cli(["module", action])
+                self.assertEqual(code, 1)
+                self.assertEqual((stdout + stderr).count("requires root"), 1)
+                self.assertNotIn("requires root", stdout)
+
+    def test_daemon_failures_are_logged_once(self):
+        timeout = OSError(errno.ETIMEDOUT, "initial timeout")
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "read_state", side_effect=timeout), \
+             patch.object(CONTROL, "write_state"), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL.Event, "wait", return_value=False):
+            code, stdout, stderr = run_cli(["daemon"])
+        combined = stdout + stderr
+        self.assertEqual(code, 1)
+        self.assertEqual(combined.count("fan control unavailable"), 1)
+        self.assertEqual(combined.count("initial timeout"), 3)
+        self.assertFalse(any(
+            line.strip() == "ERROR [Errno 110] initial timeout" for line in combined.splitlines()
+        ))
+        self.assertNotIn("initial timeout", stdout)
+
+        stop = Event()
+
+        def wait(delay):
+            stop.set()
+
+        def write(device, state):
+            if state == 0:
+                raise OSError(errno.EBUSY, "cleanup busy")
+
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL, "read_state", return_value=12), \
+             patch.object(CONTROL, "read_hottest_temperature_c", return_value=70.0), \
+             patch.object(CONTROL, "write_state", side_effect=write), \
+             patch.object(stop, "wait", side_effect=wait):
+            code, stdout, stderr = run_cli(["daemon"])
+        combined = stdout + stderr
+        self.assertEqual(code, 1)
+        self.assertEqual(combined.count("automatic restoration failed"), 1)
+        self.assertFalse(any(
+            line.startswith("ERROR ") and "cleanup busy" in line
+            for line in combined.splitlines()
+        ))
+        self.assertTrue(any("cleanup busy" in line for line in combined.splitlines()))
+        self.assertNotIn("cleanup busy", stdout)
+
+    def test_watchdog_alert_is_logged_once_and_not_printed(self):
+        stop = Event()
+        alerts = []
+        stdout, stderr = io.StringIO(), io.StringIO()
+        root = logging.getLogger()
+        handler = logging.StreamHandler(stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        root.addHandler(handler)
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr), \
+                 patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()):
+                code = CONTROL.run_watchdog(
+                    Path("/tmp/dgx-fan-missing"),
+                    Path("/tmp/dgx-fan-missing"),
+                    unit_state=lambda: ("inactive", "enabled", 1),
+                    notifier=alerts.append,
+                    monotonic=lambda: 0.0,
+                )
+        finally:
+            root.removeHandler(handler)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(alerts), 1)
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertEqual(combined.count(alerts[0]), 1)
+        self.assertEqual(combined.count("fan-stall watchdog watching"), 1)
+        self.assertEqual(stdout.getvalue(), "")
+
     def test_runtime_daemon_error_stays_restartable(self):
-        with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")), \
-             self.assertLogs(CONTROL.LOG, level="ERROR"):
-            self.assertEqual(CONTROL.main(["daemon"]), 1)
+        with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")):
+            code, stdout, stderr = run_cli(["daemon"])
+        self.assertEqual(code, 1)
+        self.assertEqual((stdout + stderr).count("timeout"), 1)
+        self.assertNotIn("timeout", stdout)
 
 
 if __name__ == "__main__":

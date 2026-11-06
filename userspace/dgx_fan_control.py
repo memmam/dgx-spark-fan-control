@@ -106,6 +106,20 @@ CURVES = {
 LOG = logging.getLogger("dgx-fan-control")
 
 
+def mark_reported(exc: BaseException) -> None:
+    """Remember that this failure is already in the process log.
+
+    main logs unreported exceptions once. Repeating one that a command
+    already logged puts the same event on the terminal and in the journal
+    a second time.
+    """
+    setattr(exc, "_dgx_reported", True)
+
+
+def was_reported(exc: BaseException) -> bool:
+    return bool(getattr(exc, "_dgx_reported", False))
+
+
 class ControlUnsupported(RuntimeError):
     """Hwmon telemetry is bound and the EC is not accepting a floor."""
 
@@ -401,6 +415,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                     f"dgx-fan-control: {DAEMON_UNIT} is not active "
                     f"({active_state}, {enabled_state})"
                 )
+                # One journal line. wall is a separate tty broadcast for
+                # logged-in users, not a second copy on stdout or stderr.
                 LOG.critical(message)
                 try:
                     notifier(message)
@@ -615,6 +631,7 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
                         "stopping for operator recovery, current floor is unverified",
                         failures, exc,
                     )
+                    mark_reported(exc)
                     raise
                 delay = retry_delay_seconds(exc, failures)
                 LOG.warning(
@@ -630,8 +647,9 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
     finally:
         try:
             write_state(cooling_device, 0)
-        except Exception:
+        except Exception as exc:
             LOG.exception("automatic restoration failed; current fan floor is unverified")
+            mark_reported(exc)
             if not primary_failure:
                 raise
         else:
@@ -1151,17 +1169,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
     except ControlUnsupported as exc:
-        LOG.error("%s", exc)
+        # status is interactive: print the reason once. Logging it as well
+        # repeated the line (ERROR on stderr, then the same text on stdout).
+        # The daemon and the write commands only log, so the journal has one
+        # line. Exit 69 is only the daemon's startup check.
         if args.command == "status":
             print(CONTROL_UNSUPPORTED)
             return 0
-        # Exit 69 is only this startup check. Runtime failures use exit 1 so
-        # systemd keeps restarting a daemon that died on supported firmware.
+        LOG.error("%s", exc)
         if args.command == "daemon":
             return UNSUPPORTED_FIRMWARE_EXIT
         return 1
     except (OSError, RuntimeError, ValueError) as exc:
-        LOG.error("%s", exc)
+        if not was_reported(exc):
+            LOG.error("%s", exc)
         return 1
     raise AssertionError(f"unhandled command: {args.command}")
 
