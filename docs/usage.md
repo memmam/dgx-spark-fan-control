@@ -332,7 +332,8 @@ Work in progress defers that reboot. When `BUSY_CHECK` in
 missing `nvidia-smi` counts as a job, so the machine is not rebooted on a
 guess. A persistent model server always shows a compute process, so with
 that default the reboot stays deferred for as long as that process is
-present, and only the 85°C poweroff protects the machine. Set `BUSY_CHECK`
+present. The stall policy then relies on the true-zero 85°C poweroff;
+project ACPI writes additionally arm the separate thermal escalation policy. Set `BUSY_CHECK`
 to a command whose exit 0 means a request is still in flight. A failure or
 a timeout of that command counts as busy. Prefer a check of in-flight
 requests over the compute-process list.
@@ -352,8 +353,9 @@ missing or unreadable, the parenthesis is
 `(not sampled now; no earlier work-state record)`.
 The default is **85°C**. `--soc-celsius` is a deprecated alias for that
 true-zero cutoff. A stall itself does not require a high temperature:
-both tachometers at 0 RPM are enough. Spinning fans are not powered off
-for temperature.
+both tachometers at 0 RPM are enough. This cutoff never powers off spinning
+fans; the separately armed ACPI escalation can stop work and shut down despite
+spinning fans.
 
 85°C is not a general limit. A published 4-node DGX Spark setup
 ([tenhkspark/dgx-spark-tuning](https://github.com/tenhkspark/dgx-spark-tuning))
@@ -653,9 +655,22 @@ before that reboot do not come back by themselves:
   oneshot unit can apply it again if you need the lock.
 - A multi-node workload can lose the pair when one node reboots. The fan
   watchdog still reboots only the machine whose fans stopped or whose floor
-  is foreign.
+  is foreign, or whose ACPI thermal incident has reached verified cool recovery.
+
+For ACPI incident recovery, do not automatically restart the workload. The
+incident latch must be inspected and explicitly reset after reboot; external
+workload managers must honor it too. The fan tool never starts a job.
 
 ## Set the ACPI fan level
+
+**Warning:** on EC 3.5.8 ACPI holds replace the stock EC curve until reboot,
+even at level 100. Do not hold them under sustained full load. The independent
+watchdog must be active before these commands write; it forces 100 at 80 C,
+stops work at 85 C, kills at 90 C or timeout, and shuts down at 95 C or the
+post-kill cooling timeout. Verified stopped/cool recovery reboots, with a
+persistent manual-reset incident latch; it never restarts the workload.
+See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
+
 
 This does not use the kernel module. It writes every cooling device whose
 type is `Fan`:

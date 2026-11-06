@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import contextvars
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -1716,6 +1717,9 @@ def apply_manual_floor(thermal_root: Path, hwmon_root: Path,
             defaults = {}
     if state_dir is None:
         state_dir = STALL_MARKER_DIR
+    if acpi_incident_latched(state_dir):
+        LOG.critical("ACPI incident latched; not restoring a manual floor; explicit acpi-incident-reset required")
+        return HELD_FLOOR_EXIT
     dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
     state, source = resolved_manual_state(defaults, state_dir)
     if source == "invalid":
@@ -2612,6 +2616,8 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
 def show_intervention() -> None:
     path = STALL_MARKER_DIR / INTERVENTION_NAME
     dismiss_unsupported_firmware_flag(path)
+    if acpi_incident_latched():
+        print("ACPI thermal incident latched: fan writes/startup inhibited; reboot then inspect cooling and explicitly run acpi-incident-reset")
     banner = intervention_banner(path)
     if banner:
         print(banner, end="")
@@ -2997,7 +3003,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         "0 RPM on every fan for more than %.0fs alerts and attempts a repair; "
         "still stopped after %.0fs reboots when no work is in progress; "
         "a true zero powers off at %.0fC. Spinning fans are not powered off "
-        "for temperature",
+        "for temperature unless an ACPI hold has armed thermal escalation",
         stall_seconds, reboot_seconds, zero_fan_celsius,
     )
     zero_since: float | None = None
@@ -3092,7 +3098,16 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             )
             return busy, how
 
+    try:
+        acpi_guard = AcpiThermalGuard(defaults)
+    except (ValueError, TypeError) as exc:
+        LOG.critical("invalid ACPI thermal configuration (%s); using safe defaults for existing holds", exc)
+        acpi_guard = AcpiThermalGuard({})
     while not stop_requested.is_set():
+        try:
+            poll_acpi_thermal(acpi_guard, thermal_root, hwmon_root, monotonic(), zero_fan_celsius)
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOG.critical("ACPI thermal observation failed: %s; preserving true-zero monitoring", exc)
         active_state, enabled_state, exec_status, unit_result, n_restarts = (
             split_unit_state(unit_state())
         )
@@ -3123,7 +3138,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             except (OSError, UnicodeError, ValueError, RuntimeError):
                 foreign_rpms = None
             busy, busy_how = sample_work(now, foreign_rpms, hottest)
-            if busy_how != "startup-grace" and held >= reboot_seconds:
+            if (busy_how != "startup-grace" and held >= reboot_seconds
+                    and not acpi_record_current(ACPI_INCIDENT_NAME)):
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
                     marker is not None and boot_id is not None and marker[0] != boot_id
@@ -3372,7 +3388,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                     )
                     recover_fan_stall(thermal_root, module_loaded=loaded)
             busy, busy_how = sample_work(now, fan_rpms, hottest)
-            if busy_how != "startup-grace" and held >= reboot_seconds:
+            if (busy_how != "startup-grace" and held >= reboot_seconds
+                    and not acpi_record_current(ACPI_INCIDENT_NAME)):
                 if busy:
                     detail = (
                         "a GPU job is running and the fans are still at 0 RPM"
@@ -3692,6 +3709,9 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
             defaults = read_defaults()
         except OSError:
             defaults = {}
+    if acpi_incident_latched(state_dir):
+        LOG.critical("ACPI incident latched; not starting fan curve; explicit acpi-incident-reset required")
+        return HELD_FLOOR_EXIT
     dismiss_unsupported_firmware_flag(STALL_MARKER_DIR / INTERVENTION_NAME)
     selected = CURVES[curve_name(curve)]
     # Telemetry-only firmware raises here and main() returns exit 69.
@@ -3836,15 +3856,18 @@ def acpi_fan_result_line(device: Path) -> str:
 
 
 def write_acpi_fan_level(device: Path, level: int) -> None:
-    maximum = int((device / "max_state").read_text(encoding="ascii").strip())
-    if not 0 <= level <= maximum:
-        raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
-    (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
-    observed = int((device / "cur_state").read_text(encoding="ascii").strip())
-    if observed != level:
-        raise RuntimeError(
-            f"ACPI fan readback mismatch: wrote {level}, read {observed}"
-        )
+    if not ACPI_MIN_LEVEL <= level <= ACPI_MAX_LEVEL:
+        raise ValueError("ACPI levels must be 35 through 100; never write 0")
+    with acpi_write_lock():
+        maximum = int((device / "max_state").read_text(encoding="ascii").strip())
+        if level > maximum:
+            raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
+        if level < ACPI_MAX_LEVEL and acpi_record_current(ACPI_MAX_NAME):
+            raise RuntimeError("ACPI thermal level 100 is latched until reboot; refusing lower level")
+        (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
+        observed = int((device / "cur_state").read_text(encoding="ascii").strip())
+        if observed != level:
+            raise RuntimeError(f"ACPI fan readback mismatch: wrote {level}, read {observed}")
 
 
 def pinned_ec_name(log_text: str) -> str | None:
@@ -4352,6 +4375,408 @@ def acpi_write_refusal(module_loaded: bool, service_active: str) -> str | None:
     return None
 
 
+
+# ACPI holds survive the writer. These boot-scoped records deliberately do not
+# clear on tool exit, service restart, or cooling; only a new boot disarms them.
+ACPI_HOLD_NAME = "acpi-hold-boot"
+ACPI_MAX_NAME = "acpi-max-boot"
+ACPI_INCIDENT_NAME = "acpi-incident"
+
+
+def acpi_incident_latched(state_dir=None) -> bool:
+    return ((state_dir or STALL_MARKER_DIR) / ACPI_INCIDENT_NAME).exists()
+
+
+def reset_acpi_incident(thermal_root):
+    if os.geteuid() != 0:
+        raise PermissionError("acpi-incident-reset requires root")
+    if not acpi_incident_latched():
+        return
+    if not read_boot_id():
+        raise RuntimeError("ACPI incident reset refused: boot ID unreadable")
+    if acpi_record_current(ACPI_INCIDENT_NAME) or acpi_record_current(ACPI_HOLD_NAME):
+        raise RuntimeError("ACPI incident cannot be reset until after reboot; EC control has not been restored")
+    guard = AcpiThermalGuard(read_defaults())
+    hot = read_hottest_temperature_c(thermal_root)
+    if hot is None or hot >= guard.fan_c - guard.hysteresis:
+        raise RuntimeError("ACPI incident reset refused: hottest zone must be below MAX minus HYSTERESIS")
+    (STALL_MARKER_DIR / ACPI_INCIDENT_NAME).unlink()
+    LOG.warning("ACPI incident reset explicitly; no fan level written and no job/service started")
+
+
+def acpi_record_current(name: str) -> bool:
+    boot = read_boot_id()
+    try:
+        return bool(boot) and (STALL_MARKER_DIR / name).read_text().strip() == boot
+    except OSError:
+        return False
+
+
+@contextmanager
+def acpi_write_lock():
+    ensure_state_dir(STALL_MARKER_DIR)
+    with (STALL_MARKER_DIR / "acpi-write.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def record_acpi_boot(name: str) -> None:
+    boot = read_boot_id()
+    if not boot:
+        raise RuntimeError("cannot arm ACPI thermal protection: boot ID unreadable")
+    with acpi_write_lock():
+        path = STALL_MARKER_DIR / name
+        temporary = path.with_suffix(".tmp")
+        write_state_text(temporary, boot + "\n")
+        temporary.replace(path)
+
+
+def acpi_ec_version(esrt_root: Path = Path("/sys/firmware/efi/esrt/entries")) -> str | None:
+    # ESRT remains readable when ProtectKernelLogs hides dmesg from the
+    # watchdog. Prefer the kernel's pinned version when it is available.
+    pinned = pinned_ec_name(read_kernel_log())
+    if pinned:
+        return pinned.removeprefix("EC ")
+    for entry in esrt_root.glob("entry*"):
+        try:
+            if (entry / "fw_class").read_text().strip().lower() != EC_FWUPD_GUID:
+                continue
+            raw = int((entry / "fw_version").read_text().strip(), 0)
+            return ec_release_name(f"{raw:08x}")
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def arm_acpi_monitor(thermal_root: Path, hwmon_root: Path = Path("/sys/class/hwmon")) -> None:
+    """Fail closed before a persistent ACPI write without an independent monitor."""
+    if acpi_incident_latched():
+        raise RuntimeError("ACPI incident latched; reboot, inspect cooling, then run acpi-incident-reset")
+    version = acpi_ec_version()
+    if (classify_fan_binding(thermal_root, hwmon_root) == "unsupported"
+            or version == "3.13.7"):
+        raise ControlUnsupported("EC 3.13.7: telemetry only, no ACPI write")
+    if version != "3.5.8":
+        raise RuntimeError("ACPI write refused: cannot positively identify EC 3.5.8 from kernel log or ESRT")
+    if systemctl_query("is-active", WATCHDOG_UNIT) != "active":
+        raise RuntimeError("ACPI write refused: start dgx-fan-watchdog.service first")
+    AcpiThermalGuard(read_defaults())
+    record_acpi_boot(ACPI_HOLD_NAME)
+
+
+class AcpiThermalGuard:
+    """Independent ACPI emergency policy; does not change the true-zero policy.
+
+    Dependency injection keeps every destructive operation fake in tests.
+    Max fan level is latched until reboot. An incident persists across reboot
+    until manual reset. Verified stopped work and 30 seconds below MAX minus
+    hysteresis request a clean reboot, never an automatic workload restart.
+    """
+    def __init__(self, defaults, *, targets=None, send=None, hook=None, shutdown=None, reboot=None):
+        self.defaults = defaults
+        self.fan_c = self.number("ACPI_THERMAL_MAX_C", 80)
+        self.stop_c = self.number("ACPI_THERMAL_STOP_C", 85)
+        self.kill_c = self.number("ACPI_THERMAL_KILL_C", 90)
+        self.shutdown_c = self.number("ACPI_THERMAL_SHUTDOWN_C", 95)
+        self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
+        self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
+        self.kill_s = self.number("ACPI_THERMAL_KILL_SECONDS", 5)
+        self.cool_s = self.number("ACPI_THERMAL_COOL_SECONDS", 30)
+        self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
+        if not 35 <= self.fan_c < self.stop_c < self.kill_c < self.shutdown_c <= 100:
+            raise ValueError("ACPI thermal thresholds must satisfy 35 <= MAX < STOP < KILL < SHUTDOWN <= 100")
+        if not 0 < self.hysteresis < self.stop_c - self.fan_c:
+            raise ValueError("ACPI thermal hysteresis must be positive and less than STOP - MAX")
+        enabled = defaults.get("ACPI_THERMAL_SHUTDOWN", "yes").strip().lower()
+        if enabled not in ("yes", "no"):
+            raise ValueError("ACPI_THERMAL_SHUTDOWN must be yes or no")
+        self.shutdown_enabled = enabled == "yes"
+        self.targets = targets or self.discover_targets
+        self.send = send or self.signal_targets
+        self.hook = hook or self.start_hook
+        self.shutdown = shutdown or (lambda: run_watchdog_action(WATCHDOG_DEFAULT_ACTION))
+        self.reboot = reboot or (lambda: run_watchdog_action(WATCHDOG_REBOOT_ACTION))
+        self.discovery_complete = True
+        self.blocked_targets = set()
+        self.stage = "incident" if acpi_record_current(ACPI_INCIDENT_NAME) else "idle"
+        self.since = 0.0
+        self.cool_since = None
+        self.hook_process = None
+        self.selected = {}
+        self.max_logged = False
+        self.retired_hooks = []
+
+    def number(self, key, fallback):
+        value = float(self.defaults.get(key, fallback))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be finite and positive")
+        return value
+
+    def start_hook(self):
+        command = self.defaults.get("ACPI_THERMAL_STOP_HOOK", "").strip()
+        if not command:
+            return None
+        # As with the existing hooks, this is trusted root configuration.
+        # Asynchronous: a hung hook cannot block the thermal/true-zero poll.
+        return subprocess.Popen(shlex.split(command), start_new_session=True,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+    def finish_hook(self):
+        if self.hook_process is not None:
+            # Kill only the exact hook process via Popen's owned child handle.
+            # No process-group signaling: a hook may have started unrelated work.
+            if self.hook_process.poll() is None:
+                self.hook_process.kill()
+            self.retired_hooks.append(self.hook_process)
+            self.hook_process = None
+
+    @staticmethod
+    def identity(pid, proc_root=Path("/proc")):
+        """Return an identity only for a non-root, non-system workload process."""
+        ancestors = {os.getpid()}
+        parent = os.getppid()
+        while parent > 1 and parent not in ancestors:
+            ancestors.add(parent)
+            try:
+                text = (proc_root / str(parent) / "stat").read_text()
+                parent = int(text[text.rindex(")") + 2:].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+        if pid <= 1 or pid in ancestors:
+            return None
+        try:
+            base = proc_root / str(pid)
+            status = (base / "status").read_text()
+            uids = re.search(r"^Uid:\s+(.*)$", status, re.M)
+            if not uids or 0 in [int(v) for v in uids[1].split()]:
+                return None
+            stat_text = (base / "stat").read_text()
+            end = stat_text.rindex(")")
+            name = stat_text[stat_text.index("(") + 1:end]
+            fields = stat_text[end + 2:].split()
+            if fields[0] == "Z" or not (base / "cmdline").read_bytes():
+                return None
+            cgroup = (base / "cgroup").read_text()
+            if any(part in cgroup for part in ("/system.slice", "/init.scope")):
+                return None
+            critical = {"systemd", "init", "sshd", "dbus-daemon", "dbus-broker",
+                        "sudo", "login", "agetty", "polkitd", "NetworkManager",
+                        "dgx-fan-control", "nvidia-persist", "nvidia-persiste"}
+            if name in critical:
+                return None
+            # Linux stat field 22 (starttime); fields[0] is field 3.
+            return (int(fields[19]), name)
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def discover_targets(self):
+        candidates = set()
+        self.discovery_complete = True
+        self.blocked_targets = set()
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+                check=False)
+            if result.returncode != 0:
+                self.discovery_complete = False
+                LOG.error("ACPI thermal: nvidia-smi compute PID query failed: %s", result.stderr)
+            else:
+                for line in result.stdout.splitlines():
+                    value = line.strip()
+                    if value.isdigit():
+                        candidates.add(int(value))
+                    elif value:
+                        self.discovery_complete = False
+                        LOG.error("ACPI thermal: unparseable compute PID %r; recovery reboot inhibited", value)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self.discovery_complete = False
+            LOG.error("ACPI thermal: nvidia-smi unavailable or timed out: %s", exc)
+        for value in self.defaults.get("ACPI_THERMAL_PIDS", "").replace(",", " ").split():
+            if value.isdigit():
+                candidates.add(int(value))
+            else:
+                LOG.error("ACPI thermal: ignoring invalid PID %r", value)
+        names = set(self.defaults.get("ACPI_THERMAL_PROCESS_NAMES", "").replace(",", " ").split())
+        if names:
+            for path in Path("/proc").glob("[0-9]*"):
+                try:
+                    if (path / "comm").read_text().strip() in names:
+                        candidates.add(int(path.name))
+                except OSError:
+                    pass
+        # Explicit PID and process-name lists never bypass these exclusions.
+        found = {}
+        for pid in candidates:
+            identity = self.identity(pid)
+            if identity is not None:
+                found[pid] = identity
+            else:
+                if (Path("/proc") / str(pid)).exists():
+                    self.blocked_targets.add(pid)
+                LOG.warning("ACPI thermal: protected, exited, or unreadable PID %s; not signaling", pid)
+        return found
+
+    def signal_targets(self, targets, sig):
+        for pid, expected in targets.items():
+            fd = None
+            try:
+                # pidfds pin a process, preventing a PID-reuse race between
+                # inspection and signaling. No unsafe os.kill fallback.
+                fd = os.pidfd_open(pid)
+                if self.identity(pid) != expected:
+                    LOG.warning("ACPI thermal: PID %s changed/protected; skipped", pid)
+                    continue
+                signal.pidfd_send_signal(fd, sig)
+                LOG.critical("ACPI thermal: sent %s to workload PID %s", sig.name, pid)
+            except (OSError, AttributeError) as exc:
+                LOG.error("ACPI thermal: cannot safely signal PID %s: %s", pid, exc)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+    def step(self, hot, now, force_max):
+        snapshot = None
+        def targets():
+            # One bounded compute query per poll, even when a hot sample
+            # preempts several stages. Every signal still rechecks identity.
+            nonlocal snapshot
+            if snapshot is None:
+                snapshot = self.targets()
+            return dict(snapshot)
+
+        self.retired_hooks = [p for p in self.retired_hooks if p.poll() is None]
+        if hot is None or not math.isfinite(hot):
+            LOG.critical("ACPI thermal: hottest zone unreadable; escalating conservatively")
+            hot = self.shutdown_c
+        if hot >= self.fan_c:
+            # The latch is persisted BEFORE the writes. A failed/partial write
+            # is retried next poll; no lower-level writer can undo escalation.
+            try:
+                record_acpi_boot(ACPI_MAX_NAME)
+            except (OSError, RuntimeError) as exc:
+                LOG.critical("ACPI thermal: cannot persist maximum latch: %s", exc)
+            try:
+                force_max()
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.critical("ACPI thermal: level 100 request failed: %s", exc)
+            if not self.max_logged:
+                LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; forcing level 100; EC curve remains replaced", hot, self.fan_c)
+                self.max_logged = True
+        if hot < self.fan_c - self.hysteresis:
+            if self.cool_since is None:
+                self.cool_since = now
+            if (now - self.cool_since >= self.cool_s
+                    and self.stage not in ("idle", "reboot", "shutdown")
+                    and acpi_record_current(ACPI_INCIDENT_NAME)):
+                remaining = targets()
+                survivors = any(self.identity(p) == ident for p, ident in self.selected.items())
+                if not remaining and not survivors and not self.blocked_targets and self.discovery_complete:
+                    self.finish_hook()
+                    LOG.critical("ACPI thermal: workload stopped and hottest zone below %.1fC for %.0fs; running systemctl reboot to restore EC control; incident remains latched", self.fan_c - self.hysteresis, self.cool_s)
+                    if self.reboot() == 0:
+                        self.stage = "reboot"
+                    else:
+                        LOG.critical("ACPI thermal: recovery reboot failed; retrying while cool")
+        else:
+            self.cool_since = None
+        if self.stage in ("incident", "reboot") and hot >= self.stop_c:
+            self.stage = "idle"
+        if self.stage == "idle" and hot >= self.stop_c:
+            try:
+                record_acpi_boot(ACPI_INCIDENT_NAME)
+            except (OSError, RuntimeError) as exc:
+                LOG.critical("ACPI thermal: cannot persist incident; recovery reboot inhibited: %s", exc)
+            LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; stopping load", hot, self.stop_c)
+            self.since = now
+            self.stage = "hook"
+            try:
+                self.hook_process = self.hook() if hot < self.kill_c else None
+            except (OSError, ValueError) as exc:
+                LOG.error("ACPI thermal: stop hook could not start: %s", exc)
+                self.hook_process = None
+        if self.stage == "hook":
+            failed = self.hook_process is None or self.hook_process.poll() not in (None, 0)
+            if failed or now - self.since >= self.hook_s or hot >= self.kill_c:
+                self.finish_hook()
+                # A successful hook gets its grace; cooling below STOP minus
+                # hysteresis suppresses further intervention, not the max latch.
+                if failed or hot >= self.stop_c - self.hysteresis:
+                    self.selected = targets()
+                    LOG.critical("ACPI thermal: hook absent/failed or insufficient cooling; SIGTERM workload targets")
+                    self.send(self.selected, signal.SIGTERM)
+                    self.stage, self.since = "term", now
+                else:
+                    self.stage = "cooling"
+        if self.stage == "cooling" and hot >= self.stop_c:
+            self.selected = targets()
+            self.send(self.selected, signal.SIGTERM)
+            self.stage, self.since = "term", now
+        if self.stage == "term" and (now - self.since >= self.term_s or hot >= self.kill_c):
+            live = targets()
+            survivors = {p: ident for p, ident in self.selected.items()
+                         if self.identity(p) == ident}
+            if survivors or hot >= self.stop_c - self.hysteresis:
+                # Include newly spawned compute jobs, but recheck every identity.
+                live.update(survivors)
+                self.selected = live
+                LOG.critical("ACPI thermal: load survived or insufficient cooling; SIGKILL workload targets")
+                self.send(live, signal.SIGKILL)
+                self.stage, self.since = "kill", now
+        if self.stage == "kill" and (hot >= self.shutdown_c or
+                (now - self.since >= self.kill_s and hot >= self.stop_c - self.hysteresis)):
+            if self.shutdown_enabled:
+                LOG.critical("ACPI thermal: cooling failed after SIGKILL (%.1fC); running systemctl poweroff", hot)
+                status = self.shutdown()
+                if status != 0:
+                    LOG.critical("ACPI thermal: poweroff failed (%s); will retry next poll", status)
+                else:
+                    self.stage = "shutdown"
+            elif self.stage != "disabled":
+                LOG.critical("ACPI thermal: shutdown explicitly disabled; machine remains hot at %.1fC", hot)
+                self.stage = "disabled"
+
+
+def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WATCHDOG_ZERO_FAN_CELSIUS):
+    if not acpi_record_current(ACPI_HOLD_NAME):
+        return
+    if classify_fan_binding(thermal_root, hwmon_root) == "unsupported":
+        return
+    # Preserve the existing true-zero 85 C path and its precedence. This policy
+    # covers spinning/unknown fans; the old watchdog handles verified 0/0.
+    try:
+        rpms = read_named_fan_rpms(hwmon_root)
+        true_zero = rpms is not None and len(rpms) >= 2 and all(r == 0 for r in rpms)
+    except (OSError, RuntimeError, ValueError):
+        true_zero = False
+    try:
+        hot = read_hottest_temperature_c(thermal_root)
+    except (OSError, RuntimeError, ValueError):
+        hot = None
+
+    if true_zero and hot is not None and hot >= zero_fan_celsius:
+        return
+
+    def force_max():
+        devices = acpi_fan_devices(thermal_root)
+        if not devices:
+            raise RuntimeError("no ACPI Fan cooling devices")
+        failures = []
+        for device in devices:
+            try:
+                if (device / "cur_state").read_text().strip() != "100":
+                    write_acpi_fan_level(device, ACPI_MAX_LEVEL)
+            except (OSError, RuntimeError, ValueError) as exc:
+                failures.append(f"{device.name}: {exc}")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+    guard.step(hot, now, force_max)
+
+
 def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
                   module_loaded: bool | None = None,
                   service_active: str | None = None,
@@ -4388,6 +4813,8 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
     devices = acpi_fan_devices(thermal_root)
     if not devices:
         raise RuntimeError("no ACPI Fan cooling device found")
+
+    arm_acpi_monitor(thermal_root)
 
     def fail_hot() -> None:
         if level == ACPI_MAX_LEVEL:
@@ -4437,6 +4864,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("acpi-incident-reset", help="after reboot and cooling, explicitly release the incident startup inhibit")
     daemon = subparsers.add_parser("daemon", help="run the smooth performance curve")
     daemon.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
     daemon.add_argument(
@@ -4447,7 +4875,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watchdog = subparsers.add_parser(
         "watchdog",
-        help="alert if ACPI fans stay at 0 RPM; power off only if that stop is also hot",
+        help="watch true-zero stalls and armed ACPI thermal escalation",
     )
     watchdog.add_argument("--poll-seconds", type=float, default=WATCHDOG_POLL_SECONDS)
     watchdog.add_argument("--zero-seconds", type=float, default=WATCHDOG_ZERO_SECONDS)
@@ -4563,6 +4991,11 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "acpi-incident-reset":
+            reset_acpi_incident(args.thermal_root)
+            return 0
+        if args.command == "set-state" and acpi_incident_latched():
+            raise RuntimeError("ACPI thermal incident latched; run acpi-incident-reset after reboot first")
         if args.command == "daemon":
             return run_daemon(
                 args.thermal_root, args.poll_seconds, args.hwmon_root, args.curve,

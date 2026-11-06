@@ -2,6 +2,7 @@
 """ACPI-only module toggle, using a temporary etc tree and a fake runner."""
 
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,6 +11,14 @@ from test_fan_control_contract import CONTROL
 
 class ModuleModeTests(unittest.TestCase):
     def setUp(self):
+        arm = patch.object(CONTROL, "arm_acpi_monitor")
+        arm.start()
+        self.addCleanup(arm.stop)
+        state = TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        isolated = patch.object(CONTROL, "STALL_MARKER_DIR", Path(state.name))
+        isolated.start()
+        self.addCleanup(isolated.stop)
         self.temp = TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.etc = Path(self.temp.name)

@@ -39,6 +39,15 @@ def run_cli(argv):
 
 
 class UserlandFailureTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name, value in (("arm_acpi_monitor", lambda *a, **kw: None),
+                            ("STALL_MARKER_DIR", Path(tmp.name) / "state")):
+            mocked = patch.object(CONTROL, name, value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+
     def test_invalid_temperatures_are_rejected(self):
         for temperature in (0, -1, math.nan, math.inf, -math.inf):
             with self.subTest(temperature=temperature):

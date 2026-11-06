@@ -4,6 +4,7 @@ import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 _loader = importlib.machinery.SourceFileLoader(
@@ -21,6 +22,7 @@ class FakeSpark:
         self.cooler.mkdir(parents=True)
         (self.cooler / "type").write_text("Fan\n")
         (self.cooler / "cur_state").write_text("100\n")
+        (self.cooler / "max_state").write_text("100\n")
         zone = self.thermal / "thermal_zone0"
         zone.mkdir()
         (zone / "temp").write_text(f"{temp_mc}\n")
@@ -42,6 +44,12 @@ class SweepTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.spark = FakeSpark(Path(self.tmp.name))
         self.lines = []
+        ctl = sweep_mod.controller()
+        for name, value in (("arm_acpi_monitor", lambda *a, **kw: None),
+                            ("STALL_MARKER_DIR", Path(self.tmp.name) / "state")):
+            mocked = patch.object(ctl, name, value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -57,10 +65,10 @@ class SweepTests(unittest.TestCase):
 
     def test_full_sweep_restores_100(self):
         seen = []
-        code = self.run_sweep([40, 35, 30],
+        code = self.run_sweep([40, 35, 36],
                               sleep=lambda _: seen.append(self.spark.level()))
         self.assertEqual(code, 0)
-        self.assertEqual(seen, [40] * 3 + [35] * 3 + [30] * 3)
+        self.assertEqual(seen, [40] * 3 + [35] * 3 + [36] * 3)
         self.assertEqual(self.spark.level(), 100)
         self.assertIn("restored", self.lines[-1])
 
@@ -68,11 +76,11 @@ class SweepTests(unittest.TestCase):
         def sleep(_):
             if self.spark.level() == 35:
                 (self.spark.fans[1] / "fan1_input").write_text("0\n")
-        code = self.run_sweep([40, 35, 30], sleep=sleep)
+        code = self.run_sweep([40, 35, 36], sleep=sleep)
         self.assertEqual(code, 2)
         self.assertEqual(self.spark.level(), 100)
         self.assertTrue(any("ABORT fan 2 reads 0 RPM" in l for l in self.lines))
-        self.assertFalse(any(l.startswith("T,30,") for l in self.lines))
+        self.assertFalse(any(l.startswith("T,36,") for l in self.lines))
 
     def test_missing_reading_aborts(self):
         (self.spark.fans[0] / "fan1_input").unlink()
@@ -97,8 +105,8 @@ class SweepTests(unittest.TestCase):
             self.run_sweep([40], sleep=sleep)
         self.assertEqual(self.spark.level(), 100)
 
-    def test_refuses_below_30_and_zero_before_writing(self):
-        for bad in ([29], [40, 20], [0], [101]):
+    def test_refuses_below_35_and_zero_before_writing(self):
+        for bad in ([34], [30], [40, 20], [0], [101]):
             with self.assertRaises(ValueError):
                 self.run_sweep(bad)
             self.assertEqual(self.spark.level(), 100)
@@ -128,7 +136,7 @@ class SweepTests(unittest.TestCase):
         (telem / "name").write_text("dgx_ec_fan\n")
         # ACPI Fan cooler already exists; no dgx_ec_fan_floor device.
         with self.assertRaises(RuntimeError) as caught:
-            self.run_sweep([40, 35, 30])
+            self.run_sweep([40, 35, 36])
         self.assertIn("telemetry only, nothing written", str(caught.exception))
         self.assertEqual(self.spark.level(), 100)
         self.assertEqual(self.lines, [])

@@ -6,19 +6,22 @@ Run as root on EC 3.5.8, at idle, with dgx_ec_fan_control unloaded and
 dgx-fan-control.service stopped. EC 3.13.7 ignores ACPI fan levels, so the
 script refuses before any write when dgx_ec_fan is present without
 dgx_ec_fan_floor, or when the kernel log from this boot shows the module
-pinned EC 3.13.7. If the module never loaded this boot, it cannot tell.
+pinned EC 3.13.7. The shared writer additionally requires a positive
+EC 3.5.8 identification from the kernel log or ESRT before arming protection.
 
 Steps every ACPI Fan cooling device through the given levels (default
-40 35 30), holds each one, and logs every fan tachometer plus the hottest
+40 35), holds each one, and logs every fan tachometer plus the hottest
 thermal zone each interval. It stops and writes level 100 at once if any fan
 reads 0 or is missing, a fan falls below --min-rpm, the hottest zone reaches
 --max-temp, or the run is interrupted. It always writes level 100 when it
-finishes. It never writes a level below 30, its own limit for a supervised
-run, and never writes 0. Outside this script, 35 is the lowest level to use.
+finishes. It never writes a level below 35 or writes 0. The independent
+watchdog must be running; protection continues after this script exits.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
+import importlib.util
 import datetime as dt
 import os
 import re
@@ -28,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-HARD_MIN_LEVEL = 30
+HARD_MIN_LEVEL = 35
 RESTORE_LEVEL = 100
 ACPI_COOLING_TYPE = "Fan"
 ACPI_FAN_NAME = "acpi_fan"
@@ -40,6 +43,22 @@ TELEMETRY_ONLY_MESSAGE = (
     "telemetry only, nothing written; EC runs its own curve "
     "(dgx_ec_fan present without dgx_ec_fan_floor)"
 )
+
+
+_CONTROLLER = None
+
+
+def controller():
+    global _CONTROLLER
+    if _CONTROLLER is None:
+        source = Path(__file__).resolve().parents[1] / "userspace/dgx_fan_control.py"
+        if not source.is_file():
+            source = Path("/usr/local/sbin/dgx-fan-control")
+        loader = importlib.machinery.SourceFileLoader("dgx_acpi_controller", str(source))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        _CONTROLLER = importlib.util.module_from_spec(spec)
+        loader.exec_module(_CONTROLLER)
+    return _CONTROLLER
 
 
 def utc_now() -> str:
@@ -131,7 +150,7 @@ def write_level(devices: list[Path], level: int) -> list[str]:
         raise ValueError("refusing ACPI level 0: it stops both fans")
     results = []
     for device in devices:
-        (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
+        controller().write_acpi_fan_level(device, level)
         results.append(f"{device.name}={read_text(device / 'cur_state')}")
     return results
 
@@ -169,6 +188,7 @@ def sweep(levels: list[int], hold: float, interval: float, min_rpm: int,
     fans = fan_devices(hwmon_root)
     if not fans:
         raise RuntimeError("no acpi_fan tachometer found")
+    controller().arm_acpi_monitor(thermal_root, hwmon_root)
     header = "time_utc,level," + ",".join(
         f"fan{i}_rpm" for i in range(1, len(fans) + 1)) + ",hottest_c,event"
     log(header)
@@ -232,7 +252,7 @@ def preflight(thermal_root: Path | None = None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("levels", nargs="*", type=int, default=[40, 35, 30])
+    parser.add_argument("levels", nargs="*", type=int, default=[40, 35])
     parser.add_argument("--hold", type=float, default=180.0,
                         help="seconds at each level (default 180)")
     parser.add_argument("--interval", type=float, default=1.0)

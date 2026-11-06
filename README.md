@@ -1,5 +1,22 @@
 # DGX Spark Fan Control
 
+> **EC 3.5.8 ACPI warning:** any ACPI hold replaces the EC curve until
+> reboot; level 100 is only about 48%/32% duty, not full fan speed. On
+> kensaki (rig off), 100 held 4320/4320 RPM at a hottest zone of 95–97.7 C
+> and SoC 96–97 C, versus the stock curve's 4860/7290 by about 94.5 C,
+> 6660/9990 at about 95 C, and 88.8–89.7 C settled. Do not hold ACPI under
+> sustained full load. The independent watchdog now forces 100/warns at
+> 80 C, stops work via hook/SIGTERM at 85 C, kills at 90 C (or timeout),
+> and powers off at 95 C (or post-kill cooling timeout). Successful
+> stopped/cool recovery requests a clean reboot, not a workload restart.
+> An incident stays latched across reboot until explicit manual reset.
+> Read [escalation, recovery, configuration, and safeguards](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
+> The burn view's GPU temperature can read about 10 C below the hottest
+> zone. `acpi-floor-sweep --max-temp` defaults to 60 C; supervised burns
+> must raise it (for example `--max-temp 95`), without bypassing escalation.
+> The 85 C true-zero fan poweroff remains separate and unchanged.
+
+
 **Pre-cool your Spark, run your job, return to NVIDIA's fan curve.**
 
 Control a shared minimum fan RPM from Linux userland, or run a temperature-based
@@ -171,10 +188,11 @@ the module is unloaded, or the module's maximum state if it is loaded. It
 never writes level 0. About 60 seconds after the zeros began, with no work
 in progress, it reboots once. The default signal is an `nvidia-smi` compute
 process, and only when `BUSY_CHECK` is unset. A persistent server keeps that
-default busy, so the reboot stays deferred and only a true zero at 85°C
-powers the machine off. A second boot that is still at 0 RPM powers off.
+default busy, so the legacy stall reboot stays deferred; its 85°C poweroff
+requires a true zero. ACPI holds additionally arm the separate escalation
+policy described above. A second boot that is still at 0 RPM powers off.
 Work in progress waits, and a true zero at 85°C still powers off. Spinning
-fans are not powered off for temperature. A foreign floor reboots once the
+fans on an unarmed stock curve are not powered off for temperature. A foreign floor reboots once the
 same way, without the repair; the next boot records needs-intervention
 instead of powering off. `dgx-fan-health.service` checks
 fans and thermals after boot and retries for 45 seconds.

@@ -394,3 +394,17 @@ validate that path on both Sparks, but do not establish the historical trigger.
   force an immediate return to idle RPM.
 - Some investigated boots had an unavailable secure eSPI transport. See the
   [troubleshooting guide](troubleshooting.md) before attempting recovery.
+
+## ACPI load hold, November 6, 2026
+
+On kensaki with EC 3.5.8, rig off, and `gpu_burn` (1:18–1:27 PM PST), ACPI
+100 held 4320/4320 RPM through hottest-zone readings of 95–97.7 C. Fanwatch
+read SoC 96–97 C for about 15 seconds with no fan override. The stock EC
+curve had reached 4860/7290 by about 94.5 C and 6660/9990 at about 95 C,
+then settled at 88.8–89.7 C. Stopping writes did not restore that curve;
+see the earlier failed restoration/reboot observations above. Level 100 is
+about 48%/32% of 9000/13500 RPM. The burn view's GPU reading was about 10 C
+below the hottest zone. These observations motivated the separate
+[ACPI thermal escalation and recovery policy](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
+The implementation is tested with mocked thermal, process, hook, and
+power-action interfaces; it has not been hardware-validated by those tests.

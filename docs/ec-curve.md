@@ -150,15 +150,162 @@ unloaded and `dgx-fan-control.service` stopped:
 ```
 sudo systemctl stop dgx-fan-control.service
 sudo modprobe -r dgx_ec_fan_control
-sudo scripts/acpi-floor-sweep 40 35 30
+sudo systemctl start dgx-fan-watchdog.service
+sudo scripts/acpi-floor-sweep 40 35
 ```
 
 It holds each level for 180 seconds and logs both fans and the hottest zone
 every second to a CSV. It writes level 100 at once if a fan reads 0 or is
 missing, a fan drops below 1000 RPM, the hottest zone reaches 60 C, or the run
 is interrupted, and it always writes 100 when it finishes. It never writes a
-level below 30, its own limit for a supervised run; outside it, 35 is the
-lowest level to use. EC 3.13.7 ignores ACPI fan levels, so the script refuses
+level below 35, the lowest level to use. EC 3.13.7 ignores ACPI fan levels, so the script refuses
 before any write when `dgx_ec_fan` is present without `dgx_ec_fan_floor`, or
-when this boot's kernel log shows the module pinned EC 3.13.7. If the module
-never loaded this boot, it cannot tell.
+when this boot's kernel log shows the module pinned EC 3.13.7. The shared
+writer also requires positive 3.5.8 identification from the kernel log or
+ESRT and an active independent watchdog; unknown firmware is refused.
+
+## EC 3.5.8: ACPI holds replace the stock curve
+
+**Do not hold an ACPI level under sustained full load. Level 100 is not
+full fan speed, and stopping writes does not restore the EC curve.** Treat
+any ACPI write on 3.5.8 as a persistent replacement of the EC curve until
+reboot. There is no verified live ACPI-to-EC handback; see
+[recorded restoration failures](validation.md).
+
+On kensaki on November 6, 2026 (1:18–1:27 PM PST), with EC 3.5.8, the rig
+off, and `gpu_burn` running, ACPI 100 held both fans at **4320/4320 RPM**
+while the hottest zone reached **95–97.7 C**. Fanwatch read **96–97 C SoC**
+for about 15 seconds without an EC override. At 9000/13500 RPM full scale,
+4320/4320 is about **48%/32% duty**, not the stock curve's top step.
+Without ACPI writes, that Spark reached **4860/7290 RPM by about 94.5 C**,
+then **6660/9990 at about 95 C**, and settled at **88.8–89.7 C**.
+These are measured runs, not a promise that every machine has the same
+thresholds or sensor offsets. The burn view's GPU temperature can read
+about **10 C below the hottest thermal zone**.
+
+The independent `dgx-fan-watchdog.service` now monitors this project's ACPI
+holds even after the writing command exits. Both `acpi-max` (including
+stall repair) and `scripts/acpi-floor-sweep` arm a boot-scoped hold record
+**before** writing. They refuse without an active watchdog, with invalid
+thermal configuration, or without positive EC 3.5.8 identification from the
+kernel's pinned version or the EC's ESRT GUID/version. EC 3.13.7 remains
+telemetry-only: no ACPI write. The minimum is **35**, including the sweep;
+34 is refused. ACPI 0 is never a release value and must never be written.
+Install the updated userland and restart the watchdog before using these
+commands; merely running an older watchdog is not protection. Direct sysfs
+writes and other writers outside this project are not tracked or interlocked.
+
+### Escalation and recovery
+
+All thresholds refer to the **hottest thermal zone**, never the burn view:
+
+1. **80 C:** force level 100 on every ACPI Fan cooler that is not already
+   at 100, log at critical severity, and latch 100 until reboot. Lower-level
+   writes from this project are then refused, including another sweep.
+2. **85 C:** persist an incident latch and start the optional stop hook
+   asynchronously. With no hook, a start failure, or a failed hook, send
+   SIGTERM to eligible workload processes immediately. Otherwise allow
+   **10 seconds** for the hook to cool the hottest zone below **83 C**;
+   if it does not, send SIGTERM. A timed-out hook is killed without waiting
+   for it. There is no workload restart or resume action.
+3. **90 C:** preempt the hook and all SIGTERM grace, and send SIGKILL.
+   Otherwise, after **10 seconds** following SIGTERM, send SIGKILL if a
+   selected process is still alive or the hottest zone remains at least
+   **83 C**. Newly discovered compute processes are included.
+4. **95 C**, or still at least **83 C** **5 seconds** after SIGKILL:
+   request clean shutdown with `systemctl poweroff`. At 95 C the stop/kill
+   stages and shutdown execute in the same poll without waiting for graces.
+   Failed shutdown requests are logged and retried. Shutdown is enabled
+   unless explicitly disabled in configuration. An unreadable hottest zone
+   while an ACPI hold is armed is treated conservatively as the final
+   threshold; this can stop work and shut down the machine.
+5. **Successful recovery:** once the hottest zone stays below **78 C**
+   continuously for **30 seconds**, verify there are no remaining selected,
+   GPU-compute, or configured target processes, no protected live targets,
+   and no failed/ambiguous compute query. Then request `systemctl reboot`
+   to restore EC control. Failed recovery reboots are retried while cool;
+   continued heat still takes the shutdown path. This is not a re-arm rule. During a latched incident, legacy cold-stall/foreign-floor reboot paths cannot bypass this recovery verification; the hot true-zero shutdown still takes precedence.
+
+The incident latch survives reboot. It inhibits `acpi-max`, the sweep,
+stall-repair ACPI writes, daemon curve startup, boot restoration of a manual
+floor, and `set-state`. After the reboot, inspect cooling and explicitly run:
+
+```sh
+sudo dgx-fan-control acpi-incident-reset
+```
+
+Reset refuses in the incident/ACPI-hold boot or unless the hottest zone is
+below MAX minus HYSTERESIS (78 C by default). It writes no fan level and
+starts no service or job. `automatic` does not clear this latch. Existing
+external workload/service restart policies are outside this tool: configure
+those policies or the stop hook to respect `/var/lib/dgx-fan-control/acpi-incident`
+if they must remain stopped across reboot. The fan tool itself never starts
+or resumes a workload.
+
+Defaults are deliberately early: on kensaki the hottest zone rose about
+**0.07 C/s between 88 and 95 C** under `gpu_burn`, while others reported
+faster **90 → 98 → power-cut** ramps. One burn does not establish safe
+timing. Userspace polling, process discovery, systemd, and shutdown latency
+cannot guarantee protection against a rapid hardware trip.
+
+The existing **85 C true-zero fan poweroff is separate and unchanged**.
+This new policy applies only after a project ACPI write; ordinary spinning
+fans on the stock EC curve do not arm it. The old true-zero hot shutdown
+retains precedence over hook/process probing. Invalid new thermal settings
+refuse new ACPI holds; the watchdog logs the error and uses safe thermal
+defaults rather than abandoning its true-zero monitoring.
+
+### Configuration and process safeguards
+
+Set these in `/etc/default/dgx-fan-control`, then restart
+`dgx-fan-watchdog.service`. They are root configuration, not environment
+variables. Existing installations keep their defaults file; add new keys
+explicitly when customizing. Missing keys use these defaults:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ACPI_THERMAL_MAX_C` | `80` | Force and latch level 100 |
+| `ACPI_THERMAL_STOP_C` | `85` | Hook/SIGTERM threshold |
+| `ACPI_THERMAL_KILL_C` | `90` | Immediate SIGKILL threshold |
+| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Immediate post-kill shutdown threshold |
+| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Hook cooling grace |
+| `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace |
+| `ACPI_THERMAL_KILL_SECONDS` | `5` | Post-kill cooling grace |
+| `ACPI_THERMAL_COOL_SECONDS` | `30` | Continuous cool verification before recovery reboot |
+| `ACPI_THERMAL_HYSTERESIS_C` | `2` | STOP minus this is adequate emergency cooling; MAX minus this is recovery/reset temperature |
+| `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this new shutdown stage, not true-zero poweroff or recovery reboot |
+| `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable/script plus arguments, parsed with `shlex`, **not a shell expression** |
+| `ACPI_THERMAL_PIDS` | empty | Additional comma/space-separated PIDs |
+| `ACPI_THERMAL_PROCESS_NAMES` | empty | Additional comma/space-separated exact Linux `comm` names (normally at most 15 characters) |
+
+All numeric settings must be finite and positive. Thresholds must satisfy
+`35 <= MAX < STOP < KILL < SHUTDOWN <= 100`; hysteresis must be less than
+STOP minus MAX. Temperature stages preempt grace periods.
+
+Default targets come from
+`nvidia-smi --query-compute-apps=pid --format=csv,noheader`, the same query
+already used by the repository's GPU-job check, with a two-second timeout.
+Missing/failing `nvidia-smi` is logged; configured targets still apply, but
+recovery reboot is inhibited until the workload-stop query can be verified.
+No hardware query was performed as part of the mocked tests.
+
+Signals are sent only through Linux pidfds after rechecking process start
+identity and safeguards. There is no unsafe numeric-PID signaling fallback.
+PID 1, this process and its ancestors, root-credential processes, kernel
+threads, zombies, unreadable processes, recognized critical process names,
+and `/system.slice/` or `/init.scope` processes are excluded. Explicit PID
+or name configuration cannot override these exclusions. This deliberately
+also excludes root-run/container-root GPU jobs and system services: use a
+trusted stop hook for them; otherwise the final shutdown is the fallback.
+A hook runs asynchronously as a direct child executable with arguments, not
+through a shell; its own child handle may be killed at the hook deadline.
+It must return promptly and clean up its own descendants. A hook that needs
+shell syntax should be an administrator-maintained script. The watchdog's
+existing sandbox still applies (for example, home directories are hidden).
+
+`acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
+must explicitly raise it, for example `--max-temp 95`; that changes only
+the sweep abort, **not** the thermal escalation thresholds. The sweep's
+exit/abort writes 100; it neither stops the burn nor restores automatic
+control. Raising `--max-temp` is not permission to hold ACPI under full load.
+The 85/90 C load-stop defaults intentionally interrupt such a burn.

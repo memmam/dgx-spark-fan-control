@@ -1,6 +1,7 @@
 # /etc/default/dgx-fan-control
 # Optional settings for the fan watchdog and the post-boot health check.
-# Both checks stay fan and thermal unless you set a command here.
+# Stock-curve checks observe fans/thermals. ACPI holds additionally arm
+# workload-stop and power actions, even without a configured stop hook.
 # This file is root configuration. The commands run as root.
 
 # Command whose standard input is the health summary. Empty disables it.
@@ -17,8 +18,8 @@ READY_CHECK=
 # Command whose exit 0 means work is in progress, so do not reboot.
 # A failure or timeout counts as busy. Empty uses nvidia-smi compute apps.
 # A persistent model server always shows a compute process, so with that
-# default a stalled-fan reboot stays deferred and only the 85 C poweroff
-# protects the machine. The deferral limit below raises an alert; it still
+# default a stalled-fan reboot stays deferred; the true-zero 85 C cutoff
+# still applies. ACPI writes additionally arm the escalation settings below. The deferral limit below raises an alert; it still
 # does not reboot through work. Prefer a command that measures in-flight
 # requests.
 BUSY_CHECK=
@@ -61,3 +62,25 @@ STUCK_SECONDS=600
 # This is the kernel cooling state, not an ACPI level. Do not set 0.
 MANUAL_STATE=
 
+
+# EC 3.5.8 ACPI emergency protection; independent of the true-zero 85 C rule.
+# All temperatures are the hottest thermal zone. See docs/ec-curve.md.
+# Restart dgx-fan-watchdog.service after changing these values.
+ACPI_THERMAL_MAX_C=80
+ACPI_THERMAL_STOP_C=85
+ACPI_THERMAL_KILL_C=90
+ACPI_THERMAL_SHUTDOWN_C=95
+ACPI_THERMAL_HOOK_SECONDS=10
+ACPI_THERMAL_TERM_SECONDS=10
+ACPI_THERMAL_KILL_SECONDS=5
+ACPI_THERMAL_COOL_SECONDS=30
+ACPI_THERMAL_HYSTERESIS_C=2
+# Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
+ACPI_THERMAL_SHUTDOWN=yes
+# Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
+# A successful cool recovery reboots; jobs are never restarted by this tool.
+# Incident latch survives reboot; reset explicitly with acpi-incident-reset.
+ACPI_THERMAL_STOP_HOOK=
+# These additional targets never bypass root/system-process exclusions.
+ACPI_THERMAL_PIDS=
+ACPI_THERMAL_PROCESS_NAMES=
