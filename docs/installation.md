@@ -205,7 +205,7 @@ sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
 
-Status must start with **`state=0/12 (no floor; EC curve)`**: the device was
+Status must start with **`state=0/12 (daemon not setting a floor; EC's own curve)`**: the device was
 found and its added floor is unset. That is NVIDIA's curve, not fans stopped.
 On EC 3.13.7, status may instead print
 `control unsupported on this firmware`: telemetry is up and floor writes were

@@ -1820,6 +1820,51 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn("Permission denied", combined)
             self.assertFalse(state.exists())
 
+    def test_plain_health_as_root_does_not_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            old = (
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-old\ntime=not-a-time\n"
+                "reason=workload not ready\n"
+            )
+            CONTROL.write_state_text(health, old)
+
+            def run(argv):
+                with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                     patch.object(CONTROL.os, "geteuid", return_value=0), \
+                     patch.object(CONTROL, "read_boot_id", return_value="boot-now"), \
+                     patch.object(CONTROL, "read_kernel_log", return_value=""), \
+                     patch.object(
+                         CONTROL, "read_daemon_facts",
+                         return_value=("inactive", "disabled", None, None, None),
+                     ), \
+                     patch.object(
+                         CONTROL, "watchdog_unit_state",
+                         return_value=("active", "enabled"),
+                     ), \
+                     patch.object(CONTROL, "_module_loaded_now", return_value=True):
+                    return run_cli([
+                        "--thermal-root", str(root / "thermal"),
+                        "--hwmon-root", str(root / "hwmon"),
+                        *argv,
+                    ])
+
+            code, stdout, stderr = run(["health"])
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("recorded: yes", stdout)
+            self.assertEqual(health.read_text(encoding="ascii"), old)
+
+            code, stdout, stderr = run(["health", "--record"])
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertIn("recorded: yes", stdout)
+            self.assertIn("result=healthy", health.read_text(encoding="ascii"))
+
     def test_owned_floor_match_mismatch_and_missing_record(self):
         self.assertEqual(CONTROL.floor_matches_last_set(13500, (12, 13500)), "ours")
         self.assertEqual(
@@ -2311,7 +2356,7 @@ class UserlandFailureTests(unittest.TestCase):
             code, stdout, stderr = run_cli([*argv, "status"])
             self.assertEqual(code, 0)
             self.assertTrue(
-                stdout.startswith("state=0/12 (no floor; EC curve) hottest=50.0C\n")
+                stdout.startswith("state=0/12 (daemon not setting a floor; EC's own curve) hottest=50.0C\n")
             )
             self.assertEqual(stdout.count("watchdog-active:"), 1)
             self.assertEqual(stdout.count("watchdog-enabled:"), 1)

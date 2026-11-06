@@ -3616,7 +3616,7 @@ def format_cooling_status(state: int, hottest_c: float) -> str:
     """State 0 is the EC curve. The label says so, so it does not read as fans off."""
     text = f"state={state}/{MAX_STATE}"
     if state == 0:
-        text += " (no floor; EC curve)"
+        text += " (daemon not setting a floor; EC's own curve)"
     return f"{text} hottest={hottest_c:.1f}C"
 
 
@@ -4594,7 +4594,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.hwmon_root,
                 settle_seconds=args.settle,
                 poll_seconds=args.poll_seconds,
-                record=os.geteuid() == 0,
+                record=args.record and os.geteuid() == 0,
             )
             if record_denied and code == 0:
                 return 1

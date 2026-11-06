@@ -40,7 +40,7 @@ sudo journalctl -k -b | grep -E 'dgx|fan.floor|arm.ffa'
 ```
 
 `inactive` is expected if you chose factory-curve/manual-boost mode. In that
-mode, status should initially show `state=0/12 (no floor; EC curve)`. With the performance service
+mode, status should initially show `state=0/12 (daemon not setting a floor; EC's own curve)`. With the performance service
 enabled, the state follows temperature. Firmware updates also require this
 check: a successful kernel build does not prove a changed EC contract works.
 
@@ -75,7 +75,7 @@ before the new module can be loaded safely:
 ```sh
 sudo systemctl stop dgx-fan-control.service
 sudo dgx-fan-control automatic
-dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
+dgx-fan-control status                    # require state=0/12 (daemon not setting a floor; EC's own curve)
 sudo modprobe -r dgx_ec_fan_control
 git pull --ff-only
 ./scripts/check
@@ -159,7 +159,7 @@ sudo systemctl disable --now dgx-fan-health.service
 sudo systemctl disable --now dgx-fan-manual.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo dgx-fan-control automatic
-dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
+dgx-fan-control status                    # require state=0/12 (daemon not setting a floor; EC's own curve)
 sudo modprobe -r dgx_ec_fan_control
 ```
 

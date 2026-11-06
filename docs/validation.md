@@ -70,11 +70,11 @@ Recheck, on each Spark, after installing this command and module:
 1. If `systemctl is-enabled dgx-fan-control.service` is already `enabled`
    from the previous `module enable`, run `sudo systemctl disable --now
    dgx-fan-control.service` once. After that, `module enable` must leave it
-   `disabled`. `dgx-fan-control status` shows `state=0/12 (no floor; EC curve)`
+   `disabled`. `dgx-fan-control status` shows `state=0/12 (daemon not setting a floor; EC's own curve)`
    when the module is loaded and the service is stopped.
 2. With the service stopped, `sudo dgx-fan-control set-state 6`, read both
    `fan*_input` values, then `sudo dgx-fan-control automatic`. Status returns
-   to `state=0/12 (no floor; EC curve)`.
+   to `state=0/12 (daemon not setting a floor; EC's own curve)`.
 3. `sudo dgx-fan-control acpi-max` while the module is still loaded exits
    nonzero and does not change `cur_state`. Then `sudo dgx-fan-control module
    disable` and `sudo dgx-fan-control acpi-max` (level 100). Fans should move

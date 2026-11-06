@@ -95,7 +95,7 @@ sudo dgx-fan-control automatic
 dgx-fan-control status
 ```
 
-Expect **`state=0/12 (no floor; EC curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` also clears the persisted manual floor. Leave the service stopped to retain the curve. Enabling the service is a separate command; `module enable` does not do it.
+Expect **`state=0/12 (daemon not setting a floor; EC's own curve)`**. That is NVIDIA's curve, not fans stopped. `automatic` also clears the persisted manual floor. Leave the service stopped to retain the curve. Enabling the service is a separate command; `module enable` does not do it.
 On EC 3.13.7 telemetry-only there is no floor to clear in sysfs, so `automatic` is a no-op that still clears a stale last-set record and exits 0.
 Firmware hysteresis can keep fans fast for a while after the floor is removed.
 
@@ -230,7 +230,7 @@ On EC 3.5.8 with October SoC `0x02009e0f`, module floors go well above the
 ACPI ceiling of about 4320 RPM (level 100). With the daemon stopped,
 `set-state 6` measured about 7560/7155 RPM. State 12 writes floor `0x34bc`
 (13500) and was louder than ACPI level 100. The idle curve on that pair was
-about 2700/4050 RPM, which is what `state=0/12 (no floor; EC curve)` means.
+about 2700/4050 RPM, which is what `state=0/12 (daemon not setting a floor; EC's own curve)` means.
 State 0 is not fans off. ACPI level 0 is fans off. Do not write ACPI level 0.
 
 ### EC 3.13.7 (unverified, and likely unused)
@@ -566,9 +566,10 @@ is one journal line naming the failing checks. `--record` writes
 needs-intervention flag, the stall marker, and the watchdog-reboot marker.
 If this boot followed a watchdog reboot that has not been announced yet, it
 also logs and broadcasts `recovered after watchdog reboot` once. On failure
-it writes the needs-intervention flag. It does not reboot. Root, including
-`sudo dgx-fan-control health`, records the same way. `--record` without root
-prints that it requires root and still prints the checks. It does not write.
+it writes the needs-intervention flag. It does not reboot. Only `--record`
+writes; `sudo dgx-fan-control health` without it prints `recorded: no`.
+`--record` without root prints that it requires root and still prints the
+checks. It does not write.
 
 The checks above are this run. The stored lines underneath are the last
 recorded file, which a plain `health` does not rewrite. `recorded: no` means

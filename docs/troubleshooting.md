@@ -381,7 +381,7 @@ state, remove the driver's pending check, or submit raw reset packets. After
 communication and ownership are reconciled and status verifies state 0, restart explicitly:
 
 ```sh
-dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
+dgx-fan-control status                    # require state=0/12 (daemon not setting a floor; EC's own curve)
 sudo systemctl reset-failed dgx-fan-control.service
 sudo systemctl start dgx-fan-control.service
 sudo journalctl -u dgx-fan-control.service -n 30

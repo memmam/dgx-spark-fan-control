@@ -36,7 +36,7 @@ workload normally. When finished, remove the added floor:
 
 ```sh
 sudo dgx-fan-control automatic
-dgx-fan-control status             # state=0/12 (no floor; EC curve)
+dgx-fan-control status             # state=0/12 (daemon not setting a floor; EC's own curve)
 ```
 
 Leave the service stopped to keep NVIDIA's curve active. Starting the service
