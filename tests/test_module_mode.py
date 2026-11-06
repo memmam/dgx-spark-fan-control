@@ -109,6 +109,7 @@ class ModuleModeTests(unittest.TestCase):
         self.assertIn("service-active: inactive\n", report)
         self.assertIn("mode: ACPI-only\n", report)
         self.assertIn("initramfs: ", report)
+        self.assertIn("service-exit: n/a\n", report)
 
     def test_foreign_modules_load_file_is_not_rewritten(self):
         load = self.etc / "modules-load.d" / CONTROL.MODULES_LOAD_NAME
@@ -121,17 +122,18 @@ class ModuleModeTests(unittest.TestCase):
         self.loaded = False
         output = __import__("io").StringIO()
         from contextlib import redirect_stdout
-        with redirect_stdout(output):
+        sentence = (
+            "fan control unsupported on EC 3.13.7; telemetry only, "
+            "service left disabled; use acpi-max on EC 3.5.8"
+        )
+        with redirect_stdout(output), self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
             CONTROL.enable_kernel_module(
                 self.etc, runner=self.runner, loaded=False,
                 control_supported=False, profile="EC 3.13.7",
             )
         text = output.getvalue()
-        self.assertIn(
-            "fan control unsupported on EC 3.13.7; telemetry only, "
-            "service left disabled; use acpi-max on EC 3.5.8",
-            text,
-        )
+        self.assertEqual(text.count(sentence), 1)
+        self.assertFalse(any(sentence in line for line in logs.output))
         self.assertIn(["modprobe", CONTROL.MODULE_NAME], self.commands)
         self.assertNotIn(
             ["systemctl", "enable", "--now", CONTROL.DAEMON_UNIT], self.commands,
@@ -152,10 +154,14 @@ class ModuleModeTests(unittest.TestCase):
         report = CONTROL.module_status(
             self.etc, loaded=True, service_active="inactive", service_enabled="disabled",
             control=CONTROL.describe_control("unsupported", "EC 3.13.7"),
-            exec_status=69,
+            exec_status=0,
+            exit_timestamp="Fri 2026-11-06 00:12:01 UTC",
+            start_monotonic_us=1_000,
+            exit_monotonic_us=1_100,
         )
         self.assertIn("control: unsupported (EC 3.13.7, telemetry only)\n", report)
-        self.assertIn("service-exit: 69\n", report)
+        self.assertIn("service-exit: n/a\n", report)
+        self.assertNotIn("service-exit: 0", report)
         self.assertEqual(CONTROL.describe_control("supported", "EC 3.5.8"), "supported")
         self.assertEqual(
             CONTROL.pinned_ec_name(
@@ -163,6 +169,37 @@ class ModuleModeTests(unittest.TestCase):
             ),
             "EC 3.13.7",
         )
+
+    def test_status_shows_exit_only_after_the_current_run(self):
+        when = "Fri 2026-11-06 01:02:03 UTC"
+        current = CONTROL.module_status(
+            self.etc, loaded=True, service_active="inactive", service_enabled="enabled",
+            exec_status=69, exit_timestamp=when,
+            start_monotonic_us=5_000, exit_monotonic_us=5_067,
+        )
+        self.assertIn(f"service-exit: 69 at {when}\n", current)
+        failed = CONTROL.module_status(
+            self.etc, loaded=True, service_active="failed", service_enabled="disabled",
+            exec_status=1, exit_timestamp=when,
+        )
+        self.assertIn(f"service-exit: 1 at {when}\n", failed)
+        running = CONTROL.module_status(
+            self.etc, loaded=True, service_active="active", service_enabled="enabled",
+            exec_status=0, exit_timestamp=when,
+            start_monotonic_us=9_000, exit_monotonic_us=8_000,
+        )
+        self.assertIn("service-exit: n/a\n", running)
+        stale_start = CONTROL.module_status(
+            self.etc, loaded=True, service_active="inactive", service_enabled="enabled",
+            exec_status=0, exit_timestamp=when,
+            start_monotonic_us=9_000, exit_monotonic_us=8_000,
+        )
+        self.assertIn("service-exit: n/a\n", stale_start)
+        never_ran = CONTROL.module_status(
+            self.etc, loaded=True, service_active="inactive", service_enabled="enabled",
+            exec_status=0, exit_monotonic_us=0,
+        )
+        self.assertIn("service-exit: n/a\n", never_ran)
 
     def test_watchdog_ignores_disabled_inactive_and_alarms_on_failed(self):
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled"))

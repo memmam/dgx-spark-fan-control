@@ -207,21 +207,105 @@ def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str, int | None]:
     )
 
 
-def systemctl_exec_main_status(unit: str = DAEMON_UNIT) -> int | None:
+def systemctl_show_properties(unit: str, names: tuple[str, ...]) -> dict[str, str]:
+    command = ["systemctl", "show"]
+    for name in names:
+        command.extend(["-p", name])
+    command.append(unit)
     try:
         completed = subprocess.run(
-            ["systemctl", "show", "-p", "ExecMainStatus", "--value", unit],
-            check=False, capture_output=True, text=True,
+            command, check=False, capture_output=True, text=True,
         )
     except OSError:
-        return None
-    text = (completed.stdout or "").strip().splitlines()
+        return {}
+    found: dict[str, str] = {}
+    for line in (completed.stdout or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key] = value.strip()
+    return found
+
+
+def _show_int(properties: dict[str, str], name: str) -> int | None:
+    text = properties.get(name, "").strip()
     if not text:
         return None
     try:
-        return int(text[0])
+        return int(text)
     except ValueError:
         return None
+
+
+def read_exec_main(unit: str = DAEMON_UNIT) -> tuple[int | None, str | None, int | None, int | None]:
+    """Exit code, wall-clock exit time, and start/exit monotonic microseconds.
+
+    A monotonic value of 0 means systemd has no such timestamp. ExecMainStatus
+    is also 0 when the main process has never exited, so callers must not
+    treat a bare 0 as a completed run.
+    """
+    properties = systemctl_show_properties(unit, (
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+        "ExecMainStartTimestampMonotonic",
+        "ExecMainExitTimestampMonotonic",
+    ))
+    timestamp = properties.get("ExecMainExitTimestamp", "").strip()
+    if timestamp in {"", "n/a", "0"}:
+        timestamp = None
+    return (
+        _show_int(properties, "ExecMainStatus"),
+        timestamp,
+        _show_int(properties, "ExecMainStartTimestampMonotonic"),
+        _show_int(properties, "ExecMainExitTimestampMonotonic"),
+    )
+
+
+def systemctl_exec_main_status(unit: str = DAEMON_UNIT) -> int | None:
+    status, _timestamp, _start_us, _exit_us = read_exec_main(unit)
+    return status
+
+
+def service_exit_is_current(active: str, enabled: str, exec_status: int | None = None,
+                            exit_timestamp: str | None = None,
+                            start_monotonic_us: int | None = None,
+                            exit_monotonic_us: int | None = None) -> bool:
+    """True when this inactive or failed state is the main process's own exit.
+
+    A disabled unit that is not failed has not run since it was disabled, so
+    a leftover ExecMainStatus is not current. An active unit is still running.
+    Enabled and inactive counts only after the main process has exited since
+    it last started.
+    """
+    if exec_status is None:
+        return False
+    if active == "failed":
+        return True
+    if active == "active" or enabled != "enabled":
+        return False
+    if not exit_timestamp or exit_monotonic_us == 0:
+        return False
+    if (
+        start_monotonic_us not in (None, 0)
+        and exit_monotonic_us not in (None, 0)
+        and exit_monotonic_us < start_monotonic_us
+    ):
+        return False
+    return True
+
+
+def format_service_exit(active: str, enabled: str, exec_status: int | None = None,
+                        exit_timestamp: str | None = None,
+                        start_monotonic_us: int | None = None,
+                        exit_monotonic_us: int | None = None) -> str:
+    """n/a, a bare code, or '<code> at <ExecMainExitTimestamp>'."""
+    if not service_exit_is_current(
+        active, enabled, exec_status, exit_timestamp,
+        start_monotonic_us, exit_monotonic_us,
+    ):
+        return "n/a"
+    if exit_timestamp:
+        return f"{exec_status} at {exit_timestamp}"
+    return str(exec_status)
 
 
 def daemon_is_down(state: str) -> bool:
@@ -567,6 +651,20 @@ def acpi_fan_devices(thermal_root: Path) -> list[Path]:
     return matches
 
 
+ACPI_RPM_NOTE = (
+    "firmware may accept this write without changing RPM "
+    "(EC 3.13.7 does); check fan RPM afterward"
+)
+
+
+def acpi_fan_result_line(device: Path) -> str:
+    """cur_state/max_state after a write, for example 'cooling_device0 (Fan): 100/100'."""
+    current = (device / "cur_state").read_text(encoding="ascii").strip()
+    maximum = (device / "max_state").read_text(encoding="ascii").strip()
+    kind = (device / "type").read_text(encoding="ascii").strip()
+    return f"{device.name} ({kind}): {current}/{maximum}"
+
+
 def write_acpi_fan_level(device: Path, level: int) -> None:
     maximum = int((device / "max_state").read_text(encoding="ascii").strip())
     if not 0 <= level <= maximum:
@@ -835,12 +933,12 @@ def enable_kernel_module(etc: Path, *, runner, loaded: bool,
     if not supported and not force_service:
         run_module_command(["systemctl", "disable", "--now", DAEMON_UNIT], runner)
         label = profile or "this firmware"
-        message = (
+        # Printed once. Logging the same sentence as well showed it twice
+        # on the EC 3.13.7 enable path.
+        print(
             f"fan control unsupported on {label}; telemetry only, "
             "service left disabled; use acpi-max on EC 3.5.8"
         )
-        print(message)
-        LOG.warning("%s", message)
         note_initramfs(etc)
         return
     if not supported and force_service:
@@ -850,7 +948,10 @@ def enable_kernel_module(etc: Path, *, runner, loaded: bool,
 
 
 def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabled: str,
-                  control: str = "unknown", exec_status: int | None = None) -> str:
+                  control: str = "unknown", exec_status: int | None = None,
+                  exit_timestamp: str | None = None,
+                  start_monotonic_us: int | None = None,
+                  exit_monotonic_us: int | None = None) -> str:
     modprobe_dir, _modules_load, managed = module_paths(etc)
     foreign = foreign_blacklist_files(modprobe_dir)
     initramfs = initramfs_module_files(etc)
@@ -872,9 +973,11 @@ def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabl
         f"control: {control}",
         f"mode: {mode}",
         "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),
+        "service-exit: " + format_service_exit(
+            service_active, service_enabled, exec_status, exit_timestamp,
+            start_monotonic_us, exit_monotonic_us,
+        ),
     ]
-    if exec_status is not None:
-        lines.append(f"service-exit: {exec_status}")
     return "\n".join(lines) + "\n"
 
 
@@ -904,16 +1007,21 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
                 LOG.exception("fail-hot ACPI write of %s failed", ACPI_MAX_LEVEL)
 
     failures: list[BaseException] = []
+    summaries: list[str] = []
     try:
         for device in devices:
             try:
                 write_acpi_fan_level(device, level)
+                summaries.append(acpi_fan_result_line(device))
             except (OSError, RuntimeError, ValueError) as exc:
                 failures.append(exc)
         if failures:
             raise RuntimeError(
                 f"ACPI fan update to {level} failed on {len(failures)} device(s)"
             )
+        for line in summaries:
+            print(line)
+        print(ACPI_RPM_NOTE)
     except BaseException:
         fail_hot()
         raise
@@ -1016,13 +1124,17 @@ def main(argv: list[str] | None = None) -> int:
                 profile = pinned_ec_name(logged.stdout or "")
             except OSError:
                 profile = None
+            exec_status, exit_timestamp, start_us, exit_us = read_exec_main()
             print(module_status(
                 etc,
                 loaded=loaded,
                 service_active=systemctl_query("is-active"),
                 service_enabled=systemctl_query("is-enabled"),
                 control=describe_control(kind, profile),
-                exec_status=systemctl_exec_main_status(),
+                exec_status=exec_status,
+                exit_timestamp=exit_timestamp,
+                start_monotonic_us=start_us,
+                exit_monotonic_us=exit_us,
             ), end="")
             return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)

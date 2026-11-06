@@ -218,21 +218,31 @@ reported and left untouched. `module enable` removes only the managed
 blacklist, restores the modules-load.d entry, loads the module, and enables
 and starts the service when fan control is supported. On EC 3.13.7, where the
 module registers telemetry only, enable loads the module and leaves the
-service disabled. It prints that fan control is unsupported and points at
-`acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
+service disabled. It prints once that fan control is unsupported and points
+at `acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
 
 `module status` prints whether the module is loaded, whether the managed
 blacklist or another blacklist is present, whether the service is enabled and
 active, whether fan control is `supported` or `unsupported (EC 3.13.7,
-telemetry only)`, and the mode (`module` or `ACPI-only`).
+telemetry only)`, and the mode (`module` or `ACPI-only`). `service-exit` is
+`n/a` while the unit is running, or while it is disabled and has not failed,
+including a leftover code from a run before the latest disable. When the unit
+is `failed`, or enabled but inactive because its main process exited, the
+field is the exit code and `ExecMainExitTimestamp`.
 
 The watchdog does not treat a disabled, inactive service as a fault. It also
 stays quiet when the unit's last exit status is 69, the startup result for
-unsupported fan control, and `module status` reports that exit. It still
+unsupported fan control. `module status` reports that exit, with the time it
+happened, when the unit is failed or still enabled and inactive. It still
 alerts when the unit is `failed`, or enabled but inactive after another exit.
 
 `acpi-max` warns if `dgx_ec_fan_control` is loaded, because the module and the
-ACPI write can compete, and suggests `module disable`. It still writes.
+ACPI write can compete, and suggests `module disable`. It still writes. On
+success it prints each Fan device's `cur_state/max_state` (for example
+`cooling_device0 (Fan): 100/100`) and notes that firmware may accept the write
+without changing RPM, which EC 3.13.7 does, so fan RPM should be checked
+afterward. It exits nonzero when no Fan cooling device is found or a write
+fails.
 
 This project does not put the module in the initramfs. `modules-load.d` loads
 it after the root filesystem is mounted, so `module disable` does not run

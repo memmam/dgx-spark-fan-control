@@ -428,14 +428,53 @@ class UserlandFailureTests(unittest.TestCase):
     def test_acpi_max_writes_only_fan_devices(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, second = self._acpi_tree(Path(directory))
-            self.assertEqual(CONTROL.main([
-                "--thermal-root", str(thermal), "acpi-max",
-            ]), 0)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                self.assertEqual(CONTROL.main([
+                    "--thermal-root", str(thermal), "acpi-max",
+                ]), 0)
+            text = stdout.getvalue()
             self.assertEqual((first / "cur_state").read_text(), "100\n")
             self.assertEqual((second / "cur_state").read_text(), "100\n")
             self.assertEqual(
                 (thermal / "cooling_device0" / "cur_state").read_text(), "0\n"
             )
+            self.assertIn("cooling_device1 (Fan): 100/100\n", text)
+            self.assertIn("cooling_device2 (Fan): 100/100\n", text)
+            self.assertNotIn("cooling_device0", text)
+            self.assertEqual(text.count(CONTROL.ACPI_RPM_NOTE), 1)
+            self.assertIn("without changing RPM", text)
+            self.assertIn("check fan RPM afterward", text)
+
+    def test_acpi_max_exits_nonzero_without_a_fan_or_when_a_write_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty = root / "empty"
+            empty.mkdir()
+            stdout = io.StringIO()
+            with redirect_stdout(stdout), self.assertLogs(CONTROL.LOG, level="ERROR"):
+                self.assertEqual(CONTROL.main([
+                    "--thermal-root", str(empty), "acpi-max",
+                ]), 1)
+            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout.getvalue())
+
+            thermal, first, second = self._acpi_tree(root)
+            original = CONTROL.write_acpi_fan_level
+
+            def broken_write(device, level):
+                if device == second:
+                    raise OSError("write failed")
+                original(device, level)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout), \
+                 patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write), \
+                 self.assertLogs(CONTROL.LOG, level="ERROR"):
+                self.assertEqual(CONTROL.main([
+                    "--thermal-root", str(thermal), "acpi-max",
+                ]), 1)
+            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout.getvalue())
+            self.assertNotIn("cooling_device", stdout.getvalue())
 
     def test_acpi_level_refuses_below_forty_and_fail_hot_rewrites_one_hundred(self):
         with tempfile.TemporaryDirectory() as directory:

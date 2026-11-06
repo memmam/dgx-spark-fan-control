@@ -268,9 +268,14 @@ sudo dgx-fan-control acpi-max
 sudo dgx-fan-control acpi-max --level 40
 ```
 
+On success it prints one line per Fan device with the read-back level, for
+example `cooling_device0 (Fan): 100/100`, then notes that firmware may accept
+the write without changing RPM. Check fan RPM afterward. EC 3.13.7 accepts
+the write and leaves RPM unchanged. The command exits nonzero when it finds
+no Fan cooling device or a write fails.
+
 `--level` below 40 is refused and does not write. On EC 3.5.8 with the
 October SoC, this is the path that has been observed to change fan speed.
-Level 100 is the maximum (about 4320 RPM in the forum measurements). On EC
-3.13.7 the same write is accepted and does not change fan speed. If a level
-below 100 fails partway, or the command is interrupted after it has found the
-devices, it tries to write 100 to each of them.
+Level 100 is the maximum (about 4320 RPM in the forum measurements). If a
+level below 100 fails partway, or the command is interrupted after it has
+found the devices, it tries to write 100 to each of them.

@@ -2,19 +2,27 @@
 
 ## Version 0.1.5 on EC 3.13.7
 
-Hardware check on one DGX Spark, kernel `7.0.0-1024-nvidia`, EC 3.13.7.
+Hardware check on DGX Spark, kernel `7.0.0-1024-nvidia`, EC 3.13.7.
 DKMS 0.1.5 built and loaded on aarch64. The kernel log showed partition
 `0x8003`, properties `0x109`, FF-A 1.2, `pinned EC 3.13.7 capabilities
 fan0=975..4350 fan1=975..4350`, floor writes disabled, baseline fans about
 2101 and 2141 RPM, and hwmon telemetry with no cooling device. `module
-status`, `module disable`, and `module enable` matched that state: disable
-left the module unloaded with the managed blacklist and mode ACPI-only;
-enable loaded it again with the service enabled and active and mode module.
-DKMS did not replace `/usr/local/sbin/dgx-fan-control`; the previous 0.1.4
-command stayed until it was installed by hand.
+disable` left the module unloaded with the managed blacklist and mode
+ACPI-only. DKMS did not replace `/usr/local/sbin/dgx-fan-control`; the
+previous 0.1.4 command stayed until it was installed by hand.
 
-Not checked on that machine: `acpi-max`, the watchdog, the quiet curve, and
-the EC 3.5.8 floor-write path. The 3.13.7 floor table was not written.
+A first `module enable`, using the command from before the exit-69 change,
+started the service. The daemon logged `control unsupported on this
+firmware`, exited 0, and would have restarted every 30 seconds. The retest
+on both Sparks, same kernel and EC, confirmed the correction: `module enable`
+leaves the service disabled, and `module status` reports
+`control: unsupported (EC 3.13.7, telemetry only)`. `acpi-max` wrote
+`cooling_device0` and `cooling_device1` to 100/100. Fans stayed about 2,000
+to 2,100 RPM, which is expected because EC 3.13.7 accepts the ACPI write and
+does not change speed.
+
+Not checked on those machines: the watchdog, the quiet curve, and the EC
+3.5.8 floor-write path. The 3.13.7 floor table was not written.
 `allow_unverified_writes` stayed off.
 
 ## Version 0.1.5 profiles and read-only EC 3.13.7
