@@ -26,7 +26,7 @@ class KernelContractTests(unittest.TestCase):
     def test_state_zero_is_automatic_and_states_are_bounded(self):
         table = SOURCE.split("static const struct dgx_ec_fan_profile dgx_ec_profiles[]", 1)[1]
         self.assertIn("DGX_EC_LIMIT_UNSET", table)
-        for rpm in ("2700U", "4500U", "9000U", "13500U", "1256U", "4350U"):
+        for rpm in ("2700U", "4500U", "9000U", "13500U", "2000U", "4350U"):
             self.assertIn(rpm, table)
         self.assertIn("state >= DGX_EC_FLOOR_STATE_COUNT", SOURCE)
         self.assertIn("EC 3.5.8", table)
@@ -51,6 +51,8 @@ class KernelContractTests(unittest.TestCase):
             "October SoC 2.158.15",
             "Do not write a level below 30",
             "ret = -EAGAIN",
+            "ret = -EPROTO",
+            "pre-October SoC firmware",
             "floor ownership mismatch",
         ):
             self.assertIn(requirement, SOURCE)

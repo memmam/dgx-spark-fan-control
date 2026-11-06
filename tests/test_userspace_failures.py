@@ -130,7 +130,7 @@ class UserlandFailureTests(unittest.TestCase):
     def test_reply_guard_refusal_waits_out_recovery_cooldown(self):
         stop = Event()
         delays = []
-        states = iter((OSError(errno.EAGAIN, "reply guard"), 1))
+        states = iter((OSError(errno.EPROTO, "reply guard"), 1))
 
         def read(device):
             result = next(states)
@@ -159,7 +159,7 @@ class UserlandFailureTests(unittest.TestCase):
 
     def test_reply_guard_refusal_is_bounded(self):
         stop = Event()
-        original = OSError(errno.EAGAIN, "reply guard")
+        original = OSError(errno.EPROTO, "reply guard")
         with patch.object(CONTROL, "require_control", return_value=Path("device")), \
              patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
@@ -172,6 +172,22 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertIs(raised.exception, original)
         self.assertEqual(read.call_count, 3)
         self.assertEqual([call.args[0] for call in wait.call_args_list], [31.0, 31.0])
+
+    def test_idle_guard_keeps_the_short_retry(self):
+        stop = Event()
+        original = OSError(errno.EAGAIN, "idle guard")
+        with patch.object(CONTROL, "require_control", return_value=Path("device")), \
+             patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL, "read_state", side_effect=original) as read, \
+             patch.object(CONTROL, "write_state"), \
+             patch.object(stop, "wait") as wait, \
+             self.assertLogs(CONTROL.LOG, level="WARNING"):
+            with self.assertRaises(OSError) as raised:
+                CONTROL.run_daemon(Path("unused"), 2)
+        self.assertIs(raised.exception, original)
+        self.assertEqual(read.call_count, 3)
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [2.0, 4.0])
 
     def test_foreign_floor_is_not_retried(self):
         stop = Event()
@@ -335,6 +351,64 @@ class UserlandFailureTests(unittest.TestCase):
                 )
             self.assertEqual(status, 0)
             self.assertEqual(actions, [])
+
+    def _acpi_tree(self, root: Path) -> tuple[Path, Path, Path]:
+        thermal = root / "thermal"
+        thermal.mkdir()
+        ours = thermal / "cooling_device0"
+        ours.mkdir()
+        (ours / "type").write_text("dgx_ec_fan_floor\n", encoding="ascii")
+        (ours / "cur_state").write_text("0\n", encoding="ascii")
+        (ours / "max_state").write_text("12\n", encoding="ascii")
+        fans = []
+        for index, name in ((1, "cooling_device1"), (2, "cooling_device2")):
+            device = thermal / name
+            device.mkdir()
+            (device / "type").write_text("Fan\n", encoding="ascii")
+            (device / "cur_state").write_text("40\n", encoding="ascii")
+            (device / "max_state").write_text("100\n", encoding="ascii")
+            fans.append(device)
+        return thermal, fans[0], fans[1]
+
+    def test_acpi_max_writes_only_fan_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thermal, first, second = self._acpi_tree(Path(directory))
+            self.assertEqual(CONTROL.main([
+                "--thermal-root", str(thermal), "acpi-max",
+            ]), 0)
+            self.assertEqual((first / "cur_state").read_text(), "100\n")
+            self.assertEqual((second / "cur_state").read_text(), "100\n")
+            self.assertEqual(
+                (thermal / "cooling_device0" / "cur_state").read_text(), "0\n"
+            )
+
+    def test_acpi_level_refuses_below_forty_and_fail_hot_rewrites_one_hundred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thermal, first, second = self._acpi_tree(Path(directory))
+            with self.assertLogs(CONTROL.LOG, level="ERROR"):
+                self.assertEqual(CONTROL.main([
+                    "--thermal-root", str(thermal), "acpi-max", "--level", "20",
+                ]), 1)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+            self.assertEqual((second / "cur_state").read_text(), "40\n")
+            self.assertEqual(CONTROL.main([
+                "--thermal-root", str(thermal), "acpi-max", "--level", "40",
+            ]), 0)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+            (second / "cur_state").write_text("7\n", encoding="ascii")
+
+            original = CONTROL.write_acpi_fan_level
+
+            def broken_write(device, level):
+                if device == second and level == 60:
+                    raise OSError("write failed")
+                original(device, level)
+
+            with patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write):
+                with self.assertRaises(RuntimeError):
+                    CONTROL.set_acpi_fans(thermal, 60)
+            self.assertEqual((first / "cur_state").read_text(), "100\n")
+            self.assertEqual((second / "cur_state").read_text(), "100\n")
 
     def test_expected_daemon_error_uses_nonrestart_exit_status(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")), \

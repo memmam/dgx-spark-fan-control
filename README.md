@@ -57,11 +57,12 @@ policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-f
 ## Compatibility
 
 Fan-floor **control** was tested on **NVIDIA DGX Spark, board P4242**, with
-**EC 3.5.8** and the SoC firmware it was qualified against, **2.155.11**
-(`0x02009b0b`), DGX OS 7.5.0, and kernel `6.17.0-1029-nvidia`. Later checks
-used kernel `7.0.0-1019-nvidia`. That SoC pairing is part of the contract.
-**EC 3.5.8 with October SoC firmware 2.158.15** (`0x02009e0f`) times out the
-FF-A/eSPI mailbox on the first read-only query, so this driver does not bind.
+**EC 3.5.8** and the pre-October SoC firmware, DGX OS 7.5.0, and kernel
+`6.17.0-1029-nvidia`. Later checks used kernel `7.0.0-1019-nvidia`. Upstream
+does not pin one SoC build in the compatibility statement. The validation
+record for this tree used SoC 2.155.11 (`0x02009b0b`). **EC 3.5.8 with October
+SoC firmware 2.158.15** (`0x02009e0f`) times out the FF-A/eSPI mailbox on the
+first read-only query, so this driver does not bind.
 Probe says so and points at the ACPI fan devices below.
 
 **EC 3.13.7** (`fwupdmgr` `0x03000d07`) has been observed on the same board,

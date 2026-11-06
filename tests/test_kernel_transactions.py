@@ -262,9 +262,9 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[1], "recovery_invalid_rtc")) { invalid_rtc = 1; expected = -EAGAIN; }
   if (!strcmp(argv[1], "recovery_invalid_header")) { invalid_header = 1; expected = -EAGAIN; }
   if (!strcmp(argv[1], "recovery_zero_oem")) { oem_zero = 1; expected = -EAGAIN; }
-  if (!strcmp(argv[1], "recovery_stale_reply")) { stale_reply = 1; expected = -EAGAIN; }
-  if (!strcmp(argv[1], "recovery_overwritten_reply")) { overwrite_reply = 1; expected = -EAGAIN; }
-  if (!strcmp(argv[1], "recovery_response_error")) { reply_error = 1; expected = -EAGAIN; }
+  if (!strcmp(argv[1], "recovery_stale_reply")) { stale_reply = 1; expected = -EPROTO; }
+  if (!strcmp(argv[1], "recovery_overwritten_reply")) { overwrite_reply = 1; expected = -EPROTO; }
+  if (!strcmp(argv[1], "recovery_response_error")) { reply_error = 1; expected = -EPROTO; }
   if (!strcmp(argv[1], "recovery_unsupported")) { reply_error = 0xff; expected = -EOPNOTSUPP; }
   if (!strcmp(argv[1], "recovery_sender_busy")) { sender_busy = 1; expected = -EBUSY; }
   if (!strcmp(argv[1], "recovery_retry_stuck")) { retry_stuck = 1; expected = -ETIMEDOUT; }
@@ -406,7 +406,7 @@ int main(int argc, char **argv) {
   assert(write_count == 0 && physical_floor == UINT16_MAX);
   allow_unverified_writes = 1;
   assert(dgx_ec_set_cur_state(&cdev, 12) == 0 && physical_floor == 4350);
-  assert(dgx_ec_set_cur_state(&cdev, 1) == 0 && physical_floor == 1256);
+  assert(dgx_ec_set_cur_state(&cdev, 1) == 0 && physical_floor == 2000);
   assert(physical_floor == dgx_ec_profiles[1].floors[1]);
  } else { assert(!"unknown case"); }
  return 0;

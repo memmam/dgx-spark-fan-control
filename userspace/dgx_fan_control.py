@@ -16,8 +16,11 @@ from threading import Event
 from pathlib import Path
 
 COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
+ACPI_COOLING_TYPE = "Fan"
 HWMON_DEVICE_NAME = "dgx_ec_fan"
 ACPI_FAN_NAME = "acpi_fan"
+ACPI_MIN_LEVEL = 40
+ACPI_MAX_LEVEL = 100
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
 WATCHDOG_POLL_SECONDS = 2.0
 WATCHDOG_ZERO_SECONDS = 10.0
@@ -32,13 +35,14 @@ UP_STATES_PER_POLL = 2
 DOWN_STATES_PER_POLL = 1
 TRANSPORT_FAILURE_LIMIT = 3
 RETRY_INITIAL_SECONDS = 2.0
-# The driver arms a 30s cooldown before returning EAGAIN for a refused
-# reply-guard or idle-guard recovery. A retry inside that window cannot succeed.
+# Reply-guard refusal is EPROTO. The driver has already started its 30s
+# recovery cooldown, so a shorter retry cannot succeed. Idle-guard refusal
+# stays EAGAIN and keeps the 2s/4s backoff.
 RECOVERY_COOLDOWN_SECONDS = 31.0
 CONTROLLER_UNAVAILABLE_EXIT = 69
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
-    errno.ETIMEDOUT, errno.EREMOTEIO,
+    errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
 ))
 
 # Temperatures are unchanged. State indexes are shared by every capability
@@ -258,7 +262,7 @@ def curve_state(temperature_c: float) -> int:
 
 
 def retry_delay_seconds(exc: OSError, failures: int) -> float:
-    if exc.errno == errno.EAGAIN:
+    if exc.errno == errno.EPROTO:
         return RECOVERY_COOLDOWN_SECONDS
     return RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
 
@@ -385,6 +389,69 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
     return 0
 
 
+def acpi_fan_devices(thermal_root: Path) -> list[Path]:
+    matches = []
+    for candidate in sorted(thermal_root.glob("cooling_device*")):
+        try:
+            device_type = (candidate / "type").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if device_type == ACPI_COOLING_TYPE:
+            matches.append(candidate)
+    return matches
+
+
+def write_acpi_fan_level(device: Path, level: int) -> None:
+    maximum = int((device / "max_state").read_text(encoding="ascii").strip())
+    if not 0 <= level <= maximum:
+        raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
+    (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
+    observed = int((device / "cur_state").read_text(encoding="ascii").strip())
+    if observed != level:
+        raise RuntimeError(
+            f"ACPI fan readback mismatch: wrote {level}, read {observed}"
+        )
+
+
+def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL) -> None:
+    """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
+
+    Does not use this project's kernel module. A level below 40 is refused
+    before any write. EC 3.13.7 accepts the ACPI write and ignores it.
+    """
+    if level < ACPI_MIN_LEVEL or level > ACPI_MAX_LEVEL:
+        raise ValueError(
+            f"ACPI fan level must be between {ACPI_MIN_LEVEL} and {ACPI_MAX_LEVEL}"
+        )
+    devices = acpi_fan_devices(thermal_root)
+    if not devices:
+        raise RuntimeError("no ACPI Fan cooling device found")
+
+    def fail_hot() -> None:
+        if level == ACPI_MAX_LEVEL:
+            return
+        for device in devices:
+            try:
+                write_acpi_fan_level(device, ACPI_MAX_LEVEL)
+            except (OSError, RuntimeError, ValueError):
+                LOG.exception("fail-hot ACPI write of %s failed", ACPI_MAX_LEVEL)
+
+    failures: list[BaseException] = []
+    try:
+        for device in devices:
+            try:
+                write_acpi_fan_level(device, level)
+            except (OSError, RuntimeError, ValueError) as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError(
+                f"ACPI fan update to {level} failed on {len(failures)} device(s)"
+            )
+    except BaseException:
+        fail_hot()
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -410,6 +477,11 @@ def build_parser() -> argparse.ArgumentParser:
     watchdog.add_argument("--zero-seconds", type=float, default=WATCHDOG_ZERO_SECONDS)
     watchdog.add_argument("--soc-celsius", type=float, default=WATCHDOG_SOC_CELSIUS)
     watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
+    acpi_max = subparsers.add_parser(
+        "acpi-max",
+        help="set ACPI Fan cooling devices without this kernel module",
+    )
+    acpi_max.add_argument("--level", type=int, default=ACPI_MAX_LEVEL)
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
     subparsers.add_parser("automatic", help="restore firmware-automatic policy")
@@ -432,6 +504,9 @@ def main(argv: list[str] | None = None) -> int:
                 soc_celsius=args.soc_celsius,
                 action=args.action,
             )
+        if args.command == "acpi-max":
+            set_acpi_fans(args.thermal_root, args.level)
+            return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)

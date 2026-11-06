@@ -137,11 +137,11 @@ same on every profile; the kernel maps them through the table below.
 
 | Filtered hottest temperature | Target state | EC 3.5.8 floor | EC 3.13.7 reported floor |
 | ---: | ---: | ---: | ---: |
-| Below 50°C, daemon running | 1 | 2,700 | 1,256 |
-| 50°C | 3 | 4,500 | 1,818 |
-| 55°C | 5 | 6,300 | 2,381 |
-| 60°C | 8 | 9,000 | 3,225 |
-| 65°C | 10 | 11,250 | 3,787 |
+| Below 50°C, daemon running | 1 | 2,700 | 2,000 |
+| 50°C | 3 | 4,500 | 2,427 |
+| 55°C | 5 | 6,300 | 2,854 |
+| 60°C | 8 | 9,000 | 3,495 |
+| 65°C | 10 | 11,250 | 3,922 |
 | 70°C or above | 12 | 13,500 | 4,350 |
 
 The 3.13.7 column is the reported capability span, not a measured tachometer
@@ -188,17 +188,22 @@ Both fans report 975–4350. That span matches `975 + 33.75 × level` for an ACP
 level of 0–100. It is not the 3.5.8 control encoding, so those 900-RPM steps
 are not scaled onto it. States 1–12 divide the reported span:
 
-`floor(state) = 975 + (4350 - 975) * state / 12`
+`floor(state) = 2000 + (4350 - 2000) * (state - 1) / 11`
+
+State 1 is 2000, not 975. ACPI level 20 on EC 3.5.8 was measured near 1620 RPM
+with the second fan stalled, and level 30 near 1940
+([forum topic 386805, post 21](https://forums.developer.nvidia.com/t/new-dgx-spark-fans-barely-speed-up-at-high-temps-and-cant-be-adjusted-critical-please-open-fan-control/386805)).
+Nothing in states 1–12 is below 2000. State 12 is the reported maximum, 4350.
 
 | State | Reported floor | State | Reported floor |
 | ---: | ---: | ---: | ---: |
-| 0 | Automatic / unset | 7 | 2,943 |
-| 1 | 1,256 | 8 | 3,225 |
-| 2 | 1,537 | 9 | 3,506 |
-| 3 | 1,818 | 10 | 3,787 |
-| 4 | 2,100 | 11 | 4,068 |
-| 5 | 2,381 | 12 | 4,350 |
-| 6 | 2,662 | | |
+| 0 | Automatic / unset | 7 | 3,281 |
+| 1 | 2,000 | 8 | 3,495 |
+| 2 | 2,213 | 9 | 3,709 |
+| 3 | 2,427 | 10 | 3,922 |
+| 4 | 2,640 | 11 | 4,136 |
+| 5 | 2,854 | 12 | 4,350 |
+| 6 | 3,068 | | |
 
 Public EC image diffs say this write is rejected because the override enable
 bit can no longer be set. Probe does not try it. There is no cooling device
@@ -248,3 +253,20 @@ sudo dgx-fan-control watchdog
 temperature, and the command. The action is one program plus arguments, not a
 shell pipeline. See the [known issues](../README.md#known-issues) before
 enabling this on a machine that uses external fans.
+
+## Set the ACPI fan level
+
+This does not use the kernel module. It writes every cooling device whose
+type is `Fan`:
+
+```sh
+sudo dgx-fan-control acpi-max
+sudo dgx-fan-control acpi-max --level 40
+```
+
+`--level` below 40 is refused and does not write. On EC 3.5.8 with the
+October SoC, this is the path that has been observed to change fan speed.
+Level 100 is the maximum (about 4320 RPM in the forum measurements). On EC
+3.13.7 the same write is accepted and does not change fan speed. If a level
+below 100 fails partway, or the command is interrupted after it has found the
+devices, it tries to write 100 to each of them.

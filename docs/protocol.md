@@ -65,13 +65,21 @@ permission table that already marked the fan/thermal block read-only, so the
 host can no longer set that bit. Probe on this profile does not read or write
 the floor. It registers hwmon only, with no cooling device. Floor writes are
 possible only when the module is loaded with `allow_unverified_writes=1`.
-That logs a warning: the state table below is unverified, and a Spark has
-been observed with both fans stopped until a power pull. Do not set the
-parameter to discover whether writes work.
+That logs a warning. Do not set the parameter to discover whether writes work.
 
-EC 3.5.8 support also assumes SoC firmware that still completes this mailbox.
-The qualified SoC is **2.155.11** (`0x02009b0b`). October SoC **2.158.15**
-(`0x02009e0f`) has been observed to time out the first read-only query.
+The 3.13.7 state table is not the bottom of the 975–4350 span. On EC 3.5.8,
+ACPI measurements in [NVIDIA forum topic 386805, post 21](https://forums.developer.nvidia.com/t/new-dgx-spark-fans-barely-speed-up-at-high-temps-and-cant-be-adjusted-critical-please-open-fan-control/386805)
+were about 1620 RPM at level 20 with the second fan stalled, about 1940 at
+level 30, about 2270 at level 40, and about 4320 at level 100. State 1 is
+2000 RPM, above that stall, and state 12 is the reported maximum 4350.
+States 2–11 are `2000 + (4350 - 2000) * (state - 1) / 11`. The profile
+validator rejects any EC 3.13.7 state 1–12 entry below 2000. The numbers are
+still unverified as floor-register values.
+
+EC 3.5.8 fan-floor support assumes the pre-October SoC firmware. Upstream's
+README does not name one SoC build. This tree's validation record used
+**2.155.11** (`0x02009b0b`). October SoC **2.158.15** (`0x02009e0f`) has been
+observed to time out the first read-only query.
 `-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan` cooling
 device as the alternative on EC 3.5.8. This driver does not operate that device.
 
@@ -131,9 +139,11 @@ as uncertain. A later completed read may reconcile the last confirmed floor,
 that exact attempted floor, or an unset clamp. This allows recovery when a
 write was applied but its acknowledgement or readback failed. An unrelated
 non-zero value returns `ESTALE` and is never overwritten. A reply-guard
-refusal, where the shared response does not match the read, returns `EAGAIN`
+refusal, where the shared response does not match the read, returns `EPROTO`
 instead. The daemon retries that after the driver's 30-second recovery
-cooldown. Status `0xFF` on that same reply returns `EOPNOTSUPP` and is not
+cooldown. Idle-guard refusal stays `EAGAIN`, with the short userspace retry,
+because that errno already meant "the canaries failed; try again soon."
+Status `0xFF` on the reply returns `EOPNOTSUPP` and is not
 retried. A timed-out setter is still never replayed. A second writer
 using the same value cannot be distinguished, so exclusive relay ownership
 remains required.

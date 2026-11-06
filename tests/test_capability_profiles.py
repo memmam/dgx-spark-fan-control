@@ -100,17 +100,15 @@ int main(void) {
  for (state = 0; state < 13; state++)
   assert(older->floors[state] == historical_358[state]);
  for (state = 1; state < 13; state++) {
-  u16 floor = 975 + (4350 - 975) * state / 12;
+  u16 floor = 2000 + (4350 - 2000) * (state - 1) / 11;
   assert(newer->floors[state] == floor);
-  assert(floor >= 975 && floor <= 4350);
+  assert(floor >= 2000 && floor <= 4350);
   assert(floor > newer->floors[state - 1] || state == 1);
-  /* Not a linear rescale of the 3.5.8 RPM-mode steps. */
-  assert(floor != older->floors[state] * 4350 / 13500 || state == 12);
  }
  assert(newer->floors[0] == 0xffff);
- assert(newer->floors[1] == 1256);
+ assert(newer->floors[1] == 2000);
  assert(newer->floors[12] == 4350);
- assert(newer->floors[1] != 2700 * 4350 / 13500);
+ assert(newer->floors[1] > 1620);
  memcpy(mutated, raw_3137, sizeof(mutated));
  for (i = 0; i < sizeof(mutated); i++) {
   mutated[i] ^= 1;

@@ -62,8 +62,9 @@ SoC firmware **2.158.15** (`0x02009e0f`) has failed the FF-A/eSPI mailbox on
 the first read-only query (eSPI status `0x05`, about 54 ms). This driver
 returns `-EIO` for submit status `0x05` and `-ETIMEDOUT` when a poll stays
 pending. Either one, before a capability profile matches, refuses the device.
-This driver's 3.5.8 fan-floor support assumes the older SoC firmware it was
-validated with (**2.155.11**, `0x02009b0b`). The kernel log names that pairing.
+This driver's 3.5.8 fan-floor support assumes the pre-October SoC firmware.
+The kernel log says that. October SoC **2.158.15** (`0x02009e0f`) is the
+pairing that failed the first read-only query.
 The module does not bind, including no hwmon device, because the mailbox did
 not answer.
 
@@ -107,10 +108,10 @@ eSPI controller caused a watchdog reboot during the original investigation.
 An ownership mismatch (`ESTALE`) causes failure: the driver
 will not overwrite an unknown existing floor. Avoid concurrent writers. Version
 0.1.5 uses `ESTALE` only for that mismatch. A reply-guard refusal, where
-recovery will not trust the shared response, returns `EAGAIN`. The daemon
-retries `EAGAIN` after 31 seconds, past the driver's 30-second cooldown, at
-most three times. It does not treat that refusal as fatal. `ESTALE` still
-stops immediately. Version
+recovery will not trust the shared response, returns `EPROTO`. The daemon
+retries `EPROTO` after 31 seconds, past the driver's 30-second cooldown, at
+most three times. Idle-guard refusal stays `EAGAIN` and keeps the two-second
+then four-second retry. `ESTALE` still stops immediately. Version
 0.1.1 remembers its own attempted write and can reconcile it after transport
 recovery, even when acknowledgement or readback failed. Version 0.1.0 could lose
 ownership in this situation. Neither version can restore through a relay that

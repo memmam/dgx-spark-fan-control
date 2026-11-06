@@ -79,6 +79,8 @@
 #define DGX_EC_DRIVER_VERSION		"0.1.5"
 /* Family-7 mailbox status byte: success is 0x00, unsupported is 0xFF. */
 #define DGX_EC_STATUS_UNSUPPORTED	0xffU
+/* ACPI level 20 stalled a fan near 1620 RPM. Do not request below this. */
+#define DGX_EC_3137_MIN_FLOOR_RPM	2000U
 
 static const uuid_t dgx_ec_packet_uuid =
 	UUID_INIT(0x78b04d80, 0xd21d, 0x4986,
@@ -115,13 +117,14 @@ struct dgx_ec_fan_profile {
  * endpoints: state 1 is 2700, then 900 RPM steps through 9000, then 1125 RPM
  * steps through 13500.
  *
- * The 3.13.7 table is used only if a floor write is actually accepted. Both
- * fans report 975..4350, the same span as the ACPI target formula
- * 975 + 33.75 * level (level 100 lands on 4350). That is not the 3.5.8
- * control encoding, so the 900 RPM steps are not rescaled onto it. States
- * 1..12 divide the reported span with integer arithmetic:
- * min + (max - min) * state / 12. Whether a 3.13.7 write uses this scale, or
- * works at all, is unverified. Public reports say the write is rejected.
+ * The 3.13.7 table is used only if allow_unverified_writes=1. Both fans
+ * report 975..4350, the same span as the ACPI target 975 + 33.75 * level.
+ * Owner measurements on EC 3.5.8 (NVIDIA forum topic 386805, post 21) put
+ * level 20 near 1620 RPM with the second fan stalled, level 30 near 1940,
+ * level 40 near 2270, and level 100 near 4320. State 1 is therefore 2000,
+ * not the bottom of the reported span, and state 12 is the reported maximum
+ * 4350. States 2..11 are 2000 + (4350 - 2000) * (state - 1) / 11. Whether a
+ * 3.13.7 write uses this scale, or works at all, is unverified.
  */
 static const struct dgx_ec_fan_profile dgx_ec_profiles[] = {
 	{
@@ -156,17 +159,17 @@ static const struct dgx_ec_fan_profile dgx_ec_profiles[] = {
 		.telemetry_if_floor_unsupported = true,
 		.floors = {
 			DGX_EC_LIMIT_UNSET,
-			1256U,
-			1537U,
-			1818U,
-			2100U,
-			2381U,
-			2662U,
-			2943U,
-			3225U,
-			3506U,
-			3787U,
-			4068U,
+			2000U,
+			2213U,
+			2427U,
+			2640U,
+			2854U,
+			3068U,
+			3281U,
+			3495U,
+			3709U,
+			3922U,
+			4136U,
 			4350U,
 		},
 	},
@@ -599,10 +602,11 @@ static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
 	stage = "reply-guard";
 	/*
 	 * A shared response that does not match this read is a refusal, not an
-	 * ownership mismatch. EAGAIN lets the daemon retry after the recovery
-	 * cooldown. ESTALE stays reserved for reconcile's foreign floor. Status
-	 * 0xFF is the EC's unsupported command: do not retry it as if the buffer
-	 * were merely stale, and do not replay a timed-out setter.
+	 * ownership mismatch. EPROTO is this refusal: the daemon waits out the
+	 * recovery cooldown before retrying it. EAGAIN stays the idle-guard
+	 * result and keeps the short userspace retry. ESTALE stays reserved for
+	 * reconcile's foreign floor. Status 0xFF is the EC's unsupported
+	 * command. A timed-out setter is never replayed.
 	 */
 	if (!(final_status & 3) && final_header[0] == 7 && final_header[1] == 4 &&
 	    final_header[2] == DGX_EC_STATUS_UNSUPPORTED) {
@@ -610,8 +614,8 @@ static int dgx_ec_recover_idle(struct dgx_ec_fan_control_data *data,
 		goto out;
 	}
 	if ((final_status & 3) || final_header[0] != 7 || final_header[1] != 4 ||
-	    final_header[2] || memcmp(reply, final_header + 3, sizeof(reply))) {
-		ret = -EAGAIN;
+	    final_header[2] || 	    memcmp(reply, final_header + 3, sizeof(reply))) {
+		ret = -EPROTO;
 		goto out;
 	}
 	*floor = get_unaligned_le16(reply);
@@ -850,6 +854,9 @@ static int dgx_ec_profiles_valid(void)
 			    floor <= previous || floor == DGX_EC_LIMIT_UNSET ||
 			    floor == DGX_EC_LIMIT_STOPPED)
 				return 0;
+			if (!strcmp(profile->name, "EC 3.13.7") &&
+			    floor < DGX_EC_3137_MIN_FLOOR_RPM)
+				return 0;
 			previous = floor;
 		}
 	}
@@ -1000,7 +1007,7 @@ static int dgx_ec_restore_automatic(struct dgx_ec_fan_control_data *data,
 	mutex_lock(&data->lock);
 	for (attempt = 0; attempt < DGX_EC_RESTORE_ATTEMPTS; attempt++) {
 		ret = dgx_ec_restore_automatic_locked(data);
-		if (!ret || ret == -ESTALE || ret == -EOPNOTSUPP)
+		if (!ret || ret == -ESTALE || ret == -EOPNOTSUPP || ret == -EPROTO)
 			break;
 		if (attempt + 1 < DGX_EC_RESTORE_ATTEMPTS)
 			msleep(DGX_EC_RESTORE_RETRY_MS);
@@ -1202,7 +1209,7 @@ static int dgx_ec_probe_failed(struct ffa_device *ffa_dev, int ret)
 	 */
 	if (ret == -ETIMEDOUT || ret == -EIO)
 		return dev_err_probe(&ffa_dev->dev, ret,
-			"EC mailbox did not complete. EC 3.5.8 fan-floor support assumes SoC firmware 2.155.11; October SoC 2.158.15 (0x02009e0f) fails the first read-only query. On EC 3.5.8 the alternative is an ACPI cooling device of type Fan (max_state 100). The BIOS target is 975 + 33.75 * level RPM. Do not write a level below 30: level 0 stops both fans. This driver does not operate that ACPI device\n");
+			"EC mailbox did not complete. EC 3.5.8 fan-floor support assumes the pre-October SoC firmware. October SoC 2.158.15 (0x02009e0f) fails the first read-only query. On EC 3.5.8 the alternative is an ACPI cooling device of type Fan (max_state 100). The BIOS target is 975 + 33.75 * level RPM. Do not write a level below 30: level 0 stops both fans. This driver does not operate that ACPI device\n");
 	return dev_err_probe(&ffa_dev->dev, ret,
 			     "refusing fan-floor cooling device\n");
 }
