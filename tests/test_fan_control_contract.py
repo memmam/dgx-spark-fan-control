@@ -241,6 +241,11 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertNotIn("After=dgx-fan-manual.service", SERVICE)
         self.assertNotIn("Requires=dgx-fan-manual.service", SERVICE)
         self.assertIn("/etc/update-motd.d/95-dgx-fan-control", INSTALL_USERLAND)
+        self.assertIn(
+            "modules_load=/etc/modules-load.d/dgx_ec_fan_control.conf\n", INSTALL_USERLAND
+        )
+        self.assertIn('if [[ ! -e "${modules_load}" ]]; then\n', INSTALL_USERLAND)
+        self.assertIn('echo "leaving existing ${modules_load} unchanged"', INSTALL_USERLAND)
         self.assertIn("systemctl disable --now dgx-fan-watchdog.service\n", UNINSTALL_USERLAND)
         self.assertIn("systemctl disable --now dgx-fan-health.service\n", UNINSTALL_USERLAND)
         self.assertIn("systemctl disable --now dgx-fan-manual.service\n", UNINSTALL_USERLAND)

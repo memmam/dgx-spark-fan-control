@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Install the command, the watchdog, the performance unit, and the health check.
+# Install the boot-load entry, the command, the watchdog, the performance unit,
+# and the health check.
+# Writes the modules-load.d entry only when it is absent, so a file left by
+# `dgx-fan-control module disable` (or one this project did not write) is kept.
 # Enables and starts the fan-stall watchdog unless --no-watchdog.
 # Enables dgx-fan-health.service for the next boot. Does not start it now.
 # Does not enable dgx-fan-control.service. That remains an explicit choice
@@ -28,6 +31,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+modules_load=/etc/modules-load.d/dgx_ec_fan_control.conf
+if [[ ! -e "${modules_load}" ]]; then
+  install -D -m 0644 "${root}/systemd/dgx_ec_fan_control.conf" "${modules_load}"
+else
+  echo "leaving existing ${modules_load} unchanged"
+fi
 install -D -m 0755 "${root}/userspace/dgx_fan_control.py" /usr/local/sbin/dgx-fan-control
 install -D -m 0644 "${root}/systemd/dgx-fan-control.service" \
   /etc/systemd/system/dgx-fan-control.service

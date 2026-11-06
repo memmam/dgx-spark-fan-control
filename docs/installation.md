@@ -239,85 +239,42 @@ sudo dgx-fan-control health --record
 
 ## 5. Choose your startup mode
 
-Install the boot-load entry, the unit files, the health check, and the
-command. This enables and starts `dgx-fan-watchdog.service`, and enables
-`dgx-fan-health.service` and `dgx-fan-manual.service` for the next boot.
-It does **not** enable `dgx-fan-control.service`.
+Install everything that is not optional with one script, run from the
+checkout:
 
 ```sh
-sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
-  /etc/modules-load.d/dgx_ec_fan_control.conf
 sudo ./scripts/install-userland
 ```
 
-The same commands by hand, without the script. Run them from the checkout.
-This installs the command, the four unit files (control, watchdog, health,
-and manual), the motd snippet, the defaults file when it is absent, and the
-modules-load entry, then reloads systemd, enables the health check and
-`dgx-fan-manual.service`, and enables the watchdog. It does **not** enable
-`dgx-fan-control.service`. The defaults file is not overwritten when it
-already exists.
+It installs the boot-load entry, the command, the unit files (control,
+watchdog, health, and manual), the motd snippet, and the defaults file when
+it is absent. It then reloads systemd, enables `dgx-fan-health.service` and
+`dgx-fan-manual.service` for the next boot, and enables and starts
+`dgx-fan-watchdog.service`. It does **not** enable `dgx-fan-control.service`;
+that is the optional mode below. The script is short; read it to see each
+step. It writes the boot-load entry
+(`/etc/modules-load.d/dgx_ec_fan_control.conf`) only when that file is
+absent, so a file left by `module disable` stays disabled. Use
+`module enable` to turn boot loading back on.
+
+Then refresh the stored health record, as in
+[section 4](#4-install-the-command-then-load-the-driver). The script does not
+do this for you.
 
 ```sh
-sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
-sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
-  /etc/modules-load.d/dgx_ec_fan_control.conf
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
-  /etc/systemd/system/dgx-fan-watchdog.service
-sudo install -D -m 0644 systemd/dgx-fan-health.service \
-  /etc/systemd/system/dgx-fan-health.service
-sudo install -D -m 0644 systemd/dgx-fan-manual.service \
-  /etc/systemd/system/dgx-fan-manual.service
-sudo install -D -m 0755 systemd/95-dgx-fan-control \
-  /etc/update-motd.d/95-dgx-fan-control
-if [ ! -f /etc/default/dgx-fan-control ]; then
-  sudo install -D -m 0644 systemd/dgx-fan-control.default \
-    /etc/default/dgx-fan-control
-fi
-sudo systemctl daemon-reload
-sudo systemctl enable dgx-fan-health.service
-sudo systemctl enable dgx-fan-manual.service
-sudo systemctl enable --now dgx-fan-watchdog.service
 sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
-`scripts/install-userland` does not run that refresh. After the script
-with the watchdog enabled, run the same two commands. Why, and what
-`--record` clears, is in
-[section 4](#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
 result. That does not apply to `sudo dgx-fan-control acpi-max` when a
 downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
-To install those files and leave the watchdog disabled, stop before the
-`enable --now` line, or run `sudo ./scripts/install-userland --no-watchdog`.
-The health check still expects the watchdog to be active, so that opt-out
-makes the next health check record needs-intervention. Do not run
-`health --record` while the watchdog is disabled.
-
-Manual removal of the command, the units, the motd snippet, and the defaults
-file, the same steps as `scripts/uninstall-userland`. This does not unload
-the kernel module. Restore the factory curve first, as in
-[maintenance](maintenance.md#uninstall).
-
-```sh
-sudo systemctl disable --now dgx-fan-watchdog.service
-sudo systemctl disable --now dgx-fan-health.service
-sudo systemctl disable --now dgx-fan-manual.service
-sudo systemctl disable --now dgx-fan-control.service
-sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
-sudo rm -f /etc/systemd/system/dgx-fan-health.service
-sudo rm -f /etc/systemd/system/dgx-fan-manual.service
-sudo rm -f /etc/modprobe.d/dgx-fan-control-owned.conf
-sudo rm -f /etc/systemd/system/dgx-fan-control.service
-sudo rm -f /etc/update-motd.d/95-dgx-fan-control
-sudo rm -f /etc/default/dgx-fan-control
-sudo rm -f /usr/local/sbin/dgx-fan-control
-sudo systemctl daemon-reload
-```
+To leave the watchdog disabled, run
+`sudo ./scripts/install-userland --no-watchdog`. The health check still
+expects the watchdog to be active, so that opt-out makes the next health
+check record needs-intervention. Do not run `health --record` while the
+watchdog is disabled.
 
 Then choose one mode:
 

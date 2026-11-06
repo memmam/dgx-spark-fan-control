@@ -442,8 +442,8 @@ again and does not power off. A foreign floor holds the fans high, so
 temperature does not power the machine off on that path. The true-zero
 poweroff stays armed whether or not the health check has failed.
 
-Install starts this as `dgx-fan-watchdog.service`, either with
-`scripts/install-userland` or the manual commands in
+Install starts this as `dgx-fan-watchdog.service`, with
+`scripts/install-userland` in
 [startup modes](installation.md#5-choose-your-startup-mode). That unit does not
 depend on `dgx-fan-control.service` or on the kernel module, so stopping or
 disabling the performance daemon leaves the watchdog running. `module enable`
