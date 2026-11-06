@@ -366,158 +366,24 @@ Continue to [pre-cooling and everyday usage](usage.md).
 
 ## 6. Update the userspace
 
-Do this on every update. It does not rebuild the kernel module.
-
-```sh
-git pull
-sudo ./scripts/install-userland
-sudo dgx-fan-control health
-sudo dgx-fan-control health --record
-```
-
-The script is the same one as in [section 5](#5-choose-your-startup-mode)
-and is safe to rerun. It reinstalls the command, every unit file, and the
-motd snippet. It keeps an existing `/etc/default/dgx-fan-control`, so a
-`BUSY_CHECK`, `READY_CHECK`, or `MANUAL_STATE` you already set is kept, and
-it keeps an existing boot-load entry. It restarts the watchdog and
-`dgx-fan-control.service` only if they are already running, and it does not
-enable the performance service. If you installed with `--no-watchdog`, pass
-it again; without it, the script enables and starts the watchdog.
-
-New optional keys in `systemd/dgx-fan-control.default`, such as
-`PROGRESS_CHECK` and `STUCK_SECONDS`, are not merged into an existing
-`/etc/default` file. Copy the ones you want by hand. The script does not
-touch `/etc/modprobe.d/dgx-fan-control-owned.conf`; if `set-state` wrote it,
-that file is how the next load receives `owned_state` and `owned_floor`.
-
-The first `health` run prints the old record as `stale (written by a
-different install)`; that is expected, and the `--record` run replaces it.
-Why that refresh is required, and what `--record` clears, is in
-[section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
-
-Update the kernel module only when this checkout changes files under
-`kernel/`. Compare the loaded module with this checkout:
-
-```sh
-modinfo dgx_ec_fan_control | grep ^version:
-```
-
-Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
-(currently `0.1.6`). If they already match and `kernel/` did not change,
-stop here. Otherwise use the same module route you installed with:
-[7A](#7a-update-the-module-with-dkms) or
-[7B](#7b-update-the-module-by-hand).
+Userspace and module updates are in
+[Updates and removal](maintenance.md#update-this-projects-source).
+Do that userspace update on every update. It does not rebuild the kernel
+module. Do not build a module before `git pull`.
 
 ## 7A. Update the module with DKMS
 
-Do section 6 first. Run this only after `git pull` in section 6; building
-before the pull rebuilds the old source under the new version number.
-
-Use this when the original install was [3A](#3a-dkms-builds-for-kernel-updates).
-DKMS signs with the enrolled MOK already configured in
-`/etc/dkms/framework.conf`. It does not run `scripts/build-sign`. From the
-checkout, refresh the registered source and rebuild for the running kernel:
-
-```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
-sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
-sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)" --force
-dkms status -m dgx-spark-fan-control
-modinfo -F signer dgx_ec_fan_control
-```
-
-Expect `installed` for `$(uname -r)` and the enrolled certificate subject
-in `signer`. Then unload and reload, and check health without sudo. The
-reload reads `owned_state` and `owned_floor` from
-`/etc/modprobe.d/dgx-fan-control-owned.conf` when that file exists. Loading
-the module puts the fans back on the EC's own curve, so a held manual floor
-is gone after the reload. When the performance daemon is not restarted, the
-block reruns `dgx-fan-manual.service` to reapply it. With no held floor that
-unit exits without writing.
-
-```sh
-if systemctl is-active --quiet dgx-fan-control.service; then
-  sudo systemctl stop dgx-fan-control.service
-  restart_performance=1
-else
-  restart_performance=0
-fi
-if lsmod | grep -q '^dgx_ec_fan_control '; then
-  sudo modprobe -r dgx_ec_fan_control
-fi
-sudo modprobe dgx_ec_fan_control
-if [ "$restart_performance" -eq 1 ]; then
-  sudo systemctl start dgx-fan-control.service
-else
-  sudo systemctl restart dgx-fan-manual.service
-fi
-sudo dgx-fan-control health
-sudo dgx-fan-control health --record
-modinfo dgx_ec_fan_control | grep ^version:
-```
-
-Why that refresh is required, and what `--record` clears, is in
-[section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+After the userspace update, follow
+[Update the module with DKMS](maintenance.md#update-the-module-with-dkms)
+only when that page's version check says `kernel/` changed. Building before
+`git pull` rebuilds the old source under the new version number.
 
 ## 7B. Update the module by hand
 
-Do section 6 first. Run this only after `git pull` in section 6; building
-before the pull rebuilds the old source under the new version number.
-
-Use this when the original install was
-[3B](#3b-manual-build-and-sign). Build and sign with the enrolled MOK, then
-install for the running kernel:
-
-```sh
-./scripts/build-sign
-sudo install -D -m 0644 kernel/dgx_ec_fan_control.ko \
-  "/lib/modules/$(uname -r)/updates/dgx_ec_fan_control.ko"
-sudo depmod -a
-modinfo -F signer dgx_ec_fan_control
-```
-
-Run `./scripts/build-sign` as the user who owns the key. The script does not
-install or load the module. An unsigned module will not load while Secure
-Boot is enforced. Then the same unload, reload, and health check as [7A](#7a-update-the-module-with-dkms).
-`modprobe` applies `owned_state` and `owned_floor` from
-`/etc/modprobe.d/dgx-fan-control-owned.conf`. As in 7A, the reload drops a
-held manual floor, and the block reruns `dgx-fan-manual.service` to reapply
-it when the performance daemon is not restarted.
-
-```sh
-if systemctl is-active --quiet dgx-fan-control.service; then
-  sudo systemctl stop dgx-fan-control.service
-  restart_performance=1
-else
-  restart_performance=0
-fi
-if lsmod | grep -q '^dgx_ec_fan_control '; then
-  sudo modprobe -r dgx_ec_fan_control
-fi
-sudo modprobe dgx_ec_fan_control
-if [ "$restart_performance" -eq 1 ]; then
-  sudo systemctl start dgx-fan-control.service
-else
-  sudo systemctl restart dgx-fan-manual.service
-fi
-sudo dgx-fan-control health
-sudo dgx-fan-control health --record
-modinfo dgx_ec_fan_control | grep ^version:
-```
-
-Why that refresh is required, and what `--record` clears, is in
-[section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+After the userspace update, follow
+[Update the module by hand](maintenance.md#update-the-module-by-hand)
+only when that page's version check says `kernel/` changed. Building before
+`git pull` rebuilds the old source under the new version number.
 
 ## EC firmware pairing and downgrade
 

@@ -67,56 +67,179 @@ After reboot, perform the status checks above.
 
 ## Update this project's source
 
-Do this between jobs. First restore automatic control and unload the existing
-module; do not proceed if restoration or readback fails. A persistently pending
-relay needs [maintenance recovery](troubleshooting.md#persistent-pending-and-service-exit-69)
-before the new module can be loaded safely:
+Do this between jobs. Update the userspace on every update. Rebuild the kernel
+module only when the version check below says `kernel/` changed. A persistently
+pending relay needs
+[maintenance recovery](troubleshooting.md#persistent-pending-and-service-exit-69)
+before the new module can be loaded safely.
+
+### Update the userspace
+
+Do this on every update. It does not rebuild the kernel module.
+
+```sh
+git pull --ff-only
+./scripts/check
+sudo ./scripts/install-userland
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+```
+
+`--ff-only` refuses a diverged checkout instead of merging. `./scripts/check`
+is the same test run as a fresh install.
+
+The script is the same one as in
+[Choose your startup mode](installation.md#5-choose-your-startup-mode) and is
+safe to rerun. It reinstalls the command, every unit file, and the motd
+snippet. It keeps an existing `/etc/default/dgx-fan-control`, so a
+`BUSY_CHECK`, `READY_CHECK`, or `MANUAL_STATE` you already set is kept, and
+it keeps an existing boot-load entry. It restarts the watchdog and
+`dgx-fan-control.service` only if they are already running, and it does not
+enable the performance service. If you installed with `--no-watchdog`, pass
+it again; without it, the script enables and starts the watchdog.
+
+New optional keys in `systemd/dgx-fan-control.default`, such as
+`PROGRESS_CHECK` and `STUCK_SECONDS`, are not merged into an existing
+`/etc/default` file. Copy the ones you want by hand. The script does not
+touch `/etc/modprobe.d/dgx-fan-control-owned.conf`; if `set-state` wrote it,
+that file is how the next load receives `owned_state` and `owned_floor`.
+
+The first `health` run prints the old record as `stale (written by a
+different install)`; that is expected, and the `--record` run replaces it.
+Why that refresh is required, and what `--record` clears, is in
+[Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+
+### Decide whether the kernel module changed
+
+```sh
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
+(currently `0.1.6`). If they already match and `kernel/` did not change,
+stop here. Otherwise use the same module route you installed with:
+[DKMS](#update-the-module-with-dkms) or
+[by hand](#update-the-module-by-hand).
+
+Run either module route only after the `git pull` above. Building before the
+pull rebuilds the old source under the new version number.
+
+First restore automatic control and unload the existing module. Do not proceed
+if restoration or readback fails. This clears a held floor on purpose:
 
 ```sh
 sudo systemctl stop dgx-fan-control.service
 sudo dgx-fan-control automatic
 dgx-fan-control status                    # require state=0/12 (daemon not setting a floor; EC's own curve)
 sudo modprobe -r dgx_ec_fan_control
-git pull --ff-only
-./scripts/check
 ```
 
-Then follow the route you originally installed:
+### Update the module with DKMS
 
-- **Manual:** repeat the manual build/sign/install commands for the running
-  kernel. Also rebuild for other installed kernels you intend to boot.
-- **DKMS:** remove the old registered version. Upgrading from 0.1.4:
-  `sudo dkms remove dgx-spark-fan-control/0.1.4 --all`
-  (from 0.1.0: `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`).
-  Check `dkms status` for the installed version, then repeat the source-copy,
-  add, build, and install steps in the installation guide. Use the version in
-  the new checkout's `dkms.conf` (currently `0.1.6`) wherever the commands
-  name a version. This also refreshes a changed checkout that retains the
-  same version; `git pull` alone does not refresh DKMS's stored source.
-  Build for every additional installed kernel you intend to boot.
-  DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
-  in the next step or the previous CLI remains.
+Use this when the original install was
+[DKMS](installation.md#3a-dkms-builds-for-kernel-updates).
+DKMS signs with the enrolled MOK already configured in
+`/etc/dkms/framework.conf`. It does not run `scripts/build-sign`.
 
-Refresh the command, the unit files, and the motd snippet, then load and
-check the new module. `install-userland` keeps an existing
-`/etc/default/dgx-fan-control` and boot-load entry, restarts the watchdog and
-`dgx-fan-control.service` only if they are already running, and does not
-enable the performance daemon. If you installed with `--no-watchdog`, pass it
-again. The full update steps are in
-[Update the userspace](installation.md#6-update-the-userspace). Rebuild the
-module only when that section's version check says to, using
-[7A](installation.md#7a-update-the-module-with-dkms) or
-[7B](installation.md#7b-update-the-module-by-hand).
+`git pull` alone does not refresh DKMS's stored source. Use the version in
+the new checkout's `dkms.conf` (currently `0.1.6`) wherever a command names a
+version. When `dkms status` still shows an older registered version, remove
+that version before registering the new one. Upgrading from 0.1.4:
+`sudo dkms remove dgx-spark-fan-control/0.1.4 --all`
+(from 0.1.0: `sudo dkms remove -m dgx-spark-fan-control -v 0.1.0 --all`).
+Check `dkms status` and substitute the version it prints.
+
+From the checkout, refresh the registered source and rebuild for the running
+kernel. `dkms install --force` refreshes a checkout that kept the same
+version. If this version is not registered yet, the add/build/install steps
+in the DKMS installation route are the first-time form of the same copy:
 
 ```sh
-sudo ./scripts/install-userland
-sudo modprobe dgx_ec_fan_control
-dgx-fan-control status
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
+sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
+  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
+sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)" --force
+dkms status -m dgx-spark-fan-control
+modinfo -F signer dgx_ec_fan_control
 ```
+
+Expect `installed` for `$(uname -r)` and the enrolled certificate subject
+in `signer`. Build for every additional installed kernel you intend to boot.
+DKMS does not update `/usr/local/sbin/dgx-fan-control`; the userspace step
+above does.
+
+Then [reload and check](#reload-and-check). The reload reads `owned_state`
+and `owned_floor` from `/etc/modprobe.d/dgx-fan-control-owned.conf` when that
+file exists. Loading the module puts the fans back on the EC's own curve, so
+a held manual floor is gone after the reload. Because automatic already
+cleared that floor, `dgx-fan-manual.service` exits without writing. If the
+performance daemon was not running and a floor is still recorded, the reload
+block reruns that unit to reapply it.
+
+### Update the module by hand
+
+Use this when the original install was
+[manual build and sign](installation.md#3b-manual-build-and-sign).
+Build and sign with the enrolled MOK, then install for the running kernel.
+Use the same `DGX_MOK_DIR` override as at installation, if any. For any other
+installed kernel you intend to boot, repeat the build with that kernel's
+headers as in [Kernel updates with manual builds](#kernel-updates-with-manual-builds).
+
+```sh
+./scripts/build-sign
+sudo install -D -m 0644 kernel/dgx_ec_fan_control.ko \
+  "/lib/modules/$(uname -r)/updates/dgx_ec_fan_control.ko"
+sudo depmod -a
+modinfo -F signer dgx_ec_fan_control
+```
+
+Run `./scripts/build-sign` as the user who owns the key. The script does not
+install or load the module. An unsigned module will not load while Secure
+Boot is enforced. Then the same [reload and check](#reload-and-check) as
+DKMS. `modprobe` applies `owned_state` and `owned_floor` from
+`/etc/modprobe.d/dgx-fan-control-owned.conf`. As in the DKMS route, the
+reload drops a held manual floor, and the block reruns
+`dgx-fan-manual.service` to reapply it when the performance daemon is not
+restarted.
+
+### Reload and check
+
+```sh
+if systemctl is-active --quiet dgx-fan-control.service; then
+  sudo systemctl stop dgx-fan-control.service
+  restart_performance=1
+else
+  restart_performance=0
+fi
+if lsmod | grep -q '^dgx_ec_fan_control '; then
+  sudo modprobe -r dgx_ec_fan_control
+fi
+sudo modprobe dgx_ec_fan_control
+if [ "$restart_performance" -eq 1 ]; then
+  sudo systemctl start dgx-fan-control.service
+else
+  sudo systemctl restart dgx-fan-manual.service
+fi
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+Why that refresh is required, and what `--record` clears, is in
+[Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ## Switch from manual installation to DKMS
 
-Restore automatic mode and unload the module as above. Remove the manually
+Restore automatic mode and unload the module as in
+[Decide whether the kernel module changed](#decide-whether-the-kernel-module-changed).
+Remove the manually
 installed file for the running kernel:
 
 ```sh
