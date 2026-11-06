@@ -2153,11 +2153,11 @@ class UserlandFailureTests(unittest.TestCase):
                 text,
             )
             self.assertIn(
-                "stale (previous boot, firmware not recorded, older version)",
+                "stale (previous boot, firmware not recorded, older record format)",
                 text,
             )
             self.assertIn(
-                "run `sudo dgx-fan-control health --record` to refresh",
+                "`sudo dgx-fan-control health --record` saves the current result",
                 text,
             )
             self.assertIn("recorded: no", text)
@@ -2221,9 +2221,9 @@ class UserlandFailureTests(unittest.TestCase):
                 ),
                 text,
             )
-            self.assertIn("stale (firmware changed, older version)", text)
+            self.assertIn("stale (firmware changed, older record format)", text)
             self.assertIn(
-                "run `sudo dgx-fan-control health --record` to refresh",
+                "`sudo dgx-fan-control health --record` saves the current result",
                 text,
             )
             self.assertEqual(
@@ -2238,78 +2238,101 @@ class UserlandFailureTests(unittest.TestCase):
         shown_time = CONTROL.time.strftime(
             "%Y-%m-%d %H:%M:%S %Z", CONTROL.time.localtime(stamp),
         )
-        hint = (
-            "(superseded by current healthy result; "
-            "run `sudo dgx-fan-control health --record` to refresh)"
+        clears = (
+            "on a healthy run it also clears the stored needs-intervention flag "
+            "and the stall and watchdog-reboot markers"
         )
         current = (
             "result=needs-intervention\nready=not configured\n"
             f"boot_id=boot-b\ntime={stamp:.3f}\n"
             f"version={CONTROL.HEALTH_RECORD_VERSION}\n"
+            f"code={CONTROL.HEALTH_CODE}\n"
             "firmware=EC 3.13.7\n"
-            "reason=workload not ready\n"
+            "reason=fans: fail\n"
         )
-        fresh = CONTROL.format_stored_health(
-            current, "boot-b", "EC 3.13.7", current_healthy=True,
-        )
-        self.assertIn(f"time={shown_time}", fresh)
-        self.assertNotIn(f"time={stamp:.3f}", fresh)
-        self.assertNotIn("stale", fresh)
-        self.assertNotIn("superseded", fresh)
 
-        raw_time = CONTROL.format_stored_health(
-            current.replace(f"time={stamp:.3f}", "time=not-a-time"),
-            "boot-b", "EC 3.13.7", current_healthy=True,
-        )
-        self.assertIn("time=not-a-time", raw_time)
-        self.assertNotIn("stale", raw_time)
+        def fmt(text, healthy=True, boot="boot-b"):
+            return CONTROL.format_stored_health(
+                text, boot, "EC 3.13.7", current_healthy=healthy,
+            )
 
-        missing_firmware = CONTROL.format_stored_health(
-            current.replace("firmware=EC 3.13.7\n", ""),
-            "boot-b", "EC 3.13.7", current_healthy=True,
-        )
-        self.assertIn(f"time={shown_time}", missing_firmware)
-        self.assertIn("stale (firmware not recorded)", missing_firmware)
-        self.assertNotIn("older version", missing_firmware)
-        self.assertNotIn("previous boot", missing_firmware)
-        self.assertIn(hint, missing_firmware)
+        # Same boot, same install, a real earlier failure: not stale, but the
+        # reason and a note are shown so it is not mistaken for the current run.
+        line, hint = fmt(current)
+        self.assertIn(f"time={shown_time}", line)
+        self.assertNotIn(f"time={stamp:.3f}", line)
+        self.assertIn("reason=fans: fail", line)
+        self.assertNotIn("stale", line)
+        self.assertIn("an earlier run this boot failed", hint)
+        self.assertIn(clears, hint)
+        self.assertIn("logs and broadcasts that recovery once", hint)
 
-        missing_version = CONTROL.format_stored_health(
-            current.replace(f"version={CONTROL.HEALTH_RECORD_VERSION}\n", ""),
-            "boot-b", "EC 3.13.7", current_healthy=True,
-        )
-        self.assertIn("stale (older version)", missing_version)
-        self.assertNotIn("firmware not recorded", missing_version)
-        self.assertNotIn("firmware changed", missing_version)
-        self.assertIn(hint, missing_version)
+        # Do not claim the failure was this boot when either boot id is missing.
+        # The --record sentence still says "this boot" about a watchdog reboot.
+        line, hint = fmt(current, boot=None)
+        self.assertNotIn("stale", line)
+        self.assertNotIn("an earlier run this boot failed", hint)
+        self.assertIn("an earlier recorded run failed", hint)
+        line, hint = fmt(current.replace("boot_id=boot-b\n", "boot_id=\n"))
+        self.assertNotIn("stale", line)
+        self.assertNotIn("an earlier run this boot failed", hint)
 
-        different_version = CONTROL.format_stored_health(
-            current.replace(
-                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
-            ),
-            "boot-b", "EC 3.13.7", current_healthy=True,
-        )
-        self.assertIn("stale (older version)", different_version)
-        self.assertNotIn("firmware not recorded", different_version)
-        self.assertIn(hint, different_version)
+        # The same record during a failing run gets no note.
+        line, hint = fmt(current, healthy=False)
+        self.assertNotIn("stale", line)
+        self.assertIsNone(hint)
 
-        failed_run = CONTROL.format_stored_health(
-            current.replace(
-                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
-            ),
-            "boot-b", "EC 3.13.7", current_healthy=False,
-        )
-        self.assertIn("stale (older version)", failed_run)
-        self.assertNotIn("superseded", failed_run)
+        line, _hint = fmt(current.replace(f"time={stamp:.3f}", "time=not-a-time"))
+        self.assertIn("time=not-a-time", line)
+        self.assertNotIn("stale", line)
+        line, _hint = fmt(current.replace(f"time={stamp:.3f}", "time=nan"))
+        self.assertIn("time=nan", line)
+        line, _hint = fmt(current.replace(f"time={stamp:.3f}", "time=1e309"))
+        self.assertIn("time=1e309", line)
 
-        previous_healthy = CONTROL.format_stored_health(
-            current.replace("result=needs-intervention", "result=healthy").replace(
-                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
-            ),
-            "boot-b", "EC 3.13.7", current_healthy=True,
+        line, hint = fmt(current.replace("firmware=EC 3.13.7\n", ""))
+        self.assertIn("stale (firmware not recorded)", line)
+        self.assertIn("superseded by the current healthy run", hint)
+        self.assertIn(clears, hint)
+
+        line, hint = fmt(current.replace(
+            f"version={CONTROL.HEALTH_RECORD_VERSION}\n", "",
+        ))
+        self.assertIn("stale (older record format)", line)
+        self.assertIn("superseded", hint)
+
+        line, _hint = fmt(current.replace(
+            f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=1",
+        ))
+        self.assertIn("stale (older record format)", line)
+        self.assertNotIn("different install", line)
+
+        # Any reinstall of different code marks the record stale without a
+        # hand-bumped format number.
+        line, hint = fmt(current.replace(
+            f"code={CONTROL.HEALTH_CODE}", "code=000000000000",
+        ))
+        self.assertIn("stale (written by a different install)", line)
+        self.assertIn("superseded", hint)
+
+        line, hint = fmt(current.replace(f"code={CONTROL.HEALTH_CODE}\n", ""))
+        self.assertIn("stale (written by a different install)", line)
+
+        line, hint = fmt(current, boot="boot-c")
+        self.assertIn("stale (previous boot)", line)
+        self.assertIn("superseded", hint)
+
+        line, hint = fmt(
+            current.replace("result=needs-intervention", "result=healthy")
+            .replace("reason=fans: fail\n", "")
+            .replace(f"code={CONTROL.HEALTH_CODE}", "code=000000000000"),
         )
-        self.assertIn("stale (older version)", previous_healthy)
-        self.assertNotIn("superseded", previous_healthy)
+        self.assertIn("stale (written by a different install)", line)
+        self.assertNotIn("reason=", line)
+        self.assertIsNone(hint)
+
+        self.assertEqual(fmt("none"), ("none", None))
+        self.assertEqual(fmt(CONTROL.NEEDS_ROOT), (CONTROL.NEEDS_ROOT, None))
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2341,8 +2364,15 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(code, 0, text)
             self.assertIn("health: healthy", text)
             self.assertIn(f"time={shown_time}", text)
-            self.assertIn("stale (firmware not recorded, older version)", text)
-            self.assertIn(hint, text)
+            self.assertIn("reason=workload not ready", text)
+            self.assertIn(
+                "stale (firmware not recorded, older record format)", text,
+            )
+            self.assertIn(
+                "stored health note: superseded by the current healthy run.",
+                text,
+            )
+            self.assertIn(clears, text)
             self.assertIn("recorded: no", text)
             self.assertEqual(health.read_text(encoding="ascii"), original)
             self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
@@ -2352,14 +2382,129 @@ class UserlandFailureTests(unittest.TestCase):
             )
             written = health.read_text(encoding="ascii")
             self.assertIn(f"version={CONTROL.HEALTH_RECORD_VERSION}\n", written)
+            self.assertIn(f"code={CONTROL.HEALTH_CODE}\n", written)
             self.assertIn("firmware=EC 3.13.7\n", written)
             self.assertNotIn("needs-intervention", written)
-            refreshed = CONTROL.format_stored_health(
-                written, "boot-b", "EC 3.13.7", current_healthy=True,
+            line, hint = fmt(written)
+            self.assertIn(f"time={shown_time}", line)
+            self.assertNotIn("stale", line)
+            self.assertIsNone(hint)
+
+    def test_health_cli_prints_stored_record_and_does_not_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            shown = CONTROL.time.strftime(
+                "%Y-%m-%d %H:%M:%S %Z", CONTROL.time.localtime(1793949945.325),
             )
-            self.assertIn(f"time={shown_time}", refreshed)
-            self.assertNotIn("stale", refreshed)
-            self.assertNotIn("superseded", refreshed)
+
+            def run(argv, *, loaded=True):
+                with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                     patch.object(CONTROL.os, "geteuid", return_value=1000), \
+                     patch.object(CONTROL, "read_boot_id", return_value="boot-now"), \
+                     patch.object(CONTROL, "read_kernel_log", return_value=""), \
+                     patch.object(
+                         CONTROL, "read_daemon_facts",
+                         return_value=("inactive", "disabled", None, None, None),
+                     ), \
+                     patch.object(
+                         CONTROL, "watchdog_unit_state",
+                         return_value=("active", "enabled"),
+                     ), \
+                     patch.object(CONTROL, "_module_loaded_now", return_value=loaded):
+                    return run_cli([
+                        "--thermal-root", str(root / "thermal"),
+                        "--hwmon-root", str(root / "hwmon"),
+                        *argv,
+                    ])
+
+            old = (
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-old\ntime=not-a-time\n"
+                "reason=workload not ready\n"
+            )
+            CONTROL.write_state_text(health, old)
+            code, stdout, stderr = run(["health"])
+            combined = stdout + stderr
+            self.assertEqual(code, 0, combined)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn("time=not-a-time", stdout)
+            self.assertIn("reason=workload not ready", stdout)
+            self.assertIn(
+                "stale (previous boot, firmware not recorded, older record format)",
+                stdout,
+            )
+            self.assertIn(
+                "stored health note: superseded by the current healthy run.",
+                stdout,
+            )
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(health.read_text(encoding="ascii"), old)
+
+            same = (
+                "result=needs-intervention\nready=fail\n"
+                "boot_id=boot-now\ntime=1793949945.325\n"
+                f"version={CONTROL.HEALTH_RECORD_VERSION}\n"
+                f"code={CONTROL.HEALTH_CODE}\n"
+                "firmware=unknown\n"
+                "reason=fans: fail\n"
+            )
+            CONTROL.write_state_text(health, same)
+            code, stdout, stderr = run(["health", "--record"])
+            combined = stdout + stderr
+            self.assertEqual(code, 1, combined)
+            self.assertIn("health --record requires root", stdout)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn(f"time={shown}", stdout)
+            self.assertIn("reason=fans: fail", stdout)
+            self.assertIn(
+                "stored health note: an earlier run this boot failed; "
+                "the current run is healthy.",
+                stdout,
+            )
+            self.assertNotIn("stale (", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(health.read_text(encoding="ascii"), same)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+
+            code, stdout, stderr = run(["health"], loaded=False)
+            combined = stdout + stderr
+            self.assertEqual(code, 1, combined)
+            self.assertIn("health: fail", stdout)
+            self.assertIn("reason=fans: fail", stdout)
+            self.assertNotIn("stored health note:", stdout)
+            self.assertEqual(health.read_text(encoding="ascii"), same)
+
+            health.unlink()
+            code, stdout, stderr = run(["health"])
+            combined = stdout + stderr
+            self.assertEqual(code, 0, combined)
+            self.assertIn("stored health: none", stdout)
+            self.assertNotIn("stored health note:", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertFalse(health.exists())
+
+            CONTROL.write_state_text(health, same)
+            real_read = Path.read_text
+
+            def deny_health(self, *args, **kwargs):
+                if self.name == CONTROL.HEALTH_NAME:
+                    raise PermissionError(errno.EACCES, "Permission denied")
+                return real_read(self, *args, **kwargs)
+
+            with patch.object(Path, "read_text", deny_health):
+                code, stdout, stderr = run(["health"])
+            combined = stdout + stderr
+            self.assertEqual(code, 0, combined)
+            self.assertIn("stored health: unknown (needs root)", stdout)
+            self.assertNotIn("stored health note:", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(health.read_text(encoding="ascii"), same)
 
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"

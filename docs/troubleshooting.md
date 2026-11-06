@@ -67,6 +67,47 @@ be readable. Do not register a second fan driver or send raw mailbox commands
 to work around the rejection. The ACPI `Fan` cooling device does not change
 fan speed on this EC either.
 
+## Stored health still says needs-intervention
+
+`health: healthy` and a stored `needs-intervention` can both be true. The
+checks are this run. `stored health:` is the last file under
+`/var/lib/dgx-fan-control/health`, and a plain `health` does not rewrite it.
+`recorded: no` means it did not. EC 3.13.7 telemetry-only stays a pass. That
+state is not written as needs-intervention.
+
+The time is this Spark's local time, with the zone abbreviation. These
+machines are set to UTC, so expect `time=2026-11-06 07:25:45 UTC`.
+`sudo timedatectl set-timezone America/Los_Angeles` is optional. It changes
+only how the stamp is shown. A value that is not a number is printed as
+stored.
+
+`stale (...)` names every reason that applies:
+
+- `previous boot`
+- `firmware changed`, when both firmwares are known and they differ
+- `firmware not recorded`, which is a file from before that field existed
+- `older record format`, when `version=` is missing or is not `2`
+- `written by a different install`, when the format is current but `code=`
+  does not match this program. `code=` is 12 hex characters of the script's
+  SHA-256. Installing a different build does this without a version edit.
+  Installing the same bytes does not.
+
+A separate `stored health note:` follows when this run is healthy and the
+stored result is needs-intervention. A stale record says it was superseded
+by the current healthy run. A record from this same boot and this same
+install is not stale: `stored health:` keeps `reason=`, and the note says
+an earlier run this boot failed. The note tells you that
+`sudo dgx-fan-control health --record` saves this result and, on a healthy
+run, clears the needs-intervention flag, the stall marker, and the
+watchdog-reboot marker. If this boot follows a watchdog reboot that has not
+been announced, that command also logs and broadcasts
+`recovered after watchdog reboot` once. A missing file prints
+`stored health: none`. A file you cannot read prints
+`stored health: unknown (needs root)`.
+
+The motd snippet and `status` read the needs-intervention flag, not this
+file. The watchdog does not read it either.
+
 ## Block or allow EC firmware updates
 
 fwupd can install EC 3.13.7 over 3.5.8 and remove fan-floor control. The

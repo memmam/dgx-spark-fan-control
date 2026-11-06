@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import logging
 import math
@@ -517,7 +518,29 @@ INTERVENTION_NAME = "needs-intervention"
 HEALTH_NAME = "health"
 # Schema of the on-disk health file. A missing or different value was written
 # by older code and is shown as stale. Plain health does not rewrite it.
-HEALTH_RECORD_VERSION = "1"
+HEALTH_RECORD_VERSION = "2"
+
+
+def _code_fingerprint() -> str:
+    """Short hash of this file. Different bytes are a different install.
+
+    The format number above changes only by hand. This changes when the
+    installed script's bytes change, so a new build does not need a bump.
+    Reinstalling the same bytes does not.
+    """
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+HEALTH_CODE = _code_fingerprint()
+RECORD_HINT = (
+    "`sudo dgx-fan-control health --record` saves the current result; on a "
+    "healthy run it also clears the stored needs-intervention flag and the "
+    "stall and watchdog-reboot markers, and, if this boot follows a watchdog "
+    "reboot that has not been announced, logs and broadcasts that recovery once."
+)
 NOTIFY_DEFAULT = Path("/etc/default/dgx-fan-control")
 
 
@@ -1689,6 +1712,7 @@ def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
         f"boot_id={boot_id or ''}",
         f"time={when:.3f}",
         f"version={HEALTH_RECORD_VERSION}",
+        f"code={HEALTH_CODE}",
     ]
     if firmware:
         lines.append(f"firmware={firmware}")
@@ -1747,15 +1771,16 @@ def _format_record_time(raw: str) -> str:
 
 
 def format_stored_health(text: str, boot_id: str | None, firmware: str, *,
-                         current_healthy: bool = False) -> str:
-    """One stored-health line. Time is local. Old records are marked stale.
+                         current_healthy: bool = False) -> tuple[str, str | None]:
+    """The stored-health line and an optional hint line. Never rewrites the file.
 
-    A missing firmware or schema version was written by older code. This does
-    not rewrite the file. A stale needs-intervention result names the refresh
-    command when this run is healthy.
+    Time is local. A record is stale when it is from a previous boot, other
+    firmware, an older record format, or a different installed script. A stored
+    needs-intervention result shows its reason, and when this run is healthy
+    the hint says so and what --record would also clear.
     """
     if text in {"none", NEEDS_ROOT}:
-        return text
+        return text, None
     fields = _health_record_fields(text)
     parts = []
     if "result" in fields:
@@ -1764,6 +1789,9 @@ def format_stored_health(text: str, boot_id: str | None, firmware: str, *,
         parts.append(f"ready={fields['ready']}")
     if "time" in fields:
         parts.append("time=" + _format_record_time(fields["time"]))
+    failed = fields.get("result") == "needs-intervention"
+    if failed and fields.get("reason"):
+        parts.append(f"reason={fields['reason']}")
     stale = []
     stored_boot = fields.get("boot_id")
     if stored_boot and boot_id and stored_boot != boot_id:
@@ -1774,15 +1802,24 @@ def format_stored_health(text: str, boot_id: str | None, firmware: str, *,
     elif firmware != "unknown" and stored_firmware != firmware:
         stale.append("firmware changed")
     if fields.get("version") != HEALTH_RECORD_VERSION:
-        stale.append("older version")
+        # An older format has no comparable code=, so that is the whole reason.
+        stale.append("older record format")
+    elif fields.get("code") != HEALTH_CODE:
+        stale.append("written by a different install")
     if stale:
         parts.append("stale (" + ", ".join(stale) + ")")
-        if current_healthy and fields.get("result") == "needs-intervention":
-            parts.append(
-                "(superseded by current healthy result; "
-                "run `sudo dgx-fan-control health --record` to refresh)"
-            )
-    return " ".join(parts) if parts else text.splitlines()[0]
+    line = " ".join(parts) if parts else text.splitlines()[0]
+    hint = None
+    if failed and current_healthy:
+        if stale:
+            lead = "superseded by the current healthy run"
+        elif stored_boot and boot_id and stored_boot == boot_id:
+            lead = "an earlier run this boot failed; the current run is healthy"
+        else:
+            # Boot ids were missing, so this is not known to be the same boot.
+            lead = "an earlier recorded run failed; the current run is healthy"
+        hint = f"{lead}. {RECORD_HINT}"
+    return line, hint
 
 
 def run_notify(defaults: dict[str, str], summary: str) -> None:
@@ -1983,12 +2020,14 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     stored_flag = _stored_text(intervention_path)
     if stored_flag not in {"none", NEEDS_ROOT} and stored_flag.startswith("reason="):
         stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
-    stored_health = format_stored_health(
+    stored_health, stored_hint = format_stored_health(
         _stored_text(health_path), boot_id, firmware,
         current_healthy=not problems,
     )
     print(f"stored needs-intervention: {stored_flag}", flush=True)
     print(f"stored health: {stored_health}", flush=True)
+    if stored_hint:
+        print(f"stored health note: {stored_hint}", flush=True)
     print("recorded: yes" if record else "recorded: no", flush=True)
     return 0 if not problems else 1
 

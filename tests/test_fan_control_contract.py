@@ -248,6 +248,7 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertNotIn("PrivateNetwork=", health)
         motd = (ROOT / "systemd" / "95-dgx-fan-control").read_text()
         self.assertIn("/var/lib/dgx-fan-control/needs-intervention", motd)
+        self.assertNotIn("/var/lib/dgx-fan-control/health", motd)
         self.assertIn("s/^reason=//p", motd)
         defaults = (ROOT / "systemd" / "dgx-fan-control.default").read_text()
         self.assertIn("READY_CHECK=\n", defaults)

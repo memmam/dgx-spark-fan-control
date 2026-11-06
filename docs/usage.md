@@ -518,18 +518,51 @@ The boot unit is different. `dgx-fan-health.service` runs
 `dgx-fan-control health --record --settle 45` as root. `--settle 45` retries
 for 45 seconds so a slow module load can still pass, and each failed attempt
 is one journal line naming the failing checks. `--record` writes
-`/var/lib/dgx-fan-control/health`, clears the reboot marker on pass, and on
-failure writes the needs-intervention flag. It does not reboot. If this boot
-followed a watchdog reboot, a pass logs and broadcasts `recovered after
-watchdog reboot` once. Root, including `sudo dgx-fan-control health`, records
-the same way. `--record` without root prints that it requires root and still
-prints the checks.
+`/var/lib/dgx-fan-control/health`. On a pass it clears the
+needs-intervention flag, the stall marker, and the watchdog-reboot marker.
+If this boot followed a watchdog reboot that has not been announced yet, it
+also logs and broadcasts `recovered after watchdog reboot` once. On failure
+it writes the needs-intervention flag. It does not reboot. Root, including
+`sudo dgx-fan-control health`, records the same way. `--record` without root
+prints that it requires root and still prints the checks. It does not write.
+
+The checks above are this run. The stored lines underneath are the last
+recorded file, which a plain `health` does not rewrite. `recorded: no` means
+it did not. `stored health:` is one line: `result=`, `ready=`, `time=` in
+this machine's local zone, and `reason=` when the stored result is
+needs-intervention. These Sparks are set to UTC, so a stamp looks like
+`time=2026-11-06 07:25:45 UTC`. `sudo timedatectl set-timezone America/Los_Angeles`
+is optional and only changes the display. A time that is not a number is
+printed unchanged.
+
+The record is marked `stale (...)` for any of these that apply:
+
+- `previous boot`, when `boot_id` differs
+- `firmware changed`, when the stored firmware and the current one are both known and differ
+- `firmware not recorded`, when the file has no `firmware=` field
+- `older record format`, when `version=` is missing or is not `2`
+- `written by a different install`, when `version=` is current but `code=`
+  is missing or is not this script. `code=` is the first 12 hex characters
+  of the SHA-256 of the installed program. A new build marks older records
+  stale without a format bump. Reinstalling the same bytes does not.
+
+When this run is healthy and the stored result is still needs-intervention,
+the next line is `stored health note:`. A stale record says it was
+superseded by the current healthy run. A record from this same boot and
+this same install is not stale: the `reason=` stays on the health line, and
+the note says an earlier run this boot failed while this run is healthy.
+The note names `sudo dgx-fan-control health --record` and what that command
+clears, including the one recovery broadcast above. A missing file prints
+`stored health: none`. A file this user cannot read prints
+`stored health: unknown (needs root)`.
 
 `status` prints `NEEDS INTERVENTION:` while the flag is readable, and
 `unknown (needs root)` for a sysfs value it cannot read.
 `dgx-fan-control health --clear` removes the flag and requires root.
 A later recorded pass removes it too.
-`/etc/update-motd.d/95-dgx-fan-control` prints the reason on a later SSH login.
+`/etc/update-motd.d/95-dgx-fan-control` prints that flag's reason on a later
+SSH login. It reads `/var/lib/dgx-fan-control/needs-intervention` only, not
+the health file, so `code=` and the stored-health note do not appear there.
 
 `DGX_FAN_NOTIFY` is empty by default. When a recorded check has it set, the
 summary is written to that command's standard input on failure and on recovery.
