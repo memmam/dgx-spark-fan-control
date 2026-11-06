@@ -197,52 +197,87 @@ writes and other writers outside this project are not tracked or interlocked.
 
 ### Escalation and recovery
 
-All thresholds refer to the **hottest thermal zone**, never the burn view:
+All thresholds refer to the **hottest thermal zone**, never the burn view.
+The same ladder applies in both phases. The ACPI phase is the only one
+that writes a fan level. The gaps between 70, 80, 85, and 90 C are
+temperature headroom, not a promise of time. A later poll can already be
+at 90 C, and that poll does not wait out the lower stages.
 
-1. **80 C:** force level 100 on every ACPI Fan cooler that is not already
-   at 100, log at critical severity, and latch 100 until reboot. Lower-level
-   writes from this project are then refused, including another sweep.
-2. **85 C:** persist an incident latch and start the optional stop hook
-   asynchronously. With no hook, a start failure, or a failed hook, send
-   SIGTERM to eligible workload processes immediately. Otherwise allow
-   **10 seconds** for the hook to cool the hottest zone below **83 C**;
-   if it does not, send SIGTERM. A timed-out hook is killed without waiting
-   for it. The stop hook does not resume the job.
-3. **90 C:** preempt the hook and all SIGTERM grace, and send SIGKILL.
+1. **70 C, advisory only.** Log one warning. The human text asks for a
+   checkpoint or a lighter load and says this is not a failure. The same
+   line is machine-readable: `acpi_thermal_advisory` with `phase=acpi` or
+   `phase=ec`, `zone_c`, `advisory_c`, `action=none`, `incident=no`, and
+   `timer=no`. Holding **70 C through 79.9 C** does this and nothing else,
+   for as long as the zone stays there. It does not start the stop hook,
+   send a signal, force a fan level, write the incident latch, write the
+   phase-2 stop marker, or start a timer. The line is not repeated until
+   the zone falls below **68 C** (advisory minus hysteresis) and then
+   reaches 70 C again. A jump straight to 80 C or above does not emit the
+   advisory on that poll; the stop ladder is the record of that poll.
+2. **80 C.** In the ACPI phase, force level 100 on every ACPI Fan cooler
+   that is not already at 100, and latch 100 until reboot. In the EC-only
+   phase, write no `cur_state`. If `ACPI_THERMAL_STOP_HOOK` is set and the
+   zone is still under 85 C, start that hook. Phase 1 records the incident
+   latch here, because level 100 has replaced the EC curve. Phase 2 records
+   the EC-stop marker here, so a resume hook cannot start a job this boot
+   has already begun to stop. **No hook configured:** do not send SIGTERM.
+   There is no timer. The zone may sit at 80–84.9 C indefinitely and the
+   only signal is still the one at 85 C. That is the no-hook reaction
+   window, from the 70 C advisory through 85 C.
+3. **Hook running, or a hook that exited 0.** It has **10 seconds**, unless
+   the zone reaches 85 C or 90 C first. If those 10 seconds end and the
+   zone is still at least **83 C**, send SIGTERM even though the zone is
+   under 85 C. That timeout exists only because a hook was started. If the
+   grace ends below 83 C, wait; SIGTERM is sent if the zone returns to
+   85 C. A hook that **fails to start or exits non-zero** is not the
+   no-hook window: SIGTERM is sent on that same poll, including under 85 C.
+4. **85 C:** if the workload is not already confirmed stopped, send
+   SIGTERM. This preempts a hook that is still inside its 10 seconds.
+   With no hook, this is the first signal, however long the zone has
+   already been at 70–84.9 C.
+5. **90 C:** preempt the hook and the SIGTERM grace, and send SIGKILL.
    Otherwise, after **10 seconds** following SIGTERM, send SIGKILL if a
    selected process is still alive or the hottest zone remains at least
-   **83 C**. Newly discovered compute processes are included.
-4. **Phase 1, confirmed stop:** as soon as the workload is verified stopped,
-   whether the hook, SIGTERM, or SIGKILL did it, request `systemctl reboot`
-   to restore stock EC control. There is no cool-down wait. Verification
-   means no remaining selected, GPU-compute, or configured target processes,
-   no protected live targets, and no failed or ambiguous compute query. The
-   reboot is requested on that verifying poll, including when the zone is
-   still at 95 C. That request records EC-only phase for the **next** boot.
-   It does not relaunch the job. A failed reboot is retried. If it fails
-   while the zone is already at the shutdown ceiling, poweroff is the
-   failure path for being unable to hand control back. It is not the normal
-   result of a successful stop. The poll that sends SIGKILL does not also
-   power off.
-5. **Phase 2, the next boot:** the incident file still names the previous
+   **83 C**. The poll that sends SIGKILL does not also power off.
+6. **Phase 1, confirmed stop:** as soon as the workload is verified stopped,
+   request `systemctl reboot` to restore stock EC control. There is no
+   cool-down wait. Verification means no remaining selected, GPU-compute,
+   or configured target processes, no protected live targets, and no failed
+   or ambiguous compute query. The reboot is requested on that verifying
+   poll, including when the zone is still hot. It does not relaunch the
+   job. A failed reboot is retried. Poweroff is not the normal result of a
+   successful stop. It is used only if reboot keeps failing and the zone
+   then stays at or above **95 C for 15 seconds**. One sample at 95 C does
+   not power off.
+7. **Phase 2, the next boot:** the incident file still names the previous
    boot, so monitoring continues with **no ACPI writes**. `acpi-phase`
    records that phase 1 requested this reboot. The incident file selects
    the phase; the phase file does not override it, and the phase file alone
    does not enable monitoring. If the boot id cannot be read, a surviving
-   incident latch stays on this no-write path. Level 100 is not forced at
-   80 C. The stock EC curve stays in place. The optional resume
-   hook may run once. If the zone again reaches 85 C, stop the workload
-   with the same hook, SIGTERM, and SIGKILL ladder. After that stop is
-   confirmed, watch the temperature. There is no second reboot and no
-   second resume. Shut down only if heat then persists: the zone is at
-   **95 C**, or it is still at least **83 C** five seconds after the stop.
-   If the zone falls below 83 C, leave the machine up. If the stop cannot
-   be verified and heat stays uncontrolled, poweroff is still the failure
-   path. An unreadable zone in this phase does not write ACPI and does not
-   power off on that sample. A verified true zero (both tachometers at 0
-   RPM) stays on the existing true-zero rule in both phases. During a
-   latched incident, legacy cold-stall and foreign-floor reboot paths
-   cannot bypass phase 1's stop verification.
+   incident latch stays on this no-write path. The optional resume hook may
+   run once, and only below 80 C. If the zone again reaches the ladder
+   above, stop the workload the same way: hook at 80 C if configured,
+   SIGTERM at 85 C, SIGKILL at 90 C. There is no second reboot and no
+   second resume. After the stop is confirmed, watch the zone. Power off
+   only when one of these holds; none of them is a single sample:
+
+   - the zone stays at or above **95 C for 15 seconds**
+   - at least **10 seconds** after the stop, the zone is at least **90 C**
+     and at least **2 C** hotter than when the watch started
+   - the zone is still at least **83 C** (85 minus hysteresis) **20 seconds**
+     after the stop
+
+   These are short software fallbacks. They were not timed on hardware and
+   they are not a claim about when a machine will cut power. If the zone
+   falls below 83 C and is not climbing through 90 C, leave the machine up.
+   If the stop cannot be verified, the failure path is still poweroff, but
+   only after the **5 second** post-SIGKILL grace while the zone is at
+   least 83 C. One sample at 95 C during that grace does not power off.
+   An unreadable zone in this phase does not write ACPI and does not power
+   off on that sample. A verified true zero (both tachometers at 0 RPM)
+   stays on the existing true-zero rule in both phases. During a latched
+   incident, legacy cold-stall and foreign-floor reboot paths cannot bypass
+   phase 1's stop verification.
 
 The reboot restores stock EC control. It is not an in-place ACPI recovery,
 and it does not relaunch the process that was stopped. The incident latch
@@ -269,15 +304,17 @@ start work again.
 
 That boot is phase 2. `dgx-fan-health.service` (`health --record`) may run
 the hook once, only after that health run has passed and the hottest zone
-is below 85 C. If the watchdog has already entered the phase-2 stop ladder
-on this boot, the hook does not run, so it cannot start a job that was
+is below 80 C. A 70 C advisory does not block it. If the watchdog has
+already entered the phase-2 stop ladder on this boot, the hook does not
+run, so it cannot start a job that was
 stopped for heat. The watchdog starts at sysinit; health starts later, and
 the stop is recorded before any signal. A later thermal stop does not
 reboot and does not run the hook again. A plain `health` run, or a failed
 one, does not start it. The hook is skipped unless every one of these is true:
 
 - the command is set, and this process is root
-- this `health --record` run passed, and the hottest zone is below the stop threshold
+- this `health --record` run passed, and the hottest zone is below 80 C.
+  The advisory band from 70 C does not block resume
 - `/var/lib/dgx-fan-control/acpi-incident` exists and names an **earlier**
   boot, so this is a new boot and ACPI writes are still inhibited
 - this boot has not armed an ACPI hold
@@ -295,11 +332,14 @@ and `DGX_ACPI_RESUME_BOOT` (this boot). It must exit promptly. What to start,
 and whether that job can resume at all, is not something this repository can
 know.
 
-Defaults are deliberately early: on kensaki the hottest zone rose about
-**0.07 C/s between 88 and 95 C** under `gpu_burn`, while others reported
-faster **90 → 98 → power-cut** ramps. One burn does not establish safe
-timing. Userspace polling, process discovery, systemd, and shutdown latency
-cannot guarantee protection against a rapid hardware trip.
+The degrees between the advisory and SIGTERM are headroom, not seconds of
+warning. On kensaki the hottest zone rose about **0.07 C/s between 88 and
+95 C** under `gpu_burn`, while others reported faster **90 → 98 →
+power-cut** ramps. That burn is not a calibration of these thresholds, and
+nothing here was measured against a hardware power cut. A fast rise can
+cross 70, 80, 85, and 90 C between polls; the poll that sees 90 C sends
+SIGKILL on that sample. Userspace polling, process discovery, systemd, and
+shutdown latency cannot guarantee protection against a rapid hardware trip.
 
 The existing **85 C true-zero fan poweroff is separate and unchanged**.
 This new policy applies only after a project ACPI write; ordinary spinning
@@ -317,23 +357,30 @@ explicitly when customizing. Missing keys use these defaults:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ACPI_THERMAL_MAX_C` | `80` | Force and latch level 100 |
-| `ACPI_THERMAL_STOP_C` | `85` | Hook/SIGTERM threshold |
-| `ACPI_THERMAL_KILL_C` | `90` | Immediate SIGKILL threshold |
-| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Last-resort poweroff ceiling when the stop is unverified or reboot failed |
-| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Hook cooling grace before SIGTERM, unless the workload is already confirmed stopped |
+| `ACPI_THERMAL_ADVISORY_C` | `70` | Advisory only. Stable 70–79 C does not stop, latch, or start a timer |
+| `ACPI_THERMAL_MAX_C` | `80` | ACPI phase: force and latch level 100. Both phases: start a configured stop hook. Not a SIGTERM |
+| `ACPI_THERMAL_STOP_C` | `85` | SIGTERM if the workload is not already confirmed stopped |
+| `ACPI_THERMAL_KILL_C` | `90` | SIGKILL. Preempts hook and SIGTERM grace |
+| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Ceiling used by the sustained post-stop and failed-reboot checks. One sample does nothing |
+| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Grace for a hook that actually started. Does not run when no hook is configured |
 | `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace before SIGKILL |
-| `ACPI_THERMAL_KILL_SECONDS` | `5` | Grace after SIGKILL before last-resort shutdown if the stop is still unverified |
-| `ACPI_THERMAL_HYSTERESIS_C` | `2` | STOP minus this is adequate hook cooling; MAX minus this is the manual reset temperature. Not a reboot delay |
-| `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this new shutdown stage, not true-zero poweroff or recovery reboot |
-| `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable/script plus arguments, parsed with `shlex`, **not a shell expression** |
+| `ACPI_THERMAL_KILL_SECONDS` | `5` | After SIGKILL, unverified-stop grace before poweroff if the zone is still at least STOP minus hysteresis |
+| `ACPI_THERMAL_SHUTDOWN_SECONDS` | `15` | How long the zone must stay at or above the ceiling before that path powers off |
+| `ACPI_THERMAL_POST_STOP_SECONDS` | `20` | Phase 2: power off if the zone is still at least STOP minus hysteresis this long after a confirmed stop |
+| `ACPI_THERMAL_RISE_C` | `2` | Phase 2: rise, in degrees, that counts as still climbing after a confirmed stop |
+| `ACPI_THERMAL_RISE_SECONDS` | `10` | Phase 2: minimum watch time before that rise can power off |
+| `ACPI_THERMAL_HYSTERESIS_C` | `2` | Clears the advisory below 68 C. Hook cooling is adequate below 83 C. Manual reset requires a zone below 78 C. Not a reboot delay |
+| `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this shutdown stage, not true-zero poweroff or the recovery reboot |
+| `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable plus arguments, parsed with `shlex`, **not a shell expression**. Empty keeps the no-hook window through 85 C |
 | `ACPI_THERMAL_RESUME_HOOK` | empty | Optional post-boot resume. Empty disables it. Not a relaunch of the killed command |
 | `ACPI_THERMAL_PIDS` | empty | Additional comma/space-separated PIDs |
 | `ACPI_THERMAL_PROCESS_NAMES` | empty | Additional comma/space-separated exact Linux `comm` names (normally at most 15 characters) |
 
 All numeric settings must be finite and positive. Thresholds must satisfy
-`35 <= MAX < STOP < KILL < SHUTDOWN <= 100`; hysteresis must be less than
-STOP minus MAX. Temperature stages preempt grace periods.
+`35 <= ADVISORY < MAX < STOP < KILL < SHUTDOWN <= 100`. Hysteresis must be
+less than STOP minus MAX and less than MAX minus ADVISORY. A temperature
+crossing preempts a grace period. The no-hook path has no grace period
+below STOP.
 
 Default targets come from
 `nvidia-smi --query-compute-apps=pid --format=csv,noheader`, the same query
@@ -370,4 +417,5 @@ must explicitly raise it, for example `--max-temp 95`; that changes only
 the sweep abort, **not** the thermal escalation thresholds. The sweep's
 exit/abort writes 100; it neither stops the burn nor restores automatic
 control. Raising `--max-temp` is not permission to hold ACPI under full load.
-The 85/90 C load-stop defaults intentionally interrupt such a burn.
+The 80/85/90 C load-stop defaults intentionally interrupt such a burn.
+The 70 C line does not.

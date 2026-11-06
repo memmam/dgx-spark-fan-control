@@ -2611,8 +2611,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         print(f"stored health note: {stored_hint}", flush=True)
     print("recorded: yes" if record else "recorded: no", flush=True)
     # Resume only after this recording run passed, and only when the zone is
-    # still below the stop threshold. A phase-2 stop already recorded for
-    # this boot skips the hook inside maybe_run_acpi_resume_hook.
+    # still below the 80 C hook threshold. An advisory in the 70s does not
+    # block it. A phase-2 stop already recorded for this boot skips the hook
+    # inside maybe_run_acpi_resume_hook.
     if record and not defaults_denied and not problems:
         try:
             hottest = read_hottest_temperature_c(thermal_root)
@@ -4624,8 +4625,9 @@ def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
 
     Disabled unless ACPI_THERMAL_RESUME_HOOK is set. The hook is the user's
     command; this does not reconstruct a killed command line. It runs at most
-    once per boot, only after health has passed, the zone is below the stop
-    threshold, and this boot's EC-only stop ladder has not already started.
+    once per boot, only after health has passed, the zone is below the hook
+    threshold (80 C), and this boot's EC-only stop ladder has not already
+    started. An advisory between 70 C and that threshold does not block it.
     The incident latch is left in place.
     """
     command = defaults.get("ACPI_THERMAL_RESUME_HOOK", "").strip()
@@ -4649,10 +4651,12 @@ def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
     if not health_ok:
         return "skipped-health"
     try:
-        stop_c = float(defaults.get("ACPI_THERMAL_STOP_C", 85))
+        hook_c = float(defaults.get("ACPI_THERMAL_MAX_C", 80))
     except (TypeError, ValueError):
-        stop_c = 85.0
-    if hottest_c is None or not math.isfinite(hottest_c) or hottest_c >= stop_c:
+        hook_c = 80.0
+    # 80 C is where the stop ladder starts. The advisory band below that
+    # is not a reason to refuse resume.
+    if hottest_c is None or not math.isfinite(hottest_c) or hottest_c >= hook_c:
         return "skipped-temperature"
     if _acpi_record_boot(ACPI_RESUME_NAME, directory) == boot:
         return "already"
@@ -4739,14 +4743,16 @@ class AcpiThermalGuard:
     """Independent ACPI emergency policy; does not change the true-zero policy.
 
     Dependency injection keeps every destructive operation fake in tests.
-    Max fan level is latched until reboot. An incident persists across reboot
-    until manual reset. A confirmed stop reboots immediately to restore the
-    EC curve. That reboot is not workload resume. Shutdown is only the
-    failure path when the stop cannot be verified, the recovery reboot fails,
-    or heat stays uncontrolled after that.
+    70 C is an advisory only. 80 C starts a configured stop hook and, in the
+    ACPI phase, forces level 100. 85 C is SIGTERM. 90 C is SIGKILL. A
+    confirmed stop reboots immediately to restore the EC curve. That reboot
+    is not workload resume. Shutdown is only the failure path when the stop
+    cannot be verified, the recovery reboot fails and the ceiling holds, or
+    phase-2 heat stays uncontrolled after a confirmed stop.
     """
     def __init__(self, defaults, *, targets=None, send=None, hook=None, shutdown=None, reboot=None):
         self.defaults = defaults
+        self.advisory_c = self.number("ACPI_THERMAL_ADVISORY_C", 70)
         self.fan_c = self.number("ACPI_THERMAL_MAX_C", 80)
         self.stop_c = self.number("ACPI_THERMAL_STOP_C", 85)
         self.kill_c = self.number("ACPI_THERMAL_KILL_C", 90)
@@ -4754,13 +4760,25 @@ class AcpiThermalGuard:
         self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
         self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
         self.kill_s = self.number("ACPI_THERMAL_KILL_SECONDS", 5)
+        self.shutdown_s = self.number("ACPI_THERMAL_SHUTDOWN_SECONDS", 15)
+        self.post_stop_s = self.number("ACPI_THERMAL_POST_STOP_SECONDS", 20)
+        self.rise_c = self.number("ACPI_THERMAL_RISE_C", 2)
+        self.rise_s = self.number("ACPI_THERMAL_RISE_SECONDS", 10)
         # ACPI_THERMAL_COOL_SECONDS is ignored. Recovery does not wait for a
         # temperature hold; a confirmed stop reboots on the verifying poll.
         self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
-        if not 35 <= self.fan_c < self.stop_c < self.kill_c < self.shutdown_c <= 100:
-            raise ValueError("ACPI thermal thresholds must satisfy 35 <= MAX < STOP < KILL < SHUTDOWN <= 100")
+        if not 35 <= self.advisory_c < self.fan_c < self.stop_c < self.kill_c < self.shutdown_c <= 100:
+            raise ValueError(
+                "ACPI thermal thresholds must satisfy "
+                "35 <= ADVISORY < MAX < STOP < KILL < SHUTDOWN <= 100"
+            )
         if not 0 < self.hysteresis < self.stop_c - self.fan_c:
             raise ValueError("ACPI thermal hysteresis must be positive and less than STOP - MAX")
+        if not self.hysteresis < self.fan_c - self.advisory_c:
+            raise ValueError(
+                "ACPI thermal hysteresis must be less than MAX - ADVISORY "
+                "so the advisory can clear before the stop hook"
+            )
         enabled = defaults.get("ACPI_THERMAL_SHUTDOWN", "yes").strip().lower()
         if enabled not in ("yes", "no"):
             raise ValueError("ACPI_THERMAL_SHUTDOWN must be yes or no")
@@ -4778,7 +4796,55 @@ class AcpiThermalGuard:
         self.selected = {}
         self.max_logged = False
         self.ec_logged = False
+        self.advisory_logged = False
+        self.reaction_logged = False
+        self.ceiling_since = None
+        self.watch_c = None
         self.retired_hooks = []
+
+    def hook_command(self) -> str:
+        return self.defaults.get("ACPI_THERMAL_STOP_HOOK", "").strip()
+
+    def note_advisory(self, hot, ec_only) -> None:
+        """Log one advisory. It does not arm a latch, a timer, or a stop."""
+        if hot < self.advisory_c - self.hysteresis:
+            self.advisory_logged = False
+            return
+        # At the hook threshold the stop ladder speaks for itself. The
+        # advisory must not claim action=none on that same poll.
+        if hot < self.advisory_c or hot >= self.fan_c or self.advisory_logged:
+            return
+        self.advisory_logged = True
+        LOG.warning(
+            "acpi_thermal_advisory phase=%s zone_c=%.1f advisory_c=%.1f "
+            "action=none incident=no timer=no; "
+            "checkpoint or reduce load if you can; this is not a failure "
+            "and it does not stop the workload",
+            "ec" if ec_only else "acpi", hot, self.advisory_c,
+        )
+
+    def ceiling_held(self, hot, now) -> bool:
+        """True only after the zone has stayed at or above the ceiling."""
+        if hot < self.shutdown_c:
+            self.ceiling_since = None
+            return False
+        if self.ceiling_since is None:
+            self.ceiling_since = now
+            return False
+        return now - self.ceiling_since >= self.shutdown_s
+
+    def post_stop_reason(self, hot, now):
+        """Phase-2 reason to power off, or None. One sample is never enough."""
+        elapsed = now - self.since
+        if self.ceiling_held(hot, now):
+            return "zone stayed at or above the shutdown ceiling after the stop"
+        if (elapsed >= self.rise_s and hot >= self.kill_c
+                and self.watch_c is not None
+                and hot >= self.watch_c + self.rise_c):
+            return "zone rose through the kill threshold after the stop"
+        if elapsed >= self.post_stop_s and hot >= self.stop_c - self.hysteresis:
+            return "zone stayed elevated after the stop"
+        return None
 
     def number(self, key, fallback):
         value = float(self.defaults.get(key, fallback))
@@ -4971,7 +5037,8 @@ class AcpiThermalGuard:
             # A failed persist must be retried before this poll decides to reboot.
             # EC-only mode must not rewrite the incident boot id.
             self.ensure_incident_latched()
-        if hot is None or not math.isfinite(hot):
+        measured = hot is not None and math.isfinite(hot)
+        if not measured:
             # An accepted recovery reboot stands. A missing sample must not
             # turn it into poweroff, and neither must residual heat.
             if self.stage == "reboot":
@@ -4988,6 +5055,9 @@ class AcpiThermalGuard:
                 return
             LOG.critical("ACPI thermal: hottest zone unreadable; escalating conservatively")
             hot = self.shutdown_c
+        else:
+            # Advisory only. It must not fall through into a latch or a timer.
+            self.note_advisory(hot, ec_only)
         if not ec_only and hot >= self.fan_c:
             # The latch is persisted BEFORE the writes. A failed/partial write
             # is retried next poll; no lower-level writer can undo escalation.
@@ -5004,6 +5074,10 @@ class AcpiThermalGuard:
                 self.max_logged = True
         if self.stage == "reboot":
             return
+        # Below 80 C the advisory is the whole policy. Do not query targets,
+        # arm the incident, or start a stop-stage timer from it.
+        if self.stage == "idle" and hot < self.fan_c:
+            return
 
         def stopped():
             remaining = targets()
@@ -5015,24 +5089,26 @@ class AcpiThermalGuard:
                 and self.discovery_complete
             )
 
+        def begin_term(reason):
+            self.finish_hook()
+            self.selected = targets()
+            LOG.critical("ACPI thermal: %s; SIGTERM workload targets", reason)
+            self.send(self.selected, signal.SIGTERM)
+            self.stage, self.since = "term", now
+
         if self.stage == "ec-watch":
-            if not stopped() and hot >= self.stop_c:
+            if not stopped() and hot >= self.fan_c:
                 self.stage = "idle"
             elif stopped():
-                heat_persists = hot >= self.shutdown_c or (
-                    now - self.since >= self.kill_s
-                    and hot >= self.stop_c - self.hysteresis
-                )
-                if heat_persists:
-                    self._last_resort_shutdown(
-                        hot, "EC-only heat persisted after the workload stopped",
-                    )
+                reason = self.post_stop_reason(hot, now)
+                if reason:
+                    self._last_resort_shutdown(hot, reason)
                 return
             else:
                 return
-        if self.stage == "incident" and hot >= self.stop_c and not stopped():
+        if self.stage == "incident" and hot >= self.fan_c and not stopped():
             self.stage = "idle"
-        if self.stage == "idle" and hot >= self.stop_c:
+        if self.stage == "idle" and hot >= self.fan_c:
             if ec_only:
                 # Before any signal, so a concurrent health --record cannot
                 # resume a job this phase has already started to stop.
@@ -5049,50 +5125,91 @@ class AcpiThermalGuard:
                     record_acpi_boot(ACPI_INCIDENT_NAME)
                 except (OSError, RuntimeError) as exc:
                     LOG.critical("ACPI thermal: cannot persist incident; recovery reboot inhibited: %s", exc)
-            LOG.critical(
-                "%s: hottest %.1fC >= %.1fC; stopping load",
-                "EC-only phase" if ec_only else "ACPI thermal",
-                hot, self.stop_c,
-            )
-            self.since = now
-            self.stage = "hook"
-            try:
-                self.hook_process = self.hook() if hot < self.kill_c else None
-            except (OSError, ValueError) as exc:
-                LOG.error("ACPI thermal: stop hook could not start: %s", exc)
-                self.hook_process = None
-        if self.stage == "hook":
-            failed = self.hook_process is None or self.hook_process.poll() not in (None, 0)
-            if failed or now - self.since >= self.hook_s or hot >= self.kill_c:
-                self.finish_hook()
-                # A successful hook gets its grace; cooling below STOP minus
-                # hysteresis suppresses further intervention, not the max latch.
-                if failed or hot >= self.stop_c - self.hysteresis:
-                    self.selected = targets()
-                    LOG.critical("ACPI thermal: hook absent/failed or insufficient cooling; SIGTERM workload targets")
-                    self.send(self.selected, signal.SIGTERM)
-                    self.stage, self.since = "term", now
+            command = self.hook_command()
+            # A poll that is already at SIGTERM or SIGKILL does not spend the
+            # hook grace. The hook runs only in the band under STOP.
+            if command and hot < self.stop_c:
+                failed = False
+                try:
+                    self.hook_process = self.hook()
+                except (OSError, ValueError) as exc:
+                    LOG.error("ACPI thermal: stop hook failed to start: %s", exc)
+                    self.hook_process = None
+                    failed = True
                 else:
+                    process = self.hook_process
+                    if process is None or process.poll() not in (None, 0):
+                        failed = True
+                if failed:
+                    begin_term(
+                        "stop hook failed; this is not the no-hook reaction window"
+                    )
+                else:
+                    LOG.critical(
+                        "%s: hottest %.1fC >= %.1fC; stop hook started",
+                        "EC-only phase" if ec_only else "ACPI thermal",
+                        hot, self.fan_c,
+                    )
+                    self.since = now
+                    self.stage = "hook"
+            else:
+                self.stage = "reaction"
+                if not command and hot < self.stop_c and not self.reaction_logged:
+                    LOG.critical(
+                        "%s: no stop hook configured; SIGTERM waits for "
+                        "%.1fC (now %.1fC). Time spent under %.1fC does "
+                        "not send SIGTERM",
+                        "EC-only phase" if ec_only else "ACPI thermal",
+                        self.stop_c, hot, self.stop_c,
+                    )
+                    self.reaction_logged = True
+        if self.stage == "reaction" and hot >= self.stop_c and not stopped():
+            begin_term(
+                "no-hook reaction window ended at %.1fC" % self.stop_c
+                if not self.hook_command()
+                else "temperature reached %.1fC before the stop hook" % self.stop_c
+            )
+        if self.stage == "hook":
+            process = self.hook_process
+            code = None if process is None else process.poll()
+            failed = process is None or (code is not None and code != 0)
+            timed_out = now - self.since >= self.hook_s
+            if failed:
+                begin_term("stop hook failed; this is not the no-hook reaction window")
+            elif code == 0 and stopped():
+                self.finish_hook()
+            elif timed_out or hot >= self.stop_c:
+                self.finish_hook()
+                if not stopped() and hot >= self.stop_c - self.hysteresis:
+                    if hot >= self.stop_c:
+                        begin_term("temperature reached %.1fC" % self.stop_c)
+                    else:
+                        begin_term(
+                            "stop hook grace of %.0fs ended at %.1fC, "
+                            "still under %.1fC" % (self.hook_s, hot, self.stop_c)
+                        )
+                elif not stopped():
                     self.stage = "cooling"
-        if self.stage == "cooling" and hot >= self.stop_c:
-            self.selected = targets()
-            self.send(self.selected, signal.SIGTERM)
-            self.stage, self.since = "term", now
+        if self.stage == "cooling" and hot >= self.stop_c and not stopped():
+            begin_term("temperature returned to %.1fC" % self.stop_c)
         entered_kill = False
         if self.stage == "term" and (now - self.since >= self.term_s or hot >= self.kill_c):
-            live = targets()
-            survivors = {p: ident for p, ident in self.selected.items()
-                         if self.identity(p) == ident}
-            if survivors or hot >= self.stop_c - self.hysteresis:
-                # Include newly spawned compute jobs, but recheck every identity.
-                live.update(survivors)
-                self.selected = live
-                LOG.critical("ACPI thermal: load survived or insufficient cooling; SIGKILL workload targets")
-                self.send(live, signal.SIGKILL)
-                self.stage, self.since = "kill", now
-                # The target snapshot was taken before this signal. Do not
-                # power off in this same poll; the next one can see the stop.
-                entered_kill = True
+            if not stopped():
+                live = targets()
+                survivors = {p: ident for p, ident in self.selected.items()
+                             if self.identity(p) == ident}
+                if survivors or hot >= self.stop_c - self.hysteresis:
+                    live.update(survivors)
+                    self.selected = live
+                    LOG.critical(
+                        "ACPI thermal: load survived or insufficient cooling; "
+                        "SIGKILL workload targets"
+                    )
+                    self.send(live, signal.SIGKILL)
+                    self.stage, self.since = "kill", now
+                    # The target snapshot was taken before this signal. Do not
+                    # power off in this same poll; the next one can see the stop.
+                    entered_kill = True
         if (ec_only and self.stage not in ("idle", "reboot", "shutdown", "ec-watch")
                 and stopped()):
             self.finish_hook()
@@ -5100,6 +5217,8 @@ class AcpiThermalGuard:
                 "EC-only phase: workload confirmed stopped; not rebooting and "
                 "not resuming; watching the stock EC curve"
             )
+            self.watch_c = hot
+            self.ceiling_since = None
             self.stage, self.since = "ec-watch", now
         elif (not ec_only and self.stage not in ("idle", "reboot", "shutdown")
                 and acpi_record_current(ACPI_INCIDENT_NAME) and stopped()):
@@ -5117,14 +5236,15 @@ class AcpiThermalGuard:
                 self.stage = "reboot"
             else:
                 LOG.critical("ACPI thermal: recovery reboot failed (%s)", status)
-                if hot >= self.shutdown_c:
-                    self._last_resort_shutdown(hot, "recovery reboot failed")
-        elif (self.stage == "kill" and not entered_kill and (
-                hot >= self.shutdown_c or (
-                    now - self.since >= self.kill_s
-                    and hot >= self.stop_c - self.hysteresis))):
-            # Still not confirmed stopped. Heat at the ceiling, or still
-            # elevated after the post-kill grace, is the failure path.
+                if self.ceiling_held(hot, now):
+                    self._last_resort_shutdown(
+                        hot, "recovery reboot failed and the shutdown ceiling held",
+                    )
+        elif (self.stage == "kill" and not entered_kill
+                and now - self.since >= self.kill_s
+                and hot >= self.stop_c - self.hysteresis):
+            # One sample at the shutdown ceiling does not power off. The
+            # post-kill grace is the unverified-stop fallback.
             self._last_resort_shutdown(hot, "workload stop not verified")
 
     def _last_resort_shutdown(self, hot, reason):

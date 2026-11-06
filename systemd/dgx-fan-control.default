@@ -66,6 +66,11 @@ MANUAL_STATE=
 # EC 3.5.8 ACPI emergency protection; independent of the true-zero 85 C rule.
 # All temperatures are the hottest thermal zone. See docs/ec-curve.md.
 # Restart dgx-fan-watchdog.service after changing these values.
+# 70 C is an advisory only. Holding 70 through 79 C does not stop anything.
+# 80 C starts the stop hook when one is configured, and in the ACPI phase
+# also forces level 100. With no hook, 80 C does not send SIGTERM.
+# 85 C is SIGTERM. 90 C is SIGKILL. Degrees of headroom are not seconds.
+ACPI_THERMAL_ADVISORY_C=70
 ACPI_THERMAL_MAX_C=80
 ACPI_THERMAL_STOP_C=85
 ACPI_THERMAL_KILL_C=90
@@ -73,12 +78,21 @@ ACPI_THERMAL_SHUTDOWN_C=95
 ACPI_THERMAL_HOOK_SECONDS=10
 ACPI_THERMAL_TERM_SECONDS=10
 ACPI_THERMAL_KILL_SECONDS=5
+# Phase 2, after a confirmed stop: one sample never powers off.
+# 15 s at or above SHUTDOWN_C, or a 2 C rise through KILL_C over 10 s,
+# or 20 s still at or above STOP minus HYSTERESIS. Not a measured trip time.
+ACPI_THERMAL_SHUTDOWN_SECONDS=15
+ACPI_THERMAL_POST_STOP_SECONDS=20
+ACPI_THERMAL_RISE_C=2
+ACPI_THERMAL_RISE_SECONDS=10
 ACPI_THERMAL_HYSTERESIS_C=2
 # Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
 # Phase 1: a confirmed stop reboots immediately and does not power off.
 # Phase 2: there is no reboot. Shutdown is only after the post-stop watch.
 ACPI_THERMAL_SHUTDOWN=yes
 # Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
+# Empty means there is no hook: SIGTERM waits for STOP_C, however long that takes.
+# A failed hook is not this case; a failure sends SIGTERM on that poll.
 # A confirmed stop reboots with no cool-down wait. That reboot restores the
 # EC curve and does not relaunch the killed command.
 # Incident latch survives reboot; reset explicitly with acpi-incident-reset.

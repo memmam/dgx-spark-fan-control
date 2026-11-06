@@ -5,8 +5,10 @@
 > kensaki (rig off), 100 held 4320/4320 RPM at a hottest zone of 95–97.7 C
 > and SoC 96–97 C, versus the stock curve's 4860/7290 by about 94.5 C,
 > 6660/9990 at about 95 C, and 88.8–89.7 C settled. Do not hold ACPI under
-> sustained full load. The independent watchdog now forces 100/warns at
-> 80 C, stops work via hook/SIGTERM at 85 C, and kills at 90 C (or timeout).
+> sustained full load. The independent watchdog advises at 70 C and does
+> not stop anything for holding 70–79 C. At 80 C it starts a configured
+> stop hook and, while an ACPI hold is active, forces level 100. With no
+> hook, it does not send SIGTERM until 85 C. It sends SIGKILL at 90 C.
 > A confirmed stop reboots immediately to restore the EC curve. Poweroff
 > does not replace that reboot. The next boot only monitors the stock EC
 > curve: no ACPI writes, no second reboot. If heat returns, it stops the

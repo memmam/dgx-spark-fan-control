@@ -663,8 +663,9 @@ job. The incident latch blocks another ACPI hold until
 EC curve. A non-checkpointable job does not continue unless the workload
 manager, or the optional `ACPI_THERMAL_RESUME_HOOK`, knows how to start it
 again. That hook is empty by default. The boot health unit runs it at most
-once, and only after that health run passes, the zone is below 85 C, and
-this boot has not already started a phase-2 thermal stop. See
+once, and only after that health run passes, the zone is below 80 C, and
+this boot has not already started a phase-2 thermal stop. An advisory in
+the 70s does not block it. See
 [optional resume](ec-curve.md#optional-resume-after-the-next-boot).
 The stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
 system bus, and it cannot open a network connection to Kubernetes, Slurm,
@@ -674,13 +675,16 @@ or an HTTP API. Root jobs and system services are not killed directly.
 
 **Warning:** on EC 3.5.8 ACPI holds replace the stock EC curve until reboot,
 even at level 100. Do not hold them under sustained full load. The independent
-watchdog must be active before these commands write; it forces 100 at 80 C,
-stops work at 85 C, and kills at 90 C or timeout. A confirmed stop reboots
-immediately. That is phase 1. Shutdown at 95 C does not replace that
-reboot. After the reboot, phase 2 watches the stock EC curve and does not
-write ACPI. If heat returns, it stops the job again and shuts down only
-when heat persists after that stop. There is no second reboot. Workload
-resume is a separate hook that runs at most once at the start of phase 2.
+watchdog must be active before these commands write. It logs an advisory
+at 70 C and will hold 70–79 C indefinitely. At 80 C it forces level 100
+and starts a configured stop hook; with no hook it waits until 85 C for
+SIGTERM, however long that takes. SIGKILL is at 90 C. A confirmed stop
+reboots immediately. That is phase 1. One sample at 95 C does not replace
+that reboot. After the reboot, phase 2 watches the stock EC curve and does
+not write ACPI. If heat returns, it uses the same 80/85/90 ladder and shuts
+down only when heat persists after that stop. There is no second reboot.
+Workload resume is a separate hook that runs at most once at the start of
+phase 2, and only below 80 C.
 See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 
 
