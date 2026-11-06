@@ -3685,6 +3685,33 @@ class UserlandFailureTests(unittest.TestCase):
         )
         self.assertEqual(status, "note")
         self.assertTrue(detail.startswith("unknown"))
+        self.assertEqual(detail, "unknown (EC not in get-devices)")
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=soc_only, devices_ok=True, verbose_text="", log_text="",
+            as_root=False,
+        )
+        self.assertEqual(
+            (status, detail), ("note", "unknown (needs root to confirm the block)"),
+        )
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=soc_only, devices_ok=True, verbose_text=verbose,
+            log_text="", as_root=False,
+        )
+        self.assertEqual((status, detail), ("pass", "blocked"))
+
+        def absent_as_user(argv):
+            if argv[0] == "fwupdmgr":
+                return subprocess.CompletedProcess(argv, 0, soc_only, "")
+            return subprocess.CompletedProcess(argv, 1, "", "Permission denied")
+
+        self.assertEqual(
+            CONTROL.read_ec_update_block("", run=absent_as_user, as_root=False),
+            ("note", "unknown (needs root to confirm the block)"),
+        )
+        self.assertEqual(
+            CONTROL.read_ec_update_block("", run=absent_as_user, as_root=True),
+            ("note", "unknown (EC not in get-devices)"),
+        )
         status, detail = CONTROL.classify_ec_update_block(
             devices_text=None, devices_ok=False, verbose_text=None, log_text="",
             timed_out=True,

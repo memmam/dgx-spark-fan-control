@@ -3864,12 +3864,15 @@ def ec_probe_succeeded(log_text: str) -> bool:
 def classify_ec_update_block(*, devices_text: str | None, devices_ok: bool,
                              verbose_text: str | None, log_text: str,
                              fwupd_missing: bool = False,
-                             timed_out: bool = False) -> tuple[str, str]:
+                             timed_out: bool = False,
+                             as_root: bool = True) -> tuple[str, str]:
     """pass, warn, or note. Never fail. A note detail starts with unknown.
 
     Present in get-devices means not blocked. The verbose 'is disabled'
     line is the positive block signal. Absence plus a successful EC probe
-    is only 'likely blocked'. A missing or slow fwupd is unknown.
+    is only 'likely blocked'. A missing or slow fwupd is unknown. Without
+    root, fwupdtool cannot print the 'is disabled' line, so an absent EC
+    says that root is needed to confirm the block.
     """
     if devices_ok and devices_text and EC_FWUPD_GUID in devices_text.lower():
         version = ec_version_in_devices(devices_text)
@@ -3896,6 +3899,8 @@ def classify_ec_update_block(*, devices_text: str | None, devices_ok: bool,
                 "pass",
                 "likely blocked; absent from get-devices while the EC probe succeeded",
             )
+        if not as_root:
+            return "note", "unknown (needs root to confirm the block)"
         return "note", "unknown (EC not in get-devices)"
     return "note", "unknown (fwupd failed)"
 
@@ -3907,10 +3912,13 @@ def _run_fwupd(argv: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def read_ec_update_block(log_text: str, run=None) -> tuple[str, str]:
+def read_ec_update_block(log_text: str, run=None,
+                         as_root: bool | None = None) -> tuple[str, str]:
     """Read-only. Does not change fwupd config or restart the daemon."""
     if run is None:
         run = _run_fwupd
+    if as_root is None:
+        as_root = os.geteuid() == 0
     devices_text = None
     devices_ok = False
     verbose_text = None
@@ -3953,6 +3961,7 @@ def read_ec_update_block(log_text: str, run=None) -> tuple[str, str]:
         devices_text=devices_text, devices_ok=devices_ok,
         verbose_text=verbose_text, log_text=log_text,
         fwupd_missing=fwupd_missing, timed_out=timed_out,
+        as_root=as_root,
     )
 
 

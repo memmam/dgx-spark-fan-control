@@ -541,9 +541,11 @@ The core checks are fan and thermal only:
   does not set needs-intervention
 - `dgx-fan-watchdog.service` is active
 - `ec-updates:` is `pass (blocked)`, `warn (not blocked; EC 3.5.8 can be
-  replaced by 3.13.7)`, or `unknown` when fwupd is missing or slow. The
-  warn and the unknown do not fail the check and do not set
-  needs-intervention. `status` does not query fwupd
+  replaced by 3.13.7)`, or `unknown` when fwupd is missing or slow. Without
+  root it is `unknown (needs root to confirm the block)` when the EC is
+  hidden; run it with `sudo` to see `pass (blocked)`. The warn and the
+  unknown do not fail the check and do not set needs-intervention.
+  `status` does not query fwupd
 - EC 3.13.7 telemetry-only is not a failure. `firmware:` says control is
   unsupported, and the cooling device, mode, and ready lines are `n/a`.
   A service left enabled reports
