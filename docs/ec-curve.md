@@ -14,7 +14,10 @@ NVIDIA replied in post 25: "There should only be one fan curve." The
 thread did not check the earlier image.
 
 Both public images contain the same two tables, so this is not a 3.13.7
-change. The bytes below are from the LVFS cabinets:
+change. The bytes below are from the LVFS cabinets. The cabinet and
+`ec_fused.cap` SHA-256 values were checked against those files; for 3.13.7
+they also match the checksums in the LVFS `firmware.xml` / cabinet
+metainfo:
 
 | EC | Cabinet SHA-256 | `ec_fused.cap` SHA-256 | Tables at file offset |
 | --- | --- | --- | --- |
@@ -29,10 +32,11 @@ The 40 bytes at those offsets are identical in both images:
 ```
 
 Each entry is four bytes: a little-endian 16-bit temperature, a duty byte,
-and a step-down byte. The thermal loop (`0xC2A88` in 3.13.7) picks the highest entry at or below
-the current temperature and holds that step until the temperature falls
-below the threshold minus the last byte. The °C and percent units are
-inferred; the measured steps below match them.
+and a step-down byte. In this disassembly the thermal loop (`0xC2A88` in
+3.13.7) picks the highest entry at or below the current temperature and
+holds that step until the temperature falls below the threshold minus the
+last byte. The °C and percent units are inferred; the measured steps below
+match them.
 
 | Table | Temperature → duty (step-down margin) |
 | --- | --- |
@@ -43,17 +47,17 @@ The slow table is maxeffort's curve 2, plus a 75% step at 95 °C. The fast
 table is their curve 1. A scan of both images for five-entry tables of this
 shape finds only these two.
 
-A function returns one table pointer or the other from a flag
-(`0xC4CF8` in 3.13.7, `0xC5D4C` in 3.5.8): the slow table when the flag is
-set, the fast one otherwise. Board init sets the flag once at boot. It
-clears it, calls the boot ROM at `0xF009` with index `0x3F9`, and sets it
-only when that call returns 0. The byte it reads is discarded, so only the
-call's status matters. Zephyr's Microchip HAL defines
+In this disassembly a function returns one table pointer or the other from
+a flag (`0xC4CF8` in 3.13.7, `0xC5D4C` in 3.5.8): the slow table when the
+flag is set, the fast one otherwise. Board init sets the flag once at boot.
+It clears it, calls the boot ROM at `0xF009` with index `0x3F9`, and sets
+it only when that call returns 0. The byte it reads is discarded, so only
+the call's status matters. Zephyr's Microchip HAL defines
 `MEC5_ROM_OTP_RD8_ADDR` as `0xf009`, so this is most likely a read of
-one-time-programmable byte `0x3F9`.
-Which status retail units get is not confirmed. Five other call sites read
-the same flag in each image, so it is most likely a part or board variant
-check, not a fan setting. Those sites were not analyzed.
+one-time-programmable byte `0x3F9`. Which status retail units get is not
+confirmed. Five other call sites read the same flag in each image, so it is
+most likely a part or board variant check, not a fan setting. Those sites
+were not analyzed.
 
 Every unit with posted data runs the slow table: maxeffort's, osos1's
 ("After multiple reboot mine seems to always be on curve 2"), and the two Sparks measured
@@ -77,9 +81,10 @@ The curve holds its base speed until about 80 °C, then steps up:
 | about 95 °C | 6660 / 9990 | 74% | about 3910 / 4105 |
 
 These match the slow fan table in the EC image (30% until 80 °C, 40% at 80,
-54% at 90, 75% at 95, 100% at 101). Neither unit followed the fast table,
-which would have raised the fans by 40 °C. The fans did not move under a
-light load that held the chip near 50 °C.
+54% at 90, 75% at 95, 100% at 101), with 74% measured against 75% in the
+table byte at about 95 °C. Neither unit followed the fast table, which
+steps up 40 °C sooner (its first step at 40 °C versus 80 °C). The fans did
+not move under a light load that held the chip near 50 °C.
 
 At full load the hottest zone settled at about 93–94 °C on step 3, with the
 GPU at 80–81 °C. Step 3 holds the chip there but does not pull it back
@@ -153,5 +158,7 @@ every second to a CSV. It writes level 100 at once if a fan reads 0 or is
 missing, a fan drops below 1000 RPM, the hottest zone reaches 60 C, or the run
 is interrupted, and it always writes 100 when it finishes. It never writes a
 level below 30, its own limit for a supervised run; outside it, 35 is the
-lowest level to use. EC 3.13.7 ignores these writes, so a run there measures
-nothing.
+lowest level to use. EC 3.13.7 ignores ACPI fan levels, so the script refuses
+before any write when `dgx_ec_fan` is present without `dgx_ec_fan_floor`, or
+when this boot's kernel log shows the module pinned EC 3.13.7. If the module
+never loaded this boot, it cannot tell.

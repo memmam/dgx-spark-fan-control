@@ -106,6 +106,42 @@ class SweepTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             sweep_mod.write_level([self.spark.cooler], 0)
 
+    def test_preflight_refuses_when_kernel_log_pins_3137(self):
+        """Module unloaded on EC 3.13.7: the boot log still names the firmware."""
+        orig = sweep_mod.os.geteuid
+        sweep_mod.os.geteuid = lambda: 0
+        try:
+            problem = sweep_mod.preflight(
+                self.spark.thermal, self.spark.hwmon,
+                log_text="dgx_ec_fan_control: pinned EC 3.13.7 capabilities\n")
+        finally:
+            sweep_mod.os.geteuid = orig
+        self.assertIn("telemetry only, nothing written", problem)
+        self.assertEqual(self.spark.level(), 100)
+        self.assertEqual(sweep_mod.pinned_ec_name(
+            "pinned EC 3.5.8 capabilities"), "EC 3.5.8")
+
+    def test_telemetry_only_refuses_before_any_write(self):
+        """dgx_ec_fan present without dgx_ec_fan_floor: no cur_state write."""
+        telem = self.spark.hwmon / "hwmon9"
+        telem.mkdir()
+        (telem / "name").write_text("dgx_ec_fan\n")
+        # ACPI Fan cooler already exists; no dgx_ec_fan_floor device.
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_sweep([40, 35, 30])
+        self.assertIn("telemetry only, nothing written", str(caught.exception))
+        self.assertEqual(self.spark.level(), 100)
+        self.assertEqual(self.lines, [])
+        self.assertTrue(sweep_mod.telemetry_only_bind(
+            self.spark.thermal, self.spark.hwmon))
+        # A floor device makes the bind supported again.
+        floor = self.spark.thermal / "cooling_device1"
+        floor.mkdir()
+        (floor / "type").write_text("dgx_ec_fan_floor\n")
+        (floor / "cur_state").write_text("6\n")
+        self.assertFalse(sweep_mod.telemetry_only_bind(
+            self.spark.thermal, self.spark.hwmon))
+
 
 if __name__ == "__main__":
     unittest.main()

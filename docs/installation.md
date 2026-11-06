@@ -661,7 +661,7 @@ sudo grep -rIl 3d13c989 /etc /var/lib/fwupd /usr/share/fwupd
 The check that shows the block:
 
 ```sh
-sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
+sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i "is disabled"
 ```
 
 A blocked EC produces a line containing
@@ -671,7 +671,10 @@ A blocked EC produces a line containing
 `ec-updates: pass (blocked)` means the EC is blocked.
 `ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)` means
 fwupd can still install 3.13.7. `ec-updates: unknown (...)` means fwupd was
-missing or too slow to answer. Without root, a blocked EC shows
+missing or too slow to answer. Without root, when get-devices lacks the EC
+GUID and the kernel `pinned EC` probe line is readable, health shows
+`ec-updates: pass (likely blocked; absent from get-devices while the EC
+probe succeeded)`. When that probe line is unreadable too, it shows
 `ec-updates: unknown (needs root to confirm the block)`, because only root
 can read the `is disabled` line. None of those lines fail health, and none
 of them set needs-intervention. `status` does not query fwupd.

@@ -668,9 +668,10 @@ sudo dgx-fan-control acpi-max --level 40
 On success it prints one line per Fan device with the read-back level, for
 example `cooling_device0 (Fan): 100/100`. On EC 3.5.8 the trailing line is
 `check fan RPM`. On EC 3.13.7 telemetry-only, `acpi-max` writes nothing,
-logs that the EC runs its own curve, and exits 0. The command exits nonzero
-when it finds no Fan cooling device, a write fails, the kernel module is
-loaded, or the fan service is active.
+logs that the EC runs its own curve, and exits 0, even when the kernel
+module is loaded. The command exits nonzero when it finds no Fan cooling
+device, a write fails, the kernel module is loaded on firmware that accepts
+floor writes, or the fan service is active.
 
 The module and ACPI `cur_state` write the same EC lower floor. `acpi-max`
 refuses in that case. `--force` overrides the refusal and logs a warning.

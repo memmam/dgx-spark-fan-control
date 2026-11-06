@@ -186,7 +186,7 @@ below, unblock, then read the version from `fwupdmgr get-devices`.
 The line that shows the block:
 
 ```sh
-sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
+sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i "is disabled"
 ```
 
 Expect `is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.

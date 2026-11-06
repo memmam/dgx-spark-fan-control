@@ -3,8 +3,10 @@
 """Supervised test of low ACPI Fan levels, for measuring a safe minimum.
 
 Run as root on EC 3.5.8, at idle, with dgx_ec_fan_control unloaded and
-dgx-fan-control.service stopped. EC 3.13.7 ignores these writes, so a run
-there measures nothing.
+dgx-fan-control.service stopped. EC 3.13.7 ignores ACPI fan levels, so the
+script refuses before any write when dgx_ec_fan is present without
+dgx_ec_fan_floor, or when the kernel log from this boot shows the module
+pinned EC 3.13.7. If the module never loaded this boot, it cannot tell.
 
 Steps every ACPI Fan cooling device through the given levels (default
 40 35 30), holds each one, and logs every fan tachometer plus the hottest
@@ -19,6 +21,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -29,8 +32,14 @@ HARD_MIN_LEVEL = 30
 RESTORE_LEVEL = 100
 ACPI_COOLING_TYPE = "Fan"
 ACPI_FAN_NAME = "acpi_fan"
+FLOOR_COOLING_TYPE = "dgx_ec_fan_floor"
+TELEMETRY_HWMON_NAME = "dgx_ec_fan"
 MODULE_NAME = "dgx_ec_fan_control"
 DAEMON_UNIT = "dgx-fan-control.service"
+TELEMETRY_ONLY_MESSAGE = (
+    "telemetry only, nothing written; EC runs its own curve "
+    "(dgx_ec_fan present without dgx_ec_fan_floor)"
+)
 
 
 def utc_now() -> str:
@@ -53,6 +62,44 @@ def fan_devices(hwmon_root: Path) -> list[Path]:
     """Each Spark fan is its own acpi_fan device with only fan1_input."""
     return [d for d in sorted(hwmon_root.glob("hwmon*"))
             if read_text(d / "name") == ACPI_FAN_NAME]
+
+
+def floor_devices(thermal_root: Path) -> list[Path]:
+    """dgx_ec_fan_floor cooling devices from this project's kernel module."""
+    return [d for d in sorted(thermal_root.glob("cooling_device*"))
+            if read_text(d / "type") == FLOOR_COOLING_TYPE]
+
+
+def telemetry_hwmon_devices(hwmon_root: Path) -> list[Path]:
+    """dgx_ec_fan hwmon devices from this project's kernel module."""
+    return [d for d in sorted(hwmon_root.glob("hwmon*"))
+            if read_text(d / "name") == TELEMETRY_HWMON_NAME]
+
+
+def telemetry_only_bind(thermal_root: Path, hwmon_root: Path) -> bool:
+    """True when dgx_ec_fan is present and dgx_ec_fan_floor is not.
+
+    Same sysfs shape classify_fan_binding treats as unsupported (telemetry
+    only) in userspace/dgx_fan_control.py.
+    """
+    if floor_devices(thermal_root):
+        return False
+    return bool(telemetry_hwmon_devices(hwmon_root))
+
+
+def read_kernel_log() -> str:
+    try:
+        completed = subprocess.run(["dmesg"], check=False, capture_output=True,
+                                   text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return completed.stdout or ""
+
+
+def pinned_ec_name(log_text: str) -> str | None:
+    """EC firmware the kernel module pinned this boot, e.g. 'EC 3.13.7'."""
+    match = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
+    return match.group(1) if match else None
 
 
 def read_fans(devices: list[Path]) -> list[int | None]:
@@ -114,6 +161,8 @@ def sweep(levels: list[int], hold: float, interval: float, min_rpm: int,
             raise ValueError(
                 f"refusing ACPI level {level}: allowed {HARD_MIN_LEVEL} "
                 f"through {RESTORE_LEVEL}")
+    if telemetry_only_bind(thermal_root, hwmon_root):
+        raise RuntimeError(TELEMETRY_ONLY_MESSAGE)
     coolers = cooling_devices(thermal_root)
     if not coolers:
         raise RuntimeError("no ACPI Fan cooling device found")
@@ -153,9 +202,22 @@ def sweep(levels: list[int], hold: float, interval: float, min_rpm: int,
             result = 3
 
 
-def preflight() -> str | None:
+def preflight(thermal_root: Path | None = None,
+              hwmon_root: Path | None = None,
+              log_text: str | None = None) -> str | None:
+    if thermal_root is None:
+        thermal_root = Path("/sys/class/thermal")
+    if hwmon_root is None:
+        hwmon_root = Path("/sys/class/hwmon")
     if os.geteuid() != 0:
         return "run as root"
+    if telemetry_only_bind(thermal_root, hwmon_root):
+        return TELEMETRY_ONLY_MESSAGE
+    if log_text is None:
+        log_text = read_kernel_log()
+    if pinned_ec_name(log_text) == "EC 3.13.7":
+        return ("telemetry only, nothing written; the kernel log shows "
+                "EC 3.13.7, which ignores ACPI fan levels")
     if Path(f"/sys/module/{MODULE_NAME}").exists():
         return f"unload {MODULE_NAME} first; it shares the EC floor register"
     try:
