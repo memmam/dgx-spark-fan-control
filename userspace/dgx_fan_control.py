@@ -1350,11 +1350,46 @@ def _count_floor_devices(thermal_root: Path) -> int | None:
     return found
 
 
-def _fan_status(hwmon_root: Path) -> tuple[str, str]:
+def _acpi_fan_cur_states(thermal_root: Path) -> str:
+    """cur_state of every ACPI Fan cooling device. Not a tachometer.
+
+    On EC 3.13.7 a write to this file is ignored, so the level can be
+    nonzero while the tachometer reads 0. The health check reports the
+    level and does not treat it as the RPM.
+    """
+    names = scandir_names(thermal_root)
+    if names is None:
+        return "unreadable"
+    states = []
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        device = thermal_root / name
+        try:
+            kind = (device / "type").read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if kind != ACPI_COOLING_TYPE:
+            continue
+        try:
+            cur = (device / "cur_state").read_text(encoding="ascii").strip()
+        except OSError:
+            cur = "unreadable"
+        states.append(f"{name}:{cur}")
+    return " ".join(states) if states else "none"
+
+
+def _fan_status(hwmon_root: Path, thermal_root: Path) -> tuple[str, str]:
+    """ACPI tachometers under hwmon name acpi_fan, plus Fan cur_state.
+
+    This is not the dgx_ec_fan mailbox telemetry. A 0 RPM input still fails
+    even when cur_state is nonzero, including on EC 3.13.7. The numbers are
+    included on pass and fail so a one-sample 0 can be told from a stall.
+    """
     names = scandir_names(hwmon_root)
     if names is None:
         return "unknown", ""
-    rpms: list[int] = []
+    devices = []
     for name in names:
         device = hwmon_root / name
         try:
@@ -1363,25 +1398,37 @@ def _fan_status(hwmon_root: Path) -> tuple[str, str]:
             if access_denied(exc):
                 return "unknown", ""
             continue
-        if kind != ACPI_FAN_NAME:
-            continue
+        if kind == ACPI_FAN_NAME:
+            devices.append(name)
+    readings: list[tuple[str, int]] = []
+    for name in devices:
+        device = hwmon_root / name
         fan_names = scandir_names(device)
         if fan_names is None:
             return "unknown", ""
+        prefix = f"{name}:" if len(devices) > 1 else ""
         for fan in fan_names:
             if not (fan.startswith("fan") and fan.endswith("_input")):
                 continue
+            label = prefix + fan[: -len("_input")]
             try:
-                rpms.append(int((device / fan).read_text(encoding="ascii").strip()))
+                rpm = int((device / fan).read_text(encoding="ascii").strip())
             except OSError as exc:
                 if access_denied(exc):
                     return "unknown", ""
                 return "fail", "ACPI fan inputs are unreadable"
             except (UnicodeError, ValueError):
                 return "fail", "ACPI fan inputs are unreadable"
-    if len(rpms) < 2 or any(rpm == 0 for rpm in rpms):
-        return "fail", "ACPI fans are not all nonzero"
-    return "pass", ""
+            readings.append((label, rpm))
+    rpm_text = " ".join(f"{label}={rpm}" for label, rpm in readings)
+    if rpm_text:
+        rpm_text += " RPM"
+    else:
+        rpm_text = "no ACPI tachometer"
+    detail = f"{rpm_text}; acpi cur_state={_acpi_fan_cur_states(thermal_root)}"
+    if len(readings) < 2 or any(rpm == 0 for _label, rpm in readings):
+        return "fail", detail
+    return "pass", detail
 
 
 def _temperature_status(thermal_root: Path, zero_fan_celsius: float,
@@ -1576,7 +1623,7 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     else:
         keep("mode", "note", "not configured")
 
-    fan_status, fan_detail = _fan_status(hwmon_root)
+    fan_status, fan_detail = _fan_status(hwmon_root, thermal_root)
     keep("fans", fan_status, fan_detail)
     keep(
         "temperature",
@@ -1631,16 +1678,78 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
 
 
 def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
-                        boot_id: str | None, when: float) -> None:
+                        boot_id: str | None, when: float,
+                        firmware: str | None = None) -> None:
     lines = [
         f"result={result}",
         f"ready={ready}",
         f"boot_id={boot_id or ''}",
         f"time={when:.3f}",
     ]
+    if firmware:
+        lines.append(f"firmware={firmware}")
     if reasons:
         lines.append("reason=" + "; ".join(reasons))
     write_state_text(path, "\n".join(lines) + "\n")
+
+
+def _health_record_fields(text: str) -> dict[str, str]:
+    found = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    return found
+
+
+def dismiss_unsupported_health_record(path: Path) -> bool:
+    """Drop a stored needs-intervention result that only names unsupported firmware.
+
+    Plain health does not otherwise rewrite this file. A different reason stays.
+    """
+    try:
+        fields = _health_record_fields(path.read_text(encoding="ascii"))
+    except OSError:
+        return False
+    if fields.get("result") != "needs-intervention":
+        return False
+    if not unsupported_firmware_flag_only(fields.get("reason", "")):
+        return False
+    clear_stall_marker(path)
+    return True
+
+
+def current_firmware_token(thermal_root: Path, hwmon_root: Path, log_text: str) -> str:
+    profile = pinned_ec_name(log_text)
+    devices = floor_devices(thermal_root)
+    count = None if devices is None else len(devices)
+    if telemetry_only_firmware(log_text, profile, telemetry_hwmon_present(hwmon_root), count):
+        return profile or "EC 3.13.7"
+    return profile or "unknown"
+
+
+def format_stored_health(text: str, boot_id: str | None, firmware: str) -> str:
+    """One stored-health line, with time and a stale mark when it is old."""
+    if text in {"none", NEEDS_ROOT}:
+        return text
+    fields = _health_record_fields(text)
+    parts = []
+    if "result" in fields:
+        parts.append(f"result={fields['result']}")
+    if "ready" in fields:
+        parts.append(f"ready={fields['ready']}")
+    if "time" in fields:
+        parts.append(f"time={fields['time']}")
+    stale = []
+    stored_boot = fields.get("boot_id")
+    if stored_boot and boot_id and stored_boot != boot_id:
+        stale.append("previous boot")
+    stored_firmware = fields.get("firmware")
+    if stored_firmware and firmware != "unknown" and stored_firmware != firmware:
+        stale.append("firmware changed")
+    if stale:
+        parts.append("stale (" + ", ".join(stale) + ")")
+    return " ".join(parts) if parts else text.splitlines()[0]
 
 
 def run_notify(defaults: dict[str, str], summary: str) -> None:
@@ -1718,15 +1827,17 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     # Plain health does not record. This one stale reason is still removed
     # on read, including when the process cannot write and the unlink fails.
     dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
+    dismiss_unsupported_health_record(state_dir / HEALTH_NAME)
     interactive = settle_seconds <= 0
     deadline = monotonic() + settle_seconds
     attempt = 0
     lines: list[str] = []
     problems: list[str] = []
     ready = "not configured"
+    seen_log = ""
 
     def evaluate(emit) -> list[str]:
-        nonlocal ready
+        nonlocal ready, seen_log
         if observer is None:
             active, enabled, exec_status, service_result, n_restarts = read_daemon_facts()
             watchdog_active, _watchdog_enabled = watchdog_unit_state()
@@ -1748,6 +1859,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         else:
             ready = ready_for_work(defaults)
         profile = pinned_ec_name(log_text or "")
+        seen_log = log_text or ""
         record = snapshot.get("record", read_manual_record(state_dir, defaults, profile))
         return collect_health_checks(
             thermal_root, hwmon_root,
@@ -1796,6 +1908,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             print(line, flush=True)
     print("health: healthy" if not problems else "health: fail", flush=True)
     when = wall_time()
+    firmware = current_firmware_token(thermal_root, hwmon_root, seen_log)
     health_path = state_dir / HEALTH_NAME
     intervention_path = state_dir / INTERVENTION_NAME
     if record:
@@ -1805,7 +1918,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
                 clear_stall_marker(state_dir / STALL_MARKER_NAME)
                 clear_stall_marker(intervention_path)
                 clear_stall_marker(state_dir / PREVIOUS_REBOOT_NAME)
-                write_health_record(health_path, "healthy", ready, [], boot_id, when)
+                write_health_record(
+                    health_path, "healthy", ready, [], boot_id, when, firmware,
+                )
                 if previous and not recovery_already_announced(state_dir, boot_id):
                     message = "dgx-fan-control: recovered after watchdog reboot"
                     LOG.info(message)
@@ -1822,6 +1937,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
                 write_intervention(intervention_path, reason, boot_id, when)
                 write_health_record(
                     health_path, "needs-intervention", ready, problems, boot_id, when,
+                    firmware,
                 )
                 message = f"dgx-fan-control: needs intervention: {reason}"
                 LOG.critical(message)
@@ -1834,13 +1950,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     stored_flag = _stored_text(intervention_path)
     if stored_flag not in {"none", NEEDS_ROOT} and stored_flag.startswith("reason="):
         stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
-    stored_health = _stored_text(health_path)
-    if stored_health not in {"none", NEEDS_ROOT}:
-        kept = [
-            line for line in stored_health.splitlines()
-            if line.startswith("result=") or line.startswith("ready=")
-        ]
-        stored_health = " ".join(kept) if kept else stored_health.splitlines()[0]
+    stored_health = format_stored_health(
+        _stored_text(health_path), boot_id, firmware,
+    )
     print(f"stored needs-intervention: {stored_flag}", flush=True)
     print(f"stored health: {stored_health}", flush=True)
     print("recorded: yes" if record else "recorded: no", flush=True)

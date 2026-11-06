@@ -2096,6 +2096,111 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertEqual(alerts, [])
         self.assertFalse(any("is not active" in line for line in logs.output))
 
+    def test_fan_line_names_rpm_and_stale_health_is_marked_or_cleared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (0, 2150), 40.0)
+            (root / "thermal" / "cooling_device1" / "cur_state").write_text(
+                "100\n", encoding="ascii",
+            )
+            hwmon = root / "hwmon" / "hwmon1"
+            hwmon.mkdir()
+            (hwmon / "name").write_text(
+                CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii",
+            )
+            (hwmon / "fan1_input").write_text("5000\n", encoding="ascii")
+            (hwmon / "fan2_input").write_text("5000\n", encoding="ascii")
+            status, detail = CONTROL._fan_status(root / "hwmon", root / "thermal")
+            self.assertEqual(status, "fail")
+            self.assertIn("fan1=0", detail)
+            self.assertIn("fan2=2150 RPM", detail)
+            self.assertIn("acpi cur_state=cooling_device0:40", detail)
+            self.assertIn("cooling_device1:100", detail)
+            self.assertNotIn("5000", detail)
+
+            (root / "hwmon" / "hwmon0" / "fan1_input").write_text("2073\n", encoding="ascii")
+            status, detail = CONTROL._fan_status(root / "hwmon", root / "thermal")
+            self.assertEqual(status, "pass", detail)
+            self.assertIn("fan1=2073", detail)
+            self.assertIn("fan2=2150 RPM", detail)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            CONTROL.write_state_text(
+                health,
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-old\ntime=1.000\n"
+                "reason=workload not ready\n",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(log_text="", ec_updates=(
+                        "note", "unknown (fwupd not installed)",
+                    )),
+                    record=False, boot="boot-b",
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn("time=1.000", text)
+            self.assertIn("stale (previous boot)", text)
+            self.assertTrue(health.exists())
+
+            CONTROL.write_state_text(
+                health,
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-b\ntime=2.000\n"
+                "reason=unsupported firmware; telemetry only\n",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(
+                        module_loaded=True,
+                        log_text=(
+                            "pinned EC 3.13.7 capabilities fan0=975..4350 "
+                            "fan1=975..4350\n"
+                            "EC 3.13.7 floor writes disabled; registering hwmon "
+                            "telemetry only, no cooling device\n"
+                        ),
+                        ec_updates=("pass", "blocked"),
+                    ),
+                    record=False, boot="boot-b",
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("stored health: none", text)
+            self.assertFalse(health.exists())
+
+            CONTROL.write_state_text(
+                health,
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-b\ntime=3.000\nfirmware=EC 3.5.8\n"
+                "reason=workload not ready\n",
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(
+                        module_loaded=True,
+                        log_text=(
+                            "pinned EC 3.13.7 capabilities fan0=975..4350 "
+                            "fan1=975..4350\n"
+                        ),
+                        ec_updates=("pass", "blocked"),
+                    ),
+                    record=False, boot="boot-b",
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("time=3.000", text)
+            self.assertIn("stale (firmware changed)", text)
+            self.assertTrue(health.exists())
+
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"
         held = reason + "; manual floor state 6 is not held"

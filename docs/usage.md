@@ -486,7 +486,11 @@ The core checks are fan and thermal only:
 - `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
 - `dgx-fan-control.service` is active when it is enabled, and it did not
   exit 78
-- both ACPI fans read nonzero RPM
+- both ACPI fans read nonzero RPM. The line includes each `acpi_fan`
+  tachometer (`fan1=… fan2=… RPM`) and each ACPI `Fan` `cur_state`.
+  That tachometer is not the `dgx_ec_fan` mailbox telemetry. On EC 3.13.7
+  a `cur_state` write does not change RPM, so a nonzero level next to
+  `fan1=0` is a tachometer reading, and a real 0 still fails
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention
