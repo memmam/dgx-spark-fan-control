@@ -29,6 +29,29 @@ BUSY_CHECK=
 # Overrides dgx-fan-control watchdog --max-defer-seconds when set.
 MAX_DEFER_SECONDS=1800
 
+# Command that prints one monotonic progress number (for example a token
+# counter). The watchdog runs it with a 5 second timeout whenever work is
+# in progress. A larger number than the previous sample is progress.
+# Failure, timeout, or unparseable output is logged once and the built-in
+# heuristic is used instead. Empty uses the built-in heuristic.
+#
+# The built-in heuristic is weaker than this hook. It treats the job as
+# stuck when nvidia-smi still lists a compute process and, for
+# STUCK_SECONDS, GPU utilization stays at or below 5 percent, or those
+# processes' CPU time in /proc/<pid>/stat stops advancing. A long prefill
+# can look idle. A busy-loop hang can look alive.
+#
+# Example, not enabled. vLLM Prometheus counters:
+# PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:generation_tokens_total /{g=$2} /^vllm:prompt_tokens_total /{p=$2} END{print g+p}'
+PROGRESS_CHECK=
+
+# Seconds without progress before a hot-under-load warning. Progress is
+# sampled whenever a job is busy. The warning is raised only while the fans
+# are spinning and the hottest zone is at or above the true-zero cutoff.
+# It does not kill the job, reboot, power off, or set needs-intervention.
+# Overrides dgx-fan-control watchdog --stuck-seconds when set.
+STUCK_SECONDS=600
+
 # Optional override of the held floor. Empty uses the last set-state
 # recorded while the performance service was stopped. automatic clears
 # that record. If this is set, it wins over the record. Use 1 through 12.

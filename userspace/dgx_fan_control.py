@@ -42,6 +42,10 @@ WATCHDOG_SOC_CELSIUS = WATCHDOG_ZERO_FAN_CELSIUS
 # Journal-only. A rise this fast can pass the 104.8 C critical trip between
 # polls, so userspace does not act on it.
 OBSERVED_RISE_C_PER_S = 4.0
+HOT_CLEAR_HYSTERESIS_C = 2.0
+STUCK_SECONDS = 600.0
+GPU_IDLE_UTIL_PERCENT = 5.0
+JOB_WATCH_NAME = "job-watch"
 WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
@@ -696,6 +700,142 @@ def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> b
     return completed.returncode == 0
 
 
+def read_progress_value(command: str) -> float | None:
+    """A monotonic progress number from PROGRESS_CHECK, or None if unusable.
+
+    The command has the same timeout as BUSY_CHECK. Success is exit 0 and a
+    final token that parses as a number. A higher number than last time is
+    progress.
+    """
+    command = command.strip()
+    if not command:
+        return None
+    try:
+        completed = subprocess.run(
+            command, shell=True, check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    tokens = (completed.stdout or "").strip().split()
+    if not tokens:
+        return None
+    try:
+        return float(tokens[-1])
+    except ValueError:
+        return None
+
+
+def process_cpu_ticks(pid: int) -> int | None:
+    """utime+stime from /proc/<pid>/stat, or None if the process is unreadable."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    rest = text.rsplit(")", 1)[-1].split()
+    if len(rest) < 13:
+        return None
+    try:
+        return int(rest[11]) + int(rest[12])
+    except ValueError:
+        return None
+
+
+def read_builtin_progress() -> tuple[float | None, dict[int, int] | None]:
+    """GPU utilization percent and per-pid CPU ticks for compute processes.
+
+    None means that signal could not be read. A missing signal does not by
+    itself mean the job is stuck.
+    """
+    try:
+        util_run = subprocess.run(
+            [
+                "nvidia-smi", "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS,
+        )
+        pid_run = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            check=False, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    util = None
+    if util_run.returncode == 0:
+        values = []
+        for line in (util_run.stdout or "").splitlines():
+            token = line.strip().split()
+            if not token:
+                continue
+            try:
+                values.append(float(token[0]))
+            except ValueError:
+                continue
+        if values:
+            util = max(values)
+    ticks: dict[int, int] | None = None
+    if pid_run.returncode == 0:
+        ticks = {}
+        for line in (pid_run.stdout or "").splitlines():
+            token = line.strip()
+            if not token or not token.isdigit():
+                continue
+            pid = int(token)
+            cpu = process_cpu_ticks(pid)
+            if cpu is not None:
+                ticks[pid] = cpu
+    return util, ticks
+
+
+def builtin_signals_stuck(util: float | None, ticks: dict[int, int] | None,
+                          previous: dict[int, int] | None) -> tuple[bool, bool]:
+    """Whether GPU util is idle, and whether CPU time failed to advance.
+
+    Each value is True only when that signal was readable and showed no
+    progress. A busy-loop on the GPU can keep utilization high and look
+    alive. A long prefill can report a low utilization and look idle.
+    """
+    util_idle = util is not None and util <= GPU_IDLE_UTIL_PERCENT
+    cpu_flat = False
+    if ticks is not None and previous:
+        cpu_flat = True
+        for pid, cpu in ticks.items():
+            if cpu > previous.get(pid, cpu - 1):
+                cpu_flat = False
+                break
+        if not ticks:
+            cpu_flat = False
+    return util_idle, cpu_flat
+
+
+def read_job_watch(state_dir: Path) -> dict[str, str]:
+    path = state_dir / JOB_WATCH_NAME
+    try:
+        text = path.read_text(encoding="ascii")
+    except OSError:
+        return {}
+    found = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    return found
+
+
+def write_job_watch(state_dir: Path, source: str, stuck: bool, seconds: float) -> None:
+    try:
+        write_state_text(
+            state_dir / JOB_WATCH_NAME,
+            f"source={source}\nstuck={'yes' if stuck else 'no'}\n"
+            f"no_progress_seconds={max(0.0, seconds):.0f}\n",
+        )
+    except OSError:
+        return
+
+
 def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
     """Whether a reboot should wait.
 
@@ -1188,7 +1328,9 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
                           service_result: str | None = None,
                           n_restarts: int | None = None,
                           record: tuple[int, int | None] | None = None,
-                          etc: Path | None = None) -> list[str]:
+                          etc: Path | None = None,
+                          state_dir: Path | None = None,
+                          job_watch: dict[str, str] | None = None) -> list[str]:
     """Run every check, emitting each line before the next external call.
 
     ``log_text`` None means read the kernel log only if a missing cooling
@@ -1331,6 +1473,18 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
             thermal_root, soc_celsius, fans_spinning=(fan_status == "pass"),
         ),
     )
+    if job_watch is None:
+        job_watch = read_job_watch(state_dir) if state_dir is not None else {}
+    progress_source = job_watch.get("source", "off")
+    if progress_source not in {"hook", "built-in", "off"}:
+        progress_source = "off"
+    keep("progress", "note", progress_source)
+    if job_watch.get("stuck") == "yes":
+        seconds = job_watch.get("no_progress_seconds", "0")
+        keep(
+            "job", "warn",
+            f"job may be stuck: no progress {seconds}s, via {progress_source}",
+        )
 
     if watchdog_active == NEEDS_ROOT:
         keep("watchdog", "unknown")
@@ -1486,6 +1640,8 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             n_restarts=snapshot.get("n_restarts"),
             record=record,
             etc=etc,
+            state_dir=state_dir,
+            job_watch=snapshot.get("job_watch"),
         )
 
     while True:
@@ -1661,6 +1817,187 @@ def _wall(notifier, message: str, what: str) -> None:
         LOG.warning("could not broadcast the %s", what)
 
 
+def progress_source(command: str, state: dict) -> str:
+    """hook when PROGRESS_CHECK is in use, built-in after it fails, else off."""
+    if state.get("hook_failed"):
+        return "built-in"
+    if command.strip():
+        return "hook"
+    if state.get("busy"):
+        return "built-in"
+    return "off"
+
+
+def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | None,
+                    busy: bool, defaults: dict[str, str], state_dir: Path,
+                    notifier, alert_repeat: float, zero_fan_celsius: float,
+                    stuck_seconds: float, state: dict,
+                    progress_reader=None, builtin_reader=None) -> None:
+    """Track a hot workload. Warn only. Never reboot, power off, or kill.
+
+    Progress is sampled whenever a job is busy, so a stall that starts
+    before the machine is hot still counts. The critical line and the wall
+    alert happen only during a hot episode: fans spinning and the hottest
+    zone at or above the true-zero cutoff. The episode ends when the job
+    ends or the zone falls below that cutoff by HOT_CLEAR_HYSTERESIS_C.
+    """
+    if progress_reader is None:
+        progress_reader = read_progress_value
+    if builtin_reader is None:
+        builtin_reader = read_builtin_progress
+    spinning = (
+        fan_rpms is not None
+        and len(fan_rpms) >= 2
+        and all(rpm > 0 for rpm in fan_rpms)
+    )
+    hot = spinning and hottest is not None and hottest >= zero_fan_celsius
+    command = defaults.get("PROGRESS_CHECK", "").strip()
+    was_busy = bool(state.get("busy"))
+    episode = bool(state.get("episode"))
+
+    def publish(source: str, stuck: bool, seconds: float) -> None:
+        state["source"] = source
+        state["stuck"] = stuck
+        write_job_watch(state_dir, source, stuck, seconds)
+
+    if not busy and was_busy and (episode or state.get("saw_hot")):
+        started = state.get("episode_started")
+        peak = state.get("peak")
+        until = state.get("hot_until")
+        if not isinstance(until, float):
+            until = now
+        duration = until - started if isinstance(started, float) else 0.0
+        peak_c = peak if isinstance(peak, float) else hottest
+        LOG.info(
+            "job finished; hot for %.0fs; peak %.1fC",
+            duration, peak_c if peak_c is not None else 0.0,
+        )
+        state["episode"] = False
+        state["saw_hot"] = False
+        state["hot_until"] = None
+        state["busy"] = False
+        state["stuck"] = False
+        state["stuck_since_alert"] = None
+        state["no_progress_since"] = None
+        publish(progress_source(command, state), False, 0.0)
+        return
+
+    if not busy:
+        state["busy"] = False
+        state["no_progress_since"] = None
+        state["stuck"] = False
+        state["stuck_since_alert"] = None
+        if hot and not episode:
+            state["episode"] = True
+            state["episode_started"] = now
+            state["peak"] = hottest
+            state["hot_until"] = None
+        elif episode and (
+            hottest is None or hottest < zero_fan_celsius - HOT_CLEAR_HYSTERESIS_C
+        ):
+            state["episode"] = False
+            if state.get("hot_until") is None:
+                state["hot_until"] = now
+        elif episode and hottest is not None:
+            state["peak"] = max(state.get("peak") or hottest, hottest)
+        publish(progress_source(command, state), False, 0.0)
+        return
+
+    state["busy"] = True
+    progressed = False
+    source = "built-in"
+    quiet_for = 0.0
+    if command:
+        value = progress_reader(command)
+        if value is None:
+            if not state.get("hook_failed"):
+                LOG.warning(
+                    "PROGRESS_CHECK failed; using the built-in progress heuristic",
+                )
+                state["hook_failed"] = True
+            source = "built-in"
+        else:
+            state["hook_failed"] = False
+            source = "hook"
+            previous = state.get("progress_value")
+            if isinstance(previous, float) and value > previous:
+                progressed = True
+            state["progress_value"] = value
+            if progressed:
+                state["no_progress_since"] = now
+                state["stuck"] = False
+                state["stuck_since_alert"] = None
+            elif state.get("no_progress_since") is None:
+                state["no_progress_since"] = now
+            quiet_for = now - state["no_progress_since"]
+    if source == "built-in":
+        util, ticks = builtin_reader()
+        previous_ticks = state.get("cpu_ticks") if isinstance(state.get("cpu_ticks"), dict) else {}
+        util_idle, cpu_flat = builtin_signals_stuck(util, ticks, previous_ticks)
+        state["cpu_ticks"] = ticks or {}
+        if util is not None and not util_idle:
+            state["util_flat_since"] = None
+        elif util_idle and state.get("util_flat_since") is None:
+            state["util_flat_since"] = now
+        if ticks is not None and previous_ticks and not cpu_flat:
+            state["cpu_flat_since"] = None
+        elif cpu_flat and state.get("cpu_flat_since") is None:
+            state["cpu_flat_since"] = now
+        held = 0.0
+        if util_idle and isinstance(state.get("util_flat_since"), float):
+            held = max(held, now - state["util_flat_since"])
+        if cpu_flat and isinstance(state.get("cpu_flat_since"), float):
+            held = max(held, now - state["cpu_flat_since"])
+        quiet_for = held
+        progressed = held == 0.0 and (
+            (util is not None and not util_idle)
+            or bool(previous_ticks and ticks is not None and not cpu_flat)
+        )
+        if progressed:
+            state["stuck"] = False
+            state["stuck_since_alert"] = None
+
+    if hot and not episode:
+        state["episode"] = True
+        state["episode_started"] = now
+        state["peak"] = hottest
+        state["hot_until"] = None
+        episode = True
+    if hot:
+        state["saw_hot"] = True
+    elif episode and hottest is not None and hottest < zero_fan_celsius - HOT_CLEAR_HYSTERESIS_C:
+        state["episode"] = False
+        if state.get("hot_until") is None:
+            state["hot_until"] = now
+        episode = False
+    elif episode and hottest is not None:
+        state["peak"] = max(state.get("peak") or hottest, hottest)
+
+    stuck = bool(episode and not progressed and quiet_for >= stuck_seconds)
+    if stuck and not state.get("stuck"):
+        LOG.critical(
+            "job may be stuck; no progress for %.0fs via %s; hottest %.1fC",
+            quiet_for, source, hottest if hottest is not None else 0.0,
+        )
+        _wall(
+            notifier,
+            f"dgx-fan-control: job may be stuck; no progress for {quiet_for:.0f}s via {source}",
+            "stuck-job alert",
+        )
+        state["stuck_since_alert"] = now
+    elif stuck:
+        last = state.get("stuck_since_alert")
+        if isinstance(last, float) and now - last >= alert_repeat:
+            _wall(
+                notifier,
+                f"dgx-fan-control: job may be stuck; no progress for {quiet_for:.0f}s via {source}",
+                "stuck-job alert",
+            )
+            state["stuck_since_alert"] = now
+    state["stuck"] = stuck
+    publish(source, stuck, quiet_for)
+
+
 def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  poll_seconds: float = WATCHDOG_POLL_SECONDS,
                  zero_seconds: float = WATCHDOG_ZERO_SECONDS,
@@ -1673,8 +2010,10 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  action: str = WATCHDOG_DEFAULT_ACTION,
                  reboot_action: str = WATCHDOG_REBOOT_ACTION,
                  max_defer_seconds: float = WATCHDOG_MAX_DEFER_SECONDS,
+                 stuck_seconds: float = STUCK_SECONDS,
                  monotonic=None, wall_time=None, runner=None, unit_state=None,
                  notifier=None, gpu_jobs=None, module_loaded=None,
+                 progress_reader=None, builtin_reader=None,
                  marker_path: Path | None = None,
                  boot_id: str | None = None,
                  defaults: dict[str, str] | None = None) -> int:
@@ -1724,6 +2063,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     max_defer_seconds = configured_float(
         defaults, "MAX_DEFER_SECONDS", max_defer_seconds,
     )
+    stuck_seconds = configured_float(defaults, "STUCK_SECONDS", stuck_seconds)
+    if not math.isfinite(stuck_seconds) or stuck_seconds < 0:
+        raise ValueError("stuck interval must be finite and non-negative")
     if marker_path is None:
         marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
     if boot_id is None:
@@ -1753,6 +2095,12 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     reboot_requested = False
     deferred_logged = False
     smi_warned = False
+    job_state: dict = {}
+    LOG.info(
+        "hot-under-load tracking warns after %.0fs without progress; "
+        "it does not stop a job, reboot, or power off",
+        stuck_seconds,
+    )
     reported_unsupported = False
     foreign_walled = False
     manual_stop_logged = False
@@ -1818,6 +2166,17 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             if busy_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
                 smi_warned = True
+            try:
+                foreign_rpms = read_named_fan_rpms(hwmon_root)
+            except (OSError, UnicodeError, ValueError, RuntimeError):
+                foreign_rpms = None
+            observe_hot_job(
+                now=now, fan_rpms=foreign_rpms, hottest=hottest, busy=busy,
+                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                stuck_seconds=stuck_seconds, state=job_state,
+                progress_reader=progress_reader, builtin_reader=builtin_reader,
+            )
             if held >= reboot_seconds:
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
@@ -1977,6 +2336,26 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             stall_repair_done = False
             reboot_requested = False
             deferred_logged = False
+            try:
+                spinning_hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                spinning_hottest = None
+            note_observed_rise(spinning_hottest, now)
+            spinning_busy, spinning_how = work_is_in_progress(defaults, gpu_jobs)
+            if spinning_how == "nvidia-smi-failed" and not smi_warned:
+                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                smi_warned = True
+            if spinning_how == "busy-check-failed" and not smi_warned:
+                LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                smi_warned = True
+            observe_hot_job(
+                now=now, fan_rpms=fan_rpms, hottest=spinning_hottest,
+                busy=spinning_busy, defaults=defaults,
+                state_dir=marker_path.parent, notifier=notifier,
+                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                stuck_seconds=stuck_seconds, state=job_state,
+                progress_reader=progress_reader, builtin_reader=builtin_reader,
+            )
         else:
             announced_shortage = False
             nonzero_since = None
@@ -2026,6 +2405,13 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
                 smi_warned = True
             note_observed_rise(hottest, now)
+            observe_hot_job(
+                now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
+                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                stuck_seconds=stuck_seconds, state=job_state,
+                progress_reader=progress_reader, builtin_reader=builtin_reader,
+            )
             hot = hottest is not None and hottest >= zero_fan_celsius
             if hot:
                 if busy:
@@ -2950,6 +3336,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="deprecated alias for --zero-fan-celsius",
     )
+    watchdog.add_argument(
+        "--stuck-seconds",
+        type=float,
+        default=STUCK_SECONDS,
+        help="warn when a hot job shows no progress for this long; default 600. Does not stop the job",
+    )
     watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
     watchdog.add_argument(
         "--reboot-seconds",
@@ -3056,6 +3448,7 @@ def main(argv: list[str] | None = None) -> int:
                 action=args.action,
                 reboot_action=args.reboot_action,
                 max_defer_seconds=args.max_defer_seconds,
+                stuck_seconds=args.stuck_seconds,
             )
         if args.command == "acpi-max":
             set_acpi_fans(

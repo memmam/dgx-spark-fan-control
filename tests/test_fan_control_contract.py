@@ -254,6 +254,10 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("BUSY_CHECK=\n", defaults)
         self.assertIn("MAX_DEFER_SECONDS=1800\n", defaults)
         self.assertIn("MANUAL_STATE=\n", defaults)
+        self.assertIn("PROGRESS_CHECK=\n", defaults)
+        self.assertIn("STUCK_SECONDS=600\n", defaults)
+        self.assertIn("vllm:generation_tokens_total", defaults)
+        self.assertIn("vllm:prompt_tokens_total", defaults)
 
 
 if __name__ == "__main__":

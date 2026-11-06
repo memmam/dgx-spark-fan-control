@@ -387,6 +387,149 @@ class UserlandFailureTests(unittest.TestCase):
                     (root / "state" / CONTROL.INTERVENTION_NAME).exists(),
                     expect,
                 )
+                self.assertIn("progress: off", stdout.getvalue())
+
+    def test_hot_job_tracking_warns_and_never_stops_the_machine(self):
+        state_dir_holder = {}
+
+        def drive(root, *, gpu, defaults, progress, builtin, stop_after, stuck=10):
+            status, actions, alerts, logs, marker = self._drive_watchdog(
+                root, rpm=(2700, 4050), celsius=90, gpu=gpu, stop_after=stop_after,
+                stuck_seconds=stuck, defaults=defaults, progress_reader=progress,
+                builtin_reader=builtin, alert_repeat_seconds=1800,
+            )
+            state_dir_holder["marker"] = marker
+            return status, actions, alerts, logs
+
+        def no_action(actions, marker):
+            self.assertEqual(actions, [])
+            self.assertFalse((marker.parent / CONTROL.INTERVENTION_NAME).exists())
+            self.assertNotIn("poweroff", " ".join(actions))
+            self.assertNotIn("reboot", " ".join(actions))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            values = iter([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+            _status, actions, alerts, logs = drive(
+                root, gpu=lambda: True, defaults={"PROGRESS_CHECK": "tokens"},
+                progress=lambda _command: next(values),
+                builtin=lambda: (_ for _ in ()).throw(AssertionError("hook should win")),
+                stop_after=16,
+            )
+            no_action(actions, state_dir_holder["marker"])
+            self.assertEqual(alerts, [])
+            self.assertNotIn("job may be stuck", "\n".join(logs))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, logs = drive(
+                root, gpu=lambda: True, defaults={"PROGRESS_CHECK": "tokens"},
+                progress=lambda _command: 5.0,
+                builtin=lambda: (_ for _ in ()).throw(AssertionError("hook should win")),
+                stop_after=16,
+            )
+            no_action(actions, state_dir_holder["marker"])
+            self.assertEqual(sum("job may be stuck" in item for item in alerts), 1)
+            self.assertEqual(
+                sum("job may be stuck" in line for line in logs), 1,
+            )
+            text = (state_dir_holder["marker"].parent / CONTROL.JOB_WATCH_NAME).read_text()
+            self.assertIn("source=hook\n", text)
+            self.assertIn("stuck=yes\n", text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, logs = drive(
+                root, gpu=lambda: True, defaults={"PROGRESS_CHECK": "tokens"},
+                progress=lambda _command: None,
+                builtin=lambda: (0.0, {42: 100}),
+                stop_after=16,
+            )
+            no_action(actions, state_dir_holder["marker"])
+            self.assertEqual(
+                sum("PROGRESS_CHECK failed" in line for line in logs), 1,
+            )
+            self.assertEqual(sum("via built-in" in item for item in alerts), 1)
+            text = (state_dir_holder["marker"].parent / CONTROL.JOB_WATCH_NAME).read_text()
+            self.assertIn("source=built-in\n", text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, _logs = drive(
+                root, gpu=lambda: True, defaults={},
+                progress=lambda _command: (_ for _ in ()).throw(AssertionError("no hook")),
+                builtin=lambda: (0.0, {42: 100}),
+                stop_after=16,
+            )
+            no_action(actions, state_dir_holder["marker"])
+            self.assertEqual(sum("via built-in" in item for item in alerts), 1)
+
+        calls = {"n": 0}
+
+        def ending():
+            calls["n"] += 1
+            return calls["n"] < 3
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, logs = drive(
+                root, gpu=ending, defaults={},
+                progress=lambda _command: None,
+                builtin=lambda: (80.0, {42: calls["n"] * 10}),
+                stop_after=12, stuck=600,
+            )
+            no_action(actions, state_dir_holder["marker"])
+            self.assertEqual(alerts, [])
+            finished = [line for line in logs if "job finished" in line]
+            self.assertEqual(len(finished), 1)
+            self.assertIn("hot for", finished[0])
+            self.assertIn("peak 90.0C", finished[0])
+
+        lines = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            problems = CONTROL.collect_health_checks(
+                root / "thermal", root / "hwmon",
+                module_loaded=True, service_active="inactive",
+                service_enabled="disabled", exec_status=None,
+                watchdog_active="active", soc_celsius=85, log_text="",
+                ready="not configured", emit=lines.append,
+                job_watch={
+                    "source": "hook", "stuck": "yes", "no_progress_seconds": "600",
+                },
+            )
+            self.assertEqual(problems, [])
+            self.assertIn("progress: hook", lines)
+            self.assertIn(
+                "job: warn (job may be stuck: no progress 600s, via hook)", lines,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(job_watch={
+                        "source": "built-in", "stuck": "yes",
+                        "no_progress_seconds": "600",
+                    }),
+                    record=True,
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("via built-in", stdout.getvalue())
+            self.assertFalse((root / "state" / CONTROL.INTERVENTION_NAME).exists())
+
+        cool = {}
+        walls = []
+        for moment in (0.0, 700.0):
+            CONTROL.observe_hot_job(
+                now=moment, fan_rpms=[2700, 4050], hottest=70.0, busy=True,
+                defaults={"PROGRESS_CHECK": "tokens"}, state_dir=Path("/nonexistent"),
+                notifier=walls.append, alert_repeat=1800, zero_fan_celsius=85,
+                stuck_seconds=600, state=cool, progress_reader=lambda _command: 1.0,
+                builtin_reader=lambda: (_ for _ in ()).throw(AssertionError("cool")),
+            )
+        self.assertEqual(walls, [])
+        self.assertFalse(cool.get("stuck"))
 
     def test_true_zero_powers_off_at_85c_with_no_work_in_progress(self):
         self.assertEqual(CONTROL.WATCHDOG_SOC_CELSIUS, 85.0)
@@ -573,7 +716,8 @@ class UserlandFailureTests(unittest.TestCase):
                         marker=None, module=False, soc=85.0, reboot_seconds=60,
                         max_defer_seconds=None, defaults=None,
                         alert_repeat_seconds=1800, unit_state="active",
-                        cooling_state=None):
+                        cooling_state=None, stuck_seconds=None,
+                        progress_reader=None, builtin_reader=None):
         self._stopped_acpi_fans(root, rpm, celsius)
         if module:
             device = root / "thermal" / "cooling_device2"
@@ -622,6 +766,9 @@ class UserlandFailureTests(unittest.TestCase):
                 **({} if max_defer_seconds is None else {
                     "max_defer_seconds": max_defer_seconds,
                 }),
+                **({} if stuck_seconds is None else {"stuck_seconds": stuck_seconds}),
+                **({} if progress_reader is None else {"progress_reader": progress_reader}),
+                **({} if builtin_reader is None else {"builtin_reader": builtin_reader}),
             )
         return status, actions, alerts, logs.output, marker
 

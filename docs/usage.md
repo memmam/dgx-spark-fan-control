@@ -360,6 +360,53 @@ with a fan floor or pre-cool. If the hottest zone rises about 4°C/s between
 polls, the watchdog writes one observational journal line and takes no
 action.
 
+## Hot under load
+
+A hot episode starts when the fans are spinning and the hottest zone is at
+or above the true-zero cutoff (85°C by default). The watchdog keeps polling.
+The episode ends when the zone falls more than 2°C below that cutoff, or
+when the job ends. This path never kills a job, reboots, powers off, or
+writes `needs-intervention`. A true zero, both fans at 0 RPM, is not a hot
+episode; that path is the stall handling above.
+
+Progress is sampled whenever work is busy, including before the machine is
+hot, so a stall that started earlier still counts when the zone crosses the
+cutoff. The stuck warning itself is raised only during a hot episode.
+
+`PROGRESS_CHECK` in `/etc/default/dgx-fan-control` is the primary signal. It
+is a command with the same 5 second timeout as `BUSY_CHECK`. It must print
+one monotonic number. A larger number than the last sample is progress. A
+failure, a timeout, or output that is not a number is logged once, and the
+watchdog falls back to the built-in heuristic until the hook works again.
+Empty means the built-in heuristic. This example reads vLLM's Prometheus
+counters and is not enabled by default:
+
+```
+PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:generation_tokens_total /{g=$2} /^vllm:prompt_tokens_total /{p=$2} END{print g+p}'
+```
+
+The built-in heuristic is weaker. With a compute process still present, the
+job looks stuck when GPU utilization stays at or below 5% for
+`STUCK_SECONDS`, or when those processes' cumulative CPU time in
+`/proc/<pid>/stat` does not advance for that long. A long prefill can
+report a low utilization and look idle. A hang that still burns CPU or GPU
+time can look alive.
+
+`STUCK_SECONDS` defaults to 600. `--stuck-seconds` is the same number; a
+value in the defaults file overrides the flag. When that interval passes
+with no progress during a hot episode, the watchdog writes one critical
+journal line and broadcasts a wall alert, then repeats the wall at the
+usual `--alert-repeat-seconds` interval. The warning clears when progress
+resumes or the job ends. When a job that was hot finishes, the journal
+records one line: `job finished`, how long it was hot, and the peak
+temperature.
+
+`dgx-fan-control health` reads `/var/lib/dgx-fan-control/job-watch` and
+prints the progress source in use: `progress: hook`, `progress: built-in`,
+or `progress: off`. A stuck job is
+`job: warn (job may be stuck: no progress Ns, via hook)` (or `built-in`).
+That line does not fail health and does not set needs-intervention.
+
 A `wall` broadcast for a daemon that is enabled but not running is sent when
 that state changes, and again at most every 30 minutes
 (`--alert-repeat-seconds`) while it lasts. The journal records the condition
@@ -402,12 +449,15 @@ Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
 path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
 `--stall-seconds`, `--reboot-seconds`, `--zero-fan-celsius`, `--action`,
-`--reboot-action`, `--alert-repeat-seconds`, and `--max-defer-seconds`
-change the alert hold, the reboot hold, the hottest-zone poweroff
-temperature, the poweroff command, the reboot command, how often a standing
-alert is broadcast again, and how long a reboot may be deferred. Each
-watchdog command is one program plus arguments, not a shell pipeline.
-`BUSY_CHECK`, `READY_CHECK`, and `DGX_FAN_NOTIFY` are shell commands from
+`--reboot-action`, `--alert-repeat-seconds`, `--max-defer-seconds`, and
+`--stuck-seconds` change the alert hold, the reboot hold, the hottest-zone
+true-zero poweroff temperature, the poweroff command, the reboot command,
+how often a standing alert is broadcast again, how long a reboot may be
+deferred, and how long a hot job may show no progress before a warning.
+`--stuck-seconds` does not stop the job. Each watchdog command is one
+program plus arguments, not a shell pipeline.
+`BUSY_CHECK`, `READY_CHECK`, `PROGRESS_CHECK`, and `DGX_FAN_NOTIFY` are
+shell commands from
 the root-owned defaults file; an `http://` or `https://` value for
 `READY_CHECK` is a GET instead. See the [known
 issues](../README.md#known-issues) before enabling this on a machine that
@@ -425,8 +475,8 @@ each check as it finishes, with `pass`, `fail (reason)`, or
 `unknown (needs root)`. A check that cannot be read is `unknown (needs root)`,
 not an error. The command exits nonzero when any check fails or is unknown.
 It also prints a needs-intervention flag or health file it can read.
-`systemctl`, `READY_CHECK`, `nvidia-smi`, and the kernel log read each time
-out after 5 seconds.
+`systemctl`, `READY_CHECK`, `PROGRESS_CHECK`, `nvidia-smi`, and the kernel
+log read each time out after 5 seconds.
 
 The core checks are fan and thermal only:
 
@@ -437,6 +487,9 @@ The core checks are fan and thermal only:
 - both ACPI fans read nonzero RPM
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
+  does not set needs-intervention
+- `progress:` is `hook`, `built-in`, or `off`. A stuck job adds
+  `job: warn (job may be stuck: ...)`, which does not fail the check and
   does not set needs-intervention
 - `dgx-fan-watchdog.service` is active
 
