@@ -497,7 +497,11 @@ modinfo -F signer dgx_ec_fan_control
 Expect `installed` for `$(uname -r)` and the enrolled certificate subject
 in `signer`. Then unload and reload, and check health without sudo. The
 reload reads `owned_state` and `owned_floor` from
-`/etc/modprobe.d/dgx-fan-control-owned.conf` when that file exists.
+`/etc/modprobe.d/dgx-fan-control-owned.conf` when that file exists. Loading
+the module puts the fans back on the EC's own curve, so a held manual floor
+is gone after the reload. When the performance daemon is not restarted, the
+block reruns `dgx-fan-manual.service` to reapply it. With no held floor that
+unit exits without writing.
 
 ```sh
 if systemctl is-active --quiet dgx-fan-control.service; then
@@ -512,6 +516,8 @@ fi
 sudo modprobe dgx_ec_fan_control
 if [ "$restart_performance" -eq 1 ]; then
   sudo systemctl start dgx-fan-control.service
+else
+  sudo systemctl restart dgx-fan-manual.service
 fi
 dgx-fan-control health
 sudo dgx-fan-control health --record
@@ -545,7 +551,9 @@ Run `./scripts/build-sign` as the user who owns the key. The script does not
 install or load the module. An unsigned module will not load while Secure
 Boot is enforced. Then the same unload, reload, and health check as [7A](#7a-update-the-module-with-dkms).
 `modprobe` applies `owned_state` and `owned_floor` from
-`/etc/modprobe.d/dgx-fan-control-owned.conf`.
+`/etc/modprobe.d/dgx-fan-control-owned.conf`. As in 7A, the reload drops a
+held manual floor, and the block reruns `dgx-fan-manual.service` to reapply
+it when the performance daemon is not restarted.
 
 ```sh
 if systemctl is-active --quiet dgx-fan-control.service; then
@@ -560,6 +568,8 @@ fi
 sudo modprobe dgx_ec_fan_control
 if [ "$restart_performance" -eq 1 ]; then
   sudo systemctl start dgx-fan-control.service
+else
+  sudo systemctl restart dgx-fan-manual.service
 fi
 dgx-fan-control health
 sudo dgx-fan-control health --record
