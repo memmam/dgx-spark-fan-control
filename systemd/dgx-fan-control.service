@@ -8,8 +8,10 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/dgx-fan-control daemon
-Restart=on-failure
-RestartPreventExitStatus=69
+# Restart after every exit, including 69. Preventing that restart left a low
+# floor in place for 1 d 19 h (tenhkspark, 2026-10-31). StartLimitBurst in
+# the [Unit] section stops an immediate exit from restarting without limit.
+Restart=always
 RestartSec=30s
 TimeoutStopSec=30s
 CapabilityBoundingSet=

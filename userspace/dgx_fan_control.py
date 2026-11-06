@@ -7,6 +7,7 @@ import argparse
 import errno
 import logging
 import math
+import os
 import shlex
 import signal
 import subprocess
@@ -26,6 +27,8 @@ WATCHDOG_POLL_SECONDS = 2.0
 WATCHDOG_ZERO_SECONDS = 10.0
 WATCHDOG_SOC_CELSIUS = 70.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
+DAEMON_UNIT = "dgx-fan-control.service"
+DAEMON_ALERT_INTERVAL_SECONDS = 60.0
 MAX_STATE = 12
 MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
@@ -59,6 +62,26 @@ PERFORMANCE_CURVE = (
     (65.0, 10),
     (70.0, 12),
 )
+
+# Opt-in quieter curve from tenhkspark, upstream PR #2 and
+# tenhkspark/dgx-spark-fan-tuning patch/0001-performance-curve.patch.
+# For EC 3.5.8 with the pre-October SoC (validation image 2.155.11) when
+# less noise is worth higher temperatures. State 1 is still the floor.
+QUIET_CURVE = (
+    (0.0, 1),
+    (52.0, 2),
+    (57.0, 3),
+    (62.0, 4),
+    (66.0, 5),
+    (70.0, 6),
+    (73.0, 8),
+    (76.0, 10),
+    (78.0, 12),
+)
+CURVES = {
+    "performance": PERFORMANCE_CURVE,
+    "quiet": QUIET_CURVE,
+}
 
 LOG = logging.getLogger("dgx-fan-control")
 
@@ -140,6 +163,26 @@ def fans_stalled(fan_rpms: list[int], soc_c: float, held_seconds: float, *,
     return held_seconds > zero_seconds
 
 
+def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
+    try:
+        completed = subprocess.run(
+            ["systemctl", "is-active", unit],
+            check=False, capture_output=True, text=True,
+        )
+    except OSError:
+        return "unknown"
+    lines = (completed.stdout or "").strip().splitlines()
+    return lines[0] if lines else "unknown"
+
+
+def daemon_is_down(state: str) -> bool:
+    return state != "active"
+
+
+def broadcast_alert(message: str) -> None:
+    subprocess.run(["wall", message], check=False, capture_output=True)
+
+
 def run_watchdog_action(action: str) -> int:
     argv = shlex.split(action)
     if not argv:
@@ -153,7 +196,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  zero_seconds: float = WATCHDOG_ZERO_SECONDS,
                  soc_celsius: float = WATCHDOG_SOC_CELSIUS,
                  action: str = WATCHDOG_DEFAULT_ACTION,
-                 monotonic=None, runner=None) -> int:
+                 monotonic=None, runner=None, unit_state=None, notifier=None) -> int:
     """Read ACPI fan tachometers and thermal_zone0. Never writes a fan control."""
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
@@ -165,6 +208,10 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         monotonic = time.monotonic
     if runner is None:
         runner = run_watchdog_action
+    if unit_state is None:
+        unit_state = systemctl_is_active
+    if notifier is None:
+        notifier = broadcast_alert
     stop_requested = Event()
 
     def request_stop(signum: int, frame: object) -> None:
@@ -179,7 +226,26 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     )
     fault_since: float | None = None
     announced_shortage = False
+    last_daemon_alert: float | None = None
     while not stop_requested.is_set():
+        # A dead daemon can leave a low floor while temperatures stay under
+        # every stall threshold. Check it before those thresholds.
+        service_state = unit_state()
+        if daemon_is_down(service_state):
+            now = monotonic()
+            if (last_daemon_alert is None or
+                    now - last_daemon_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
+                message = (
+                    f"dgx-fan-control: {DAEMON_UNIT} is not active ({service_state})"
+                )
+                LOG.critical(message)
+                try:
+                    notifier(message)
+                except OSError:
+                    LOG.warning("could not broadcast the fan-daemon alert")
+                last_daemon_alert = now
+        else:
+            last_daemon_alert = None
         try:
             fan_rpms = read_named_fan_rpms(hwmon_root)
             soc_c = read_thermal_zone_c(thermal_root)
@@ -248,11 +314,19 @@ def read_hottest_temperature_c(thermal_root: Path) -> float:
     return max(readings)
 
 
-def curve_state(temperature_c: float) -> int:
+def curve_name(explicit: str | None = None) -> str:
+    raw = explicit if explicit else os.environ.get("DGX_FAN_CURVE", "performance")
+    name = raw.strip().lower()
+    if name not in CURVES:
+        raise ValueError(f"unknown fan curve {raw!r}; choose performance or quiet")
+    return name
+
+
+def curve_state(temperature_c: float, curve: tuple = PERFORMANCE_CURVE) -> int:
     if not math.isfinite(temperature_c) or temperature_c <= 0:
         raise ValueError("temperature must be finite and positive")
     state = 0
-    for threshold_c, threshold_state in PERFORMANCE_CURVE:
+    for threshold_c, threshold_state in curve:
         if threshold_state < MIN_CURVE_STATE:
             raise ValueError("performance curve requested state 0")
         if temperature_c < threshold_c:
@@ -267,15 +341,16 @@ def retry_delay_seconds(exc: OSError, failures: int) -> float:
     return RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
 
 
-def next_state(current: int, filtered_temperature_c: float) -> int:
+def next_state(current: int, filtered_temperature_c: float,
+               curve: tuple = PERFORMANCE_CURVE) -> int:
     """Rate-limit the curve, with prompt increases and slow hysteretic falls."""
     if not 0 <= current <= MAX_STATE:
         raise ValueError("current cooling state is outside the driver contract")
-    rising_target = curve_state(filtered_temperature_c)
+    rising_target = curve_state(filtered_temperature_c, curve)
     if rising_target > current:
         chosen = min(rising_target, current + UP_STATES_PER_POLL)
     else:
-        falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C)
+        falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C, curve)
         if falling_target < current:
             chosen = max(falling_target, current - DOWN_STATES_PER_POLL)
         else:
@@ -303,11 +378,12 @@ def write_state(cooling_device: Path, state: int) -> None:
 
 
 def run_daemon(thermal_root: Path, poll_seconds: float,
-               hwmon_root: Path | None = None) -> int:
+               hwmon_root: Path | None = None, curve: str | None = None) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
     if hwmon_root is None:
         hwmon_root = Path("/sys/class/hwmon")
+    selected = CURVES[curve_name(curve)]
     cooling_device = require_control(thermal_root, hwmon_root)
     filtered_temperature_c: float | None = None
     stop_requested = Event()
@@ -319,7 +395,10 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    LOG.info("controller starting; authenticating the current cooling state")
+    LOG.info(
+        "controller starting curve=%s; authenticating the current cooling state",
+        curve_name(curve),
+    )
 
     try:
         while not stop_requested.is_set():
@@ -335,7 +414,7 @@ def run_daemon(thermal_root: Path, poll_seconds: float,
                         filtered_temperature_c += FILTER_ALPHA * (
                             hottest - filtered_temperature_c
                         )
-                    desired = next_state(current, filtered_temperature_c)
+                    desired = next_state(current, filtered_temperature_c, selected)
                 except (OSError, RuntimeError, ValueError):
                     LOG.exception("temperature observation failed; requesting maximum cooling")
                     hottest = math.nan
@@ -469,6 +548,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     daemon = subparsers.add_parser("daemon", help="run the smooth performance curve")
     daemon.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    daemon.add_argument(
+        "--curve",
+        choices=tuple(CURVES),
+        default=None,
+        help="performance (default) or quiet; DGX_FAN_CURVE overrides the default",
+    )
     watchdog = subparsers.add_parser(
         "watchdog",
         help="read ACPI fans and power off if both stay at 0 RPM while hot",
@@ -494,7 +579,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "daemon":
-            return run_daemon(args.thermal_root, args.poll_seconds, args.hwmon_root)
+            return run_daemon(
+                args.thermal_root, args.poll_seconds, args.hwmon_root, args.curve,
+            )
         if args.command == "watchdog":
             return run_watchdog(
                 args.thermal_root,

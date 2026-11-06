@@ -154,9 +154,14 @@ response bytes, another timeout, and inconsistent floor ownership all refuse
 recovery. Retain the logs when this occurs. Do not repeatedly restart the
 service to work around the cooldown or discard ownership by reloading.
 
-Systemd does not restart exit 69. Unexpected process crashes have a 30-second
-restart delay and a three-start limit per five minutes. SIGTERM lets the daemon
-perform its own cleanup, without a competing `ExecStop` writer.
+The service uses `Restart=always` with a 30-second delay. Exit 69 used to be
+excluded from restart, which left a stopped daemon holding a low floor while
+temperatures stayed under the alarms (observed for 1 day 19 hours). A process
+that exits immediately, including unsupported firmware, is still limited to
+three starts in five minutes (`StartLimitBurst=3`, `StartLimitIntervalSec=300`).
+SIGTERM lets the daemon perform its own cleanup, without a competing
+`ExecStop` writer. `dgx-fan-control watchdog` logs and broadcasts when this
+unit is not `active`, before it applies the temperature rule.
 
 On 2026-09-07, both machines had an **idle physical mailbox with a stale pending
 flag**. A guarded, one-shot read-lower-floor retry recovered communication on

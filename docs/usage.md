@@ -132,8 +132,12 @@ boot. This is **our performance curve**, not NVIDIA's factory curve. While the
 daemon is running it never selects state 0. Below 50°C it holds state 1, the
 first additive floor, because a clamp of 0 has been observed to latch with the
 fans stopped. Stopping the service still restores state 0 (NVIDIA's curve).
-Temperatures are unchanged from the original curve. The state numbers are the
-same on every profile; the kernel maps them through the table below.
+Temperatures below are the default `performance` curve. `--curve quiet` or
+`DGX_FAN_CURVE=quiet` selects the tenhkspark opt-in curve (state 1 below
+52°C, state 12 at 78°C) for EC 3.5.8 with the pre-October SoC when less noise
+is preferred. Both curves keep state at 1 or higher while the daemon runs.
+The state numbers are the same on every profile; the kernel maps them through
+the table below.
 
 | Filtered hottest temperature | Target state | EC 3.5.8 floor | EC 3.13.7 reported floor |
 | ---: | ---: | ---: | ---: |

@@ -269,6 +269,55 @@ class UserlandFailureTests(unittest.TestCase):
                 self.assertEqual(CONTROL.main([*argv, "set-state", "1"]), 1)
                 self.assertEqual(CONTROL.main([*argv, "automatic"]), 1)
 
+    def test_quiet_curve_never_selects_zero_and_is_monotonic(self):
+        thresholds = [temperature for temperature, _state in CONTROL.QUIET_CURVE]
+        states = [state for _temperature, state in CONTROL.QUIET_CURVE]
+        self.assertEqual(thresholds, sorted(thresholds))
+        self.assertEqual(states, sorted(states))
+        self.assertGreaterEqual(min(states), 1)
+        self.assertEqual(CONTROL.curve_state(51.9, CONTROL.QUIET_CURVE), 1)
+        self.assertEqual(CONTROL.curve_state(52.0, CONTROL.QUIET_CURVE), 2)
+        self.assertEqual(CONTROL.curve_state(78.0, CONTROL.QUIET_CURVE), 12)
+        previous = 0
+        for temperature in (0.1, 20, 51.9, 52, 57, 62, 66, 70, 73, 76, 78, 100):
+            state = CONTROL.curve_state(temperature, CONTROL.QUIET_CURVE)
+            self.assertGreaterEqual(state, previous)
+            self.assertGreaterEqual(state, 1)
+            for current in range(CONTROL.MAX_STATE + 1):
+                self.assertGreaterEqual(
+                    CONTROL.next_state(current, temperature, CONTROL.QUIET_CURVE), 1,
+                )
+            previous = state
+        self.assertEqual(CONTROL.curve_name("quiet"), "quiet")
+        self.assertEqual(CONTROL.curve_name("performance"), "performance")
+        with patch.dict("os.environ", {"DGX_FAN_CURVE": "quiet"}, clear=False):
+            self.assertEqual(CONTROL.curve_name(None), "quiet")
+            self.assertIs(CONTROL.CURVES[CONTROL.curve_name(None)], CONTROL.QUIET_CURVE)
+
+    def test_watchdog_alerts_when_the_daemon_is_not_active_before_temperature(self):
+        alerts = []
+        actions = []
+        stop = Event()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root,
+                    root,
+                    unit_state=lambda: "inactive",
+                    notifier=alerts.append,
+                    runner=lambda action: actions.append(action),
+                )
+        self.assertEqual(status, 0)
+        self.assertEqual(actions, [])
+        self.assertTrue(any("not active" in message for message in alerts))
+        self.assertTrue(any("not active" in line for line in logs.output))
+        self.assertFalse(CONTROL.daemon_is_down("active"))
+        self.assertTrue(CONTROL.daemon_is_down("failed"))
+
     def test_stall_requires_both_fans_hot_for_more_than_ten_seconds(self):
         self.assertFalse(CONTROL.fans_stalled([0, 0], 70.0, 10.0))
         self.assertTrue(CONTROL.fans_stalled([0, 0], 70.0, 10.01))
@@ -313,6 +362,8 @@ class UserlandFailureTests(unittest.TestCase):
                     soc_celsius=70,
                     monotonic=lambda: clock[0],
                     runner=runner,
+                    unit_state=lambda: "active",
+                    notifier=lambda message: None,
                 )
             self.assertEqual(status, 0)
             self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
@@ -348,6 +399,8 @@ class UserlandFailureTests(unittest.TestCase):
                     root / "hwmon",
                     monotonic=lambda: clock[0],
                     runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=lambda message: None,
                 )
             self.assertEqual(status, 0)
             self.assertEqual(actions, [])

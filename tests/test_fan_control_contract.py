@@ -112,6 +112,10 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("PrivateNetwork=yes", SERVICE)
         self.assertIn("ProtectSystem=strict", SERVICE)
         self.assertNotIn("modprobe", SERVICE)
+        self.assertIn("Restart=always\n", SERVICE)
+        self.assertNotIn("RestartPreventExitStatus", SERVICE)
+        self.assertIn("StartLimitBurst=3", SERVICE)
+        self.assertIn("StartLimitIntervalSec=300", SERVICE)
 
 
 if __name__ == "__main__":
