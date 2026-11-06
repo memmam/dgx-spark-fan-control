@@ -515,6 +515,9 @@ def write_stall_marker(path: Path, boot_id: str, when: float, reason: str = "tru
 
 INTERVENTION_NAME = "needs-intervention"
 HEALTH_NAME = "health"
+# Schema of the on-disk health file. A missing or different value was written
+# by older code and is shown as stale. Plain health does not rewrite it.
+HEALTH_RECORD_VERSION = "1"
 NOTIFY_DEFAULT = Path("/etc/default/dgx-fan-control")
 
 
@@ -1685,6 +1688,7 @@ def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
         f"ready={ready}",
         f"boot_id={boot_id or ''}",
         f"time={when:.3f}",
+        f"version={HEALTH_RECORD_VERSION}",
     ]
     if firmware:
         lines.append(f"firmware={firmware}")
@@ -1728,8 +1732,28 @@ def current_firmware_token(thermal_root: Path, hwmon_root: Path, log_text: str) 
     return profile or "unknown"
 
 
-def format_stored_health(text: str, boot_id: str | None, firmware: str) -> str:
-    """One stored-health line, with time and a stale mark when it is old."""
+def _format_record_time(raw: str) -> str:
+    """Local wall time with zone, or the stored text when it is not a timestamp."""
+    try:
+        stamp = float(raw)
+    except ValueError:
+        return raw
+    if not math.isfinite(stamp):
+        return raw
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(stamp))
+    except (OSError, OverflowError, ValueError):
+        return raw
+
+
+def format_stored_health(text: str, boot_id: str | None, firmware: str, *,
+                         current_healthy: bool = False) -> str:
+    """One stored-health line. Time is local. Old records are marked stale.
+
+    A missing firmware or schema version was written by older code. This does
+    not rewrite the file. A stale needs-intervention result names the refresh
+    command when this run is healthy.
+    """
     if text in {"none", NEEDS_ROOT}:
         return text
     fields = _health_record_fields(text)
@@ -1739,16 +1763,25 @@ def format_stored_health(text: str, boot_id: str | None, firmware: str) -> str:
     if "ready" in fields:
         parts.append(f"ready={fields['ready']}")
     if "time" in fields:
-        parts.append(f"time={fields['time']}")
+        parts.append("time=" + _format_record_time(fields["time"]))
     stale = []
     stored_boot = fields.get("boot_id")
     if stored_boot and boot_id and stored_boot != boot_id:
         stale.append("previous boot")
     stored_firmware = fields.get("firmware")
-    if stored_firmware and firmware != "unknown" and stored_firmware != firmware:
+    if not stored_firmware:
+        stale.append("firmware not recorded")
+    elif firmware != "unknown" and stored_firmware != firmware:
         stale.append("firmware changed")
+    if fields.get("version") != HEALTH_RECORD_VERSION:
+        stale.append("older version")
     if stale:
         parts.append("stale (" + ", ".join(stale) + ")")
+        if current_healthy and fields.get("result") == "needs-intervention":
+            parts.append(
+                "(superseded by current healthy result; "
+                "run `sudo dgx-fan-control health --record` to refresh)"
+            )
     return " ".join(parts) if parts else text.splitlines()[0]
 
 
@@ -1952,6 +1985,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
     stored_health = format_stored_health(
         _stored_text(health_path), boot_id, firmware,
+        current_healthy=not problems,
     )
     print(f"stored needs-intervention: {stored_flag}", flush=True)
     print(f"stored health: {stored_health}", flush=True)

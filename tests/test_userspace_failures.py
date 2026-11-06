@@ -2146,9 +2146,27 @@ class UserlandFailureTests(unittest.TestCase):
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
             self.assertIn("health: healthy", text)
-            self.assertIn("time=1.000", text)
-            self.assertIn("stale (previous boot)", text)
-            self.assertTrue(health.exists())
+            self.assertIn(
+                "time=" + CONTROL.time.strftime(
+                    "%Y-%m-%d %H:%M:%S %Z", CONTROL.time.localtime(1.0),
+                ),
+                text,
+            )
+            self.assertIn(
+                "stale (previous boot, firmware not recorded, older version)",
+                text,
+            )
+            self.assertIn(
+                "run `sudo dgx-fan-control health --record` to refresh",
+                text,
+            )
+            self.assertIn("recorded: no", text)
+            self.assertEqual(
+                health.read_text(encoding="ascii"),
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-old\ntime=1.000\n"
+                "reason=workload not ready\n",
+            )
 
             CONTROL.write_state_text(
                 health,
@@ -2197,9 +2215,151 @@ class UserlandFailureTests(unittest.TestCase):
                 )
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
-            self.assertIn("time=3.000", text)
-            self.assertIn("stale (firmware changed)", text)
-            self.assertTrue(health.exists())
+            self.assertIn(
+                "time=" + CONTROL.time.strftime(
+                    "%Y-%m-%d %H:%M:%S %Z", CONTROL.time.localtime(3.0),
+                ),
+                text,
+            )
+            self.assertIn("stale (firmware changed, older version)", text)
+            self.assertIn(
+                "run `sudo dgx-fan-control health --record` to refresh",
+                text,
+            )
+            self.assertEqual(
+                health.read_text(encoding="ascii"),
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-b\ntime=3.000\nfirmware=EC 3.5.8\n"
+                "reason=workload not ready\n",
+            )
+
+    def test_stored_health_uses_local_time_and_marks_missing_schema(self):
+        stamp = 1793949945.325
+        shown_time = CONTROL.time.strftime(
+            "%Y-%m-%d %H:%M:%S %Z", CONTROL.time.localtime(stamp),
+        )
+        hint = (
+            "(superseded by current healthy result; "
+            "run `sudo dgx-fan-control health --record` to refresh)"
+        )
+        current = (
+            "result=needs-intervention\nready=not configured\n"
+            f"boot_id=boot-b\ntime={stamp:.3f}\n"
+            f"version={CONTROL.HEALTH_RECORD_VERSION}\n"
+            "firmware=EC 3.13.7\n"
+            "reason=workload not ready\n"
+        )
+        fresh = CONTROL.format_stored_health(
+            current, "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn(f"time={shown_time}", fresh)
+        self.assertNotIn(f"time={stamp:.3f}", fresh)
+        self.assertNotIn("stale", fresh)
+        self.assertNotIn("superseded", fresh)
+
+        raw_time = CONTROL.format_stored_health(
+            current.replace(f"time={stamp:.3f}", "time=not-a-time"),
+            "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn("time=not-a-time", raw_time)
+        self.assertNotIn("stale", raw_time)
+
+        missing_firmware = CONTROL.format_stored_health(
+            current.replace("firmware=EC 3.13.7\n", ""),
+            "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn(f"time={shown_time}", missing_firmware)
+        self.assertIn("stale (firmware not recorded)", missing_firmware)
+        self.assertNotIn("older version", missing_firmware)
+        self.assertNotIn("previous boot", missing_firmware)
+        self.assertIn(hint, missing_firmware)
+
+        missing_version = CONTROL.format_stored_health(
+            current.replace(f"version={CONTROL.HEALTH_RECORD_VERSION}\n", ""),
+            "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn("stale (older version)", missing_version)
+        self.assertNotIn("firmware not recorded", missing_version)
+        self.assertNotIn("firmware changed", missing_version)
+        self.assertIn(hint, missing_version)
+
+        different_version = CONTROL.format_stored_health(
+            current.replace(
+                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
+            ),
+            "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn("stale (older version)", different_version)
+        self.assertNotIn("firmware not recorded", different_version)
+        self.assertIn(hint, different_version)
+
+        failed_run = CONTROL.format_stored_health(
+            current.replace(
+                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
+            ),
+            "boot-b", "EC 3.13.7", current_healthy=False,
+        )
+        self.assertIn("stale (older version)", failed_run)
+        self.assertNotIn("superseded", failed_run)
+
+        previous_healthy = CONTROL.format_stored_health(
+            current.replace("result=needs-intervention", "result=healthy").replace(
+                f"version={CONTROL.HEALTH_RECORD_VERSION}", "version=0",
+            ),
+            "boot-b", "EC 3.13.7", current_healthy=True,
+        )
+        self.assertIn("stale (older version)", previous_healthy)
+        self.assertNotIn("superseded", previous_healthy)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            original = (
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-b\ntime=1793949945.325\n"
+                "reason=workload not ready\n"
+            )
+            CONTROL.write_state_text(health, original)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(
+                        module_loaded=True,
+                        log_text=(
+                            "pinned EC 3.13.7 capabilities fan0=975..4350 "
+                            "fan1=975..4350\n"
+                            "EC 3.13.7 floor writes disabled; registering hwmon "
+                            "telemetry only, no cooling device\n"
+                        ),
+                        ec_updates=("pass", "blocked"),
+                    ),
+                    record=False, boot="boot-b",
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn(f"time={shown_time}", text)
+            self.assertIn("stale (firmware not recorded, older version)", text)
+            self.assertIn(hint, text)
+            self.assertIn("recorded: no", text)
+            self.assertEqual(health.read_text(encoding="ascii"), original)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+
+            CONTROL.write_health_record(
+                health, "healthy", "n/a", [], "boot-b", stamp, "EC 3.13.7",
+            )
+            written = health.read_text(encoding="ascii")
+            self.assertIn(f"version={CONTROL.HEALTH_RECORD_VERSION}\n", written)
+            self.assertIn("firmware=EC 3.13.7\n", written)
+            self.assertNotIn("needs-intervention", written)
+            refreshed = CONTROL.format_stored_health(
+                written, "boot-b", "EC 3.13.7", current_healthy=True,
+            )
+            self.assertIn(f"time={shown_time}", refreshed)
+            self.assertNotIn("stale", refreshed)
+            self.assertNotIn("superseded", refreshed)
 
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"
