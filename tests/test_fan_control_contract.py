@@ -226,6 +226,11 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=yes\n", text)
         self.assertIn("systemctl enable --now dgx-fan-watchdog.service\n", INSTALL_USERLAND)
         self.assertNotIn("enable --now dgx-fan-control.service", INSTALL_USERLAND)
+        self.assertIn(
+            "systemctl try-restart dgx-fan-watchdog.service dgx-fan-control.service\n",
+            INSTALL_USERLAND,
+        )
+        self.assertNotIn("systemctl restart", INSTALL_USERLAND)
         self.assertIn("--no-watchdog", INSTALL_USERLAND)
         self.assertIn("not enabling dgx-fan-watchdog.service (--no-watchdog)", INSTALL_USERLAND)
         self.assertIn("systemctl enable dgx-fan-health.service\n", INSTALL_USERLAND)

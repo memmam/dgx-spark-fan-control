@@ -8,6 +8,8 @@
 # Enables dgx-fan-health.service for the next boot. Does not start it now.
 # Does not enable dgx-fan-control.service. That remains an explicit choice
 # (systemctl enable, or: dgx-fan-control module enable --start-service).
+# Restarts the watchdog and dgx-fan-control.service only if they are already
+# running, so an update loads the new command. Safe to rerun on every update.
 set -euo pipefail
 
 watchdog=1
@@ -55,6 +57,7 @@ fi
 systemctl daemon-reload
 systemctl enable dgx-fan-health.service
 systemctl enable dgx-fan-manual.service
+systemctl try-restart dgx-fan-watchdog.service dgx-fan-control.service
 
 if [[ "${watchdog}" -eq 1 ]]; then
   systemctl enable --now dgx-fan-watchdog.service

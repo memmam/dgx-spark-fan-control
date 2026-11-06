@@ -370,53 +370,25 @@ Do this on every update. It does not rebuild the kernel module.
 
 ```sh
 git pull
-```
-
-Reinstall the command, every unit file, and the motd snippet. Copying only
-`dgx-fan-control.service` leaves the watchdog unit missing, and `status`
-then shows `watchdog-enabled: not-found`. Leave an existing
-`/etc/default/dgx-fan-control` in place so a `BUSY_CHECK`, `READY_CHECK`,
-or `MANUAL_STATE` you already set is kept. Install the template only when
-the file is absent. New optional keys in `systemd/dgx-fan-control.default`,
-such as `PROGRESS_CHECK` and `STUCK_SECONDS`, are not merged into an
-existing `/etc/default` file. Copy the ones you want by hand. Do not
-replace `/etc/modprobe.d/dgx-fan-control-owned.conf` if `set-state` wrote
-it; that file is how the next load receives `owned_state` and
-`owned_floor`.
-
-If the watchdog unit was not installed yet, `is-active` does not enable it.
-Use the manual install in [section 5](#5-choose-your-startup-mode), including
-`systemctl enable --now dgx-fan-watchdog.service`. Restart the performance
-daemon only when it is already active. Do not enable it from this update.
-
-```sh
-sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
-  /etc/systemd/system/dgx-fan-watchdog.service
-sudo install -D -m 0644 systemd/dgx-fan-health.service \
-  /etc/systemd/system/dgx-fan-health.service
-sudo install -D -m 0644 systemd/dgx-fan-manual.service \
-  /etc/systemd/system/dgx-fan-manual.service
-sudo install -D -m 0755 systemd/95-dgx-fan-control \
-  /etc/update-motd.d/95-dgx-fan-control
-if [ ! -f /etc/default/dgx-fan-control ]; then
-  sudo install -D -m 0644 systemd/dgx-fan-control.default \
-    /etc/default/dgx-fan-control
-fi
-sudo systemctl daemon-reload
-sudo systemctl enable dgx-fan-health.service
-sudo systemctl enable dgx-fan-manual.service
-if systemctl is-active --quiet dgx-fan-watchdog.service; then
-  sudo systemctl restart dgx-fan-watchdog.service
-fi
-if systemctl is-active --quiet dgx-fan-control.service; then
-  sudo systemctl restart dgx-fan-control.service
-fi
+sudo ./scripts/install-userland
 sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
+
+The script is the same one as in [section 5](#5-choose-your-startup-mode)
+and is safe to rerun. It reinstalls the command, every unit file, and the
+motd snippet. It keeps an existing `/etc/default/dgx-fan-control`, so a
+`BUSY_CHECK`, `READY_CHECK`, or `MANUAL_STATE` you already set is kept, and
+it keeps an existing boot-load entry. It restarts the watchdog and
+`dgx-fan-control.service` only if they are already running, and it does not
+enable the performance service. If you installed with `--no-watchdog`, pass
+it again; without it, the script enables and starts the watchdog.
+
+New optional keys in `systemd/dgx-fan-control.default`, such as
+`PROGRESS_CHECK` and `STUCK_SECONDS`, are not merged into an existing
+`/etc/default` file. Copy the ones you want by hand. The script does not
+touch `/etc/modprobe.d/dgx-fan-control-owned.conf`; if `set-state` wrote it,
+that file is how the next load receives `owned_state` and `owned_floor`.
 
 The first `health` run prints the old record as `stale (written by a
 different install)`; that is expected, and the `--record` run replaces it.

@@ -97,40 +97,22 @@ Then follow the route you originally installed:
   DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
   in the next step or the previous CLI remains.
 
-Refresh the command, the four unit files (control, watchdog, health, and
-manual), and the motd snippet, then load
-and check the new module. The full update steps, including when to restart
-each service, are in
+Refresh the command, the unit files, and the motd snippet, then load and
+check the new module. `install-userland` keeps an existing
+`/etc/default/dgx-fan-control` and boot-load entry, restarts the watchdog and
+`dgx-fan-control.service` only if they are already running, and does not
+enable the performance daemon. If you installed with `--no-watchdog`, pass it
+again. The full update steps are in
 [Update the userspace](installation.md#6-update-the-userspace). Rebuild the
 module only when that section's version check says to, using
 [7A](installation.md#7a-update-the-module-with-dkms) or
 [7B](installation.md#7b-update-the-module-by-hand).
 
 ```sh
-sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
-  /etc/systemd/system/dgx-fan-watchdog.service
-sudo install -D -m 0644 systemd/dgx-fan-health.service \
-  /etc/systemd/system/dgx-fan-health.service
-sudo install -D -m 0644 systemd/dgx-fan-manual.service \
-  /etc/systemd/system/dgx-fan-manual.service
-sudo install -D -m 0755 systemd/95-dgx-fan-control \
-  /etc/update-motd.d/95-dgx-fan-control
-sudo systemctl daemon-reload
-sudo systemctl enable dgx-fan-health.service
-sudo systemctl enable dgx-fan-manual.service
+sudo ./scripts/install-userland
 sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
-
-Restart `dgx-fan-watchdog.service` if it is active. Restart
-`dgx-fan-control.service` only if it is active. Do not enable the performance
-daemon from an update. If status says `watchdog-enabled: not-found`, install
-and enable the watchdog unit as in
-[startup modes](installation.md#5-choose-your-startup-mode). Leave an
-existing `/etc/default/dgx-fan-control` alone.
 
 ## Switch from manual installation to DKMS
 
