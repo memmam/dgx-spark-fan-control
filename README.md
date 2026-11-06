@@ -80,7 +80,7 @@ override handlers and their dispatch table byte-identical between 3.5.8 and
 bit is clear. What changed is host command **0xEB**: it now honors a permission
 table that marks the fan/thermal register block read-only, so the host can no
 longer set that enable bit. This is deliberate access control. Floor writes on
-3.13.7 are therefore expected to fail. Version 0.1.5 still accepts the exact
+3.13.7 are therefore expected to fail. Version 0.1.6 still accepts the exact
 capability reply. Probe on that profile reads capabilities and telemetry only.
 It does not send a floor command, and it does not create a cooling device.
 `dgx-fan-control status` then prints `control unsupported on this firmware` once.
@@ -109,7 +109,7 @@ enrolled local signing certificate when Secure Boot is enabled. DKMS is optional
 systemd provides boot loading and the optional performance service.
 
 This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.5** recognizes the EC 3.13.7 capability reply and binds telemetry
+Version **0.1.6** recognizes the EC 3.13.7 capability reply and binds telemetry
 only, with no floor command, unless `allow_unverified_writes=1`. It tells a
 probe timeout apart from that case. The default performance curve never requests state 0 while the daemon is
 running. `--curve quiet` or `DGX_FAN_CURVE=quiet` selects the quieter opt-in
@@ -226,7 +226,7 @@ this module is not loaded. The two writers share one lower-floor register.
 
 Use this when fans should be driven with `acpi-max` and the kernel module
 should stay unloaded. `disable` does not uninstall the driver. Full removal
-is `sudo dkms remove dgx-spark-fan-control/0.1.5 --all` (the version in
+is `sudo dkms remove dgx-spark-fan-control/0.1.6 --all` (the version in
 `dkms.conf`).
 
 ```sh

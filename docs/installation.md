@@ -145,13 +145,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.5/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.5/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.5/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.5
-sudo dkms build -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.6
+sudo dkms build -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -360,7 +360,7 @@ modinfo dgx_ec_fan_control | grep ^version:
 ```
 
 Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
-(currently `0.1.5`). If they already match and `kernel/` did not change,
+(currently `0.1.6`). If they already match and `kernel/` did not change,
 stop after the userspace steps. Otherwise use the same module route you
 installed with: [6A](#6a-dkms-module-update) or
 [6B](#6b-manual-module-update).
@@ -416,11 +416,11 @@ DKMS signs with the enrolled MOK already configured in
 checkout, refresh the registered source and rebuild for the running kernel:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.5/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.5/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.5/kernel/
-sudo dkms install -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)" --force
+  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
+sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)" --force
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```

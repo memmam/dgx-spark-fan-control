@@ -11,8 +11,14 @@ simulated FF-A responses; they exercise failure recovery without contacting
 firmware. Driver changes also need a `W=1` build on the target kernel and
 an explicitly documented hardware validation result or testing limitation.
 
-Keep `PACKAGE_VERSION` in `dkms.conf` aligned with the driver's `MODULE_VERSION`
-when releasing a driver version, and update versioned installation examples.
+Keep `PACKAGE_VERSION` in `dkms.conf` aligned with `DGX_EC_DRIVER_VERSION`
+in `kernel/dgx_ec_fan_control.c`, and update versioned installation examples.
+Any change under `kernel/` must bump that version. `./scripts/check` hashes
+`kernel/Makefile` and `kernel/dgx_ec_fan_control.c` and compares them with
+`kernel/SOURCE_REV` (`<version> <sha256>`). Refresh that file in the same
+change. A kernel edit that leaves the version at the previous hash fails
+the check, which is what keeps `modinfo` from matching a module that does
+not contain the new source.
 DKMS changes need a target build using isolated source/state directories;
 documentation-only checks must not enroll keys or alter a running controller.
 

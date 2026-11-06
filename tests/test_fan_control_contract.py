@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -60,6 +62,9 @@ class KernelContractTests(unittest.TestCase):
             "module_param(owned_state, int, 0444)",
             "module_param(owned_floor, uint, 0444)",
             "matches owned state",
+            "static int owned_state = -1;",
+            "owned_state >= 1",
+            "owned_floor != 0",
             "Do not write ACPI level 0",
             "realtime=%lld.%09ld uptime=%lld.%09ld",
             "ret = -EAGAIN",
@@ -76,6 +81,72 @@ class KernelContractTests(unittest.TestCase):
         self.assertIn("DGX_EC_RESTORE_ATTEMPTS", SOURCE)
         self.assertIn("thermal_cooling_device_register", SOURCE)
         self.assertNotIn("dgx_ec_confirm_floor_control", SOURCE)
+
+    def test_default_load_does_not_refuse_an_unset_floor(self):
+        probe = SOURCE.split("dgx_ec_fan_control_probe", 1)[1]
+        unset_gate = probe.index("floor != DGX_EC_LIMIT_UNSET")
+        adopt = probe.index("taking ownership of existing lower floor")
+        refuse = probe.index("refusing to replace existing lower floor")
+        self.assertLess(unset_gate, adopt)
+        self.assertLess(adopt, refuse)
+        self.assertEqual(probe_existing_floor(0xFFFF), "continue")
+        self.assertEqual(probe_existing_floor(0), "clear-zero")
+        self.assertEqual(probe_existing_floor(13500), "refuse")
+        self.assertEqual(
+            probe_existing_floor(13500, owned_state=12, owned_floor=13500, table_value=13500),
+            "adopt",
+        )
+        self.assertEqual(
+            probe_existing_floor(0x10FE, owned_state=12, owned_floor=13500, table_value=13500),
+            "refuse",
+        )
+
+    def test_kernel_version_bumps_with_the_source(self):
+        version = re.search(r'DGX_EC_DRIVER_VERSION\s+"([^"]+)"', SOURCE)
+        self.assertIsNotNone(version)
+        package = re.search(
+            r'PACKAGE_VERSION="([^"]+)"',
+            (ROOT / "dkms.conf").read_text(encoding="utf-8"),
+        )
+        self.assertIsNotNone(package)
+        self.assertEqual(version.group(1), package.group(1))
+        recorded = (ROOT / "kernel" / "SOURCE_REV").read_text(encoding="ascii").strip()
+        self.assertEqual(recorded, f"{version.group(1)} {kernel_source_digest()}")
+
+
+def probe_existing_floor(floor, owned_state=-1, owned_floor=0, table_value=None,
+                         state_count=13):
+    """What probe does with an EC floor. Defaults match a load with no record.
+
+    ``continue`` refuses nothing. ``clear-zero`` restores the NVIDIA curve.
+    ``adopt`` takes a floor that matches the last-set record. ``refuse`` is
+    the foreign-floor path.
+    """
+    if floor == 0:
+        return "clear-zero"
+    if floor == 0xFFFF:
+        return "continue"
+    owned = (
+        owned_state >= 1
+        and owned_state < state_count
+        and owned_floor != 0
+        and floor == owned_floor
+        and table_value == owned_floor
+    )
+    return "adopt" if owned else "refuse"
+
+
+def kernel_source_digest() -> str:
+    digest = hashlib.sha256()
+    for path in sorted((ROOT / "kernel").iterdir()):
+        if not path.is_file() or path.name == "SOURCE_REV":
+            continue
+        if path.suffix not in {".c", ".h"} and path.name != "Makefile":
+            continue
+        digest.update(path.name.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 class UserlandPolicyTests(unittest.TestCase):

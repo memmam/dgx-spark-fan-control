@@ -79,7 +79,7 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.5"
+#define DGX_EC_DRIVER_VERSION		"0.1.6"
 /* Family-7 mailbox status byte: success is 0x00, unsupported is 0xFF. */
 #define DGX_EC_STATUS_UNSUPPORTED	0xffU
 /* ACPI level 20 stalled a fan near 1620 RPM. Do not request below this. */

@@ -23,7 +23,7 @@ capability response. Read the kernel log; do not remove validation checks.
 This implementation matches the NVIDIA P4242 platform only. Other GB10 boards
 have not been qualified.
 
-Version 0.1.5 accepts exactly two capability replies: EC 3.5.8
+Version 0.1.6 accepts exactly two capability replies: EC 3.5.8
 (1260–9000 / 1890–13500) and EC 3.13.7 (975–4350 / 975–4350), both revision 1
 and unit mode 0. Anything else is still `-EBADMSG` (`-74`), including a
 one-count difference. The kernel log prints the unrecognized parsed ranges.
