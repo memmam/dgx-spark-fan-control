@@ -4423,15 +4423,47 @@ def acpi_write_lock():
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+# (path, boot id) records whose file and directory have been fsynced.
+# A new process, boot, or missing file tries again. This is not a substitute
+# for the on-disk boot-id check.
+_DURABLE_ACPI_RECORDS: set[tuple[str, str]] = set()
+
+
+def _fsync_existing(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def record_acpi_boot(name: str) -> None:
+    """Persist a boot-scoped ACPI record and push it to disk.
+
+    The incident file has to still be there after a power loss, so the next
+    boot can refuse another ACPI hold. A failed sync leaves the key uncached
+    and the caller retries.
+    """
     boot = read_boot_id()
     if not boot:
         raise RuntimeError("cannot arm ACPI thermal protection: boot ID unreadable")
     with acpi_write_lock():
         path = STALL_MARKER_DIR / name
-        temporary = path.with_suffix(".tmp")
-        write_state_text(temporary, boot + "\n")
-        temporary.replace(path)
+        key = (str(path), boot)
+        try:
+            current = path.read_text(encoding="ascii").strip() == boot
+        except OSError:
+            current = False
+        if key in _DURABLE_ACPI_RECORDS and current:
+            return
+        if not current:
+            temporary = path.with_suffix(".tmp")
+            write_state_text(temporary, boot + "\n")
+            _fsync_existing(temporary)
+            temporary.replace(path)
+        _fsync_existing(path)
+        _fsync_existing(path.parent)
+        _DURABLE_ACPI_RECORDS.add(key)
 
 
 def acpi_ec_version(esrt_root: Path = Path("/sys/firmware/efi/esrt/entries")) -> str | None:
@@ -4521,18 +4553,57 @@ class AcpiThermalGuard:
             return None
         # As with the existing hooks, this is trusted root configuration.
         # Asynchronous: a hung hook cannot block the thermal/true-zero poll.
-        return subprocess.Popen(shlex.split(command), start_new_session=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL)
+        # The pidfd is taken immediately so a later stop cannot hit a reused PID.
+        process = subprocess.Popen(shlex.split(command), start_new_session=True,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        process.hook_pidfd = None
+        try:
+            process.hook_pidfd = os.pidfd_open(process.pid)
+        except (OSError, AttributeError, TypeError) as exc:
+            LOG.error("ACPI thermal: hook pidfd unavailable (%s); a hung hook will not be signaled by PID", exc)
+        return process
 
     def finish_hook(self):
-        if self.hook_process is not None:
-            # Kill only the exact hook process via Popen's owned child handle.
-            # No process-group signaling: a hook may have started unrelated work.
-            if self.hook_process.poll() is None:
-                self.hook_process.kill()
-            self.retired_hooks.append(self.hook_process)
+        process = self.hook_process
+        if process is None:
+            return
+        # Only the pidfd captured at spawn. Popen.kill() is a numeric PID and
+        # can land on a reused process. No process-group signal: the hook may
+        # have started unrelated work, and it must reap its own descendants.
+        fd = getattr(process, "hook_pidfd", None)
+        if not isinstance(fd, int):
+            fd = None
+        try:
+            if process.poll() is None:
+                if fd is None:
+                    LOG.error(
+                        "ACPI thermal: hook still running without a spawn-time "
+                        "pidfd; not signaling by numeric PID"
+                    )
+                else:
+                    try:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    except (OSError, AttributeError) as exc:
+                        LOG.error("ACPI thermal: hook pidfd kill failed: %s", exc)
+        finally:
+            if fd is not None:
+                os.close(fd)
+                process.hook_pidfd = None
+            self.retired_hooks.append(process)
             self.hook_process = None
+
+    def ensure_incident_latched(self) -> None:
+        """Retry the incident file until this boot's copy is durable."""
+        if self.stage == "idle" or acpi_record_current(ACPI_INCIDENT_NAME):
+            return
+        try:
+            record_acpi_boot(ACPI_INCIDENT_NAME)
+        except (OSError, RuntimeError) as exc:
+            LOG.critical(
+                "ACPI thermal: cannot persist incident; recovery reboot inhibited: %s",
+                exc,
+            )
 
     @staticmethod
     def identity(pid, proc_root=Path("/proc")):
@@ -4650,7 +4721,18 @@ class AcpiThermalGuard:
             return dict(snapshot)
 
         self.retired_hooks = [p for p in self.retired_hooks if p.poll() is None]
+        # A failed persist must be retried before this poll decides to reboot.
+        self.ensure_incident_latched()
         if hot is None or not math.isfinite(hot):
+            # systemctl reboot has already been accepted. A missing sample
+            # must not turn that recovery into poweroff. A later finite
+            # reading at or above STOP still re-enters the stop path.
+            if self.stage == "reboot":
+                LOG.critical(
+                    "ACPI thermal: hottest zone unreadable after recovery "
+                    "reboot was requested; leaving the reboot in place"
+                )
+                return
             LOG.critical("ACPI thermal: hottest zone unreadable; escalating conservatively")
             hot = self.shutdown_c
         if hot >= self.fan_c:
@@ -4747,7 +4829,9 @@ def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WAT
     if classify_fan_binding(thermal_root, hwmon_root) == "unsupported":
         return
     # Preserve the existing true-zero 85 C path and its precedence. This policy
-    # covers spinning/unknown fans; the old watchdog handles verified 0/0.
+    # covers spinning or unknown fans. Verified 0/0 at or above the cutoff,
+    # and verified 0/0 with an unreadable zone, stay on that path: the old
+    # rule does not power off when the zone cannot be read.
     try:
         rpms = read_named_fan_rpms(hwmon_root)
         true_zero = rpms is not None and len(rpms) >= 2 and all(r == 0 for r in rpms)
@@ -4758,7 +4842,9 @@ def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WAT
     except (OSError, RuntimeError, ValueError):
         hot = None
 
-    if true_zero and hot is not None and hot >= zero_fan_celsius:
+    if true_zero and (
+        hot is None or not math.isfinite(hot) or hot >= zero_fan_celsius
+    ):
         return
 
     def force_max():

@@ -659,7 +659,10 @@ before that reboot do not come back by themselves:
 
 For ACPI incident recovery, do not automatically restart the workload. The
 incident latch must be inspected and explicitly reset after reboot; external
-workload managers must honor it too. The fan tool never starts a job.
+workload managers must honor it too. The fan tool never starts a job. The
+stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
+system bus, and it cannot open a network connection to Kubernetes, Slurm,
+or an HTTP API. Root jobs and system services are not killed directly.
 
 ## Set the ACPI fan level
 

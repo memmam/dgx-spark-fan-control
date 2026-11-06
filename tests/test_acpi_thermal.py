@@ -67,7 +67,7 @@ class ThermalTests(unittest.TestCase):
         self.step(85, 0)
         self.send.assert_not_called()
         self.step(90, 0.1)
-        process.kill.assert_called_once()
+        process.kill.assert_not_called()
         process.wait.assert_not_called()
         self.assertEqual([c.args[1] for c in self.send.call_args_list],
                          [signal.SIGTERM, signal.SIGKILL])
@@ -442,6 +442,79 @@ class ThermalTests(unittest.TestCase):
             self.assertIsNone(C.AcpiThermalGuard.identity(pid, proc))
         for protected in (0, 1, os.getpid(), os.getppid()):
             self.assertIsNone(C.AcpiThermalGuard.identity(protected, proc))
+
+    def test_true_zero_with_unreadable_zone_does_not_use_acpi_shutdown(self):
+        thermal, hwmon = self.fake_fans()
+        C.record_acpi_boot(C.ACPI_HOLD_NAME)
+        for sensor in hwmon.glob("hwmon*"):
+            (sensor / "fan1_input").write_text("0")
+        for zone in thermal.glob("thermal_zone*"):
+            (zone / "temp").unlink()
+        C.poll_acpi_thermal(self.guard, thermal, hwmon, 0)
+        self.shutdown.assert_not_called()
+        self.send.assert_not_called()
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+
+    def test_unreadable_zone_does_not_replace_an_accepted_recovery_reboot(self):
+        self.step(85, 0)
+        self.targets.return_value = {}
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(77, 1)
+            self.step(77, 31)
+        self.reboot.assert_called_once()
+        self.step(None, 32)
+        self.shutdown.assert_not_called()
+        self.assertEqual(self.guard.stage, "reboot")
+        self.step(95, 33)
+        self.shutdown.assert_called_once()
+
+    def test_incident_persist_is_retried_until_present(self):
+        real = C.record_acpi_boot
+        failed = False
+
+        def flaky(name):
+            nonlocal failed
+            if name == C.ACPI_INCIDENT_NAME and not failed:
+                failed = True
+                raise OSError("disk")
+            real(name)
+
+        with patch.object(C, "record_acpi_boot", side_effect=flaky):
+            self.step(85, 0)
+            self.assertFalse(C.acpi_incident_latched())
+            self.step(86, 1)
+        self.assertTrue(C.acpi_record_current(C.ACPI_INCIDENT_NAME))
+
+    def test_acpi_record_fsyncs_file_and_directory_once(self):
+        with patch.object(C.os, "fsync") as fsync:
+            C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+            first = fsync.call_count
+            C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+            self.assertEqual(fsync.call_count, first)
+        self.assertGreaterEqual(first, 2)
+        path = C.STALL_MARKER_DIR / C.ACPI_INCIDENT_NAME
+        path.unlink()
+        with patch.object(C.os, "fsync") as fsync:
+            C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        self.assertGreaterEqual(fsync.call_count, 2)
+        self.assertTrue(C.acpi_record_current(C.ACPI_INCIDENT_NAME))
+
+    def test_hook_kill_uses_spawn_time_pidfd_not_numeric_kill(self):
+        process = Mock()
+        process.poll.return_value = None
+        process.hook_pidfd = 11
+        process.pid = 4242
+        self.guard.hook_process = process
+        with patch.object(C.signal, "pidfd_send_signal") as send, \
+             patch.object(C.os, "close") as close, \
+             patch.object(C.os, "kill") as kill:
+            self.guard.finish_hook()
+        send.assert_called_once_with(11, signal.SIGKILL)
+        close.assert_called_once_with(11)
+        kill.assert_not_called()
+        process.kill.assert_not_called()
+        self.assertIsNone(self.guard.hook_process)
 
     def test_hook_is_async_argv_without_shell(self):
         guard = C.AcpiThermalGuard({"ACPI_THERMAL_STOP_HOOK": "/opt/stop-job --reason hot"})

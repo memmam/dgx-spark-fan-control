@@ -217,14 +217,22 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    stages and shutdown execute in the same poll without waiting for graces.
    Failed shutdown requests are logged and retried. Shutdown is enabled
    unless explicitly disabled in configuration. An unreadable hottest zone
-   while an ACPI hold is armed is treated conservatively as the final
-   threshold; this can stop work and shut down the machine.
+   while an ACPI hold is armed and the fans are spinning or unknown is
+   treated conservatively as the final threshold; this can stop work and
+   shut down the machine. A verified true zero (both tachometers at 0 RPM)
+   does not: an unreadable zone stays on the existing true-zero rule, which
+   does not power off without a readable zone at or above 85 C.
 5. **Successful recovery:** once the hottest zone stays below **78 C**
    continuously for **30 seconds**, verify there are no remaining selected,
    GPU-compute, or configured target processes, no protected live targets,
    and no failed/ambiguous compute query. Then request `systemctl reboot`
    to restore EC control. Failed recovery reboots are retried while cool;
-   continued heat still takes the shutdown path. This is not a re-arm rule. During a latched incident, legacy cold-stall/foreign-floor reboot paths cannot bypass this recovery verification; the hot true-zero shutdown still takes precedence.
+   continued heat still takes the shutdown path. After that reboot command
+   has been accepted, an unreadable sample does not replace it with
+   poweroff; a later finite reading at or above STOP does. This is not a
+   re-arm rule. During a latched incident, legacy cold-stall/foreign-floor
+   reboot paths cannot bypass this recovery verification; the hot true-zero
+   shutdown still takes precedence.
 
 The incident latch survives reboot. It inhibits `acpi-max`, the sweep,
 stall-repair ACPI writes, daemon curve startup, boot restoration of a manual
@@ -298,10 +306,19 @@ or name configuration cannot override these exclusions. This deliberately
 also excludes root-run/container-root GPU jobs and system services: use a
 trusted stop hook for them; otherwise the final shutdown is the fallback.
 A hook runs asynchronously as a direct child executable with arguments, not
-through a shell; its own child handle may be killed at the hook deadline.
-It must return promptly and clean up its own descendants. A hook that needs
-shell syntax should be an administrator-maintained script. The watchdog's
-existing sandbox still applies (for example, home directories are hidden).
+through a shell. It is stopped only through a pidfd taken at spawn, never
+by numeric PID, and only that process: it must return promptly and clean up
+its own descendants. A hook that needs shell syntax should be an
+administrator-maintained script. The watchdog sandbox applies to the hook.
+Home directories are hidden, and `RestrictAddressFamilies=AF_UNIX` blocks
+TCP and UDP, so the hook cannot call a Kubernetes, Slurm, or HTTP API
+itself. `systemctl` over the system bus is allowed. Docker, Slurm,
+Kubernetes, and systemd `Restart=` policies are not stopped by the fan
+tool. Root and `/system.slice` jobs are not signaled either. Those have to
+be stopped by the hook, or the final shutdown is the fallback. None of them
+may start the workload again while
+`/var/lib/dgx-fan-control/acpi-incident` exists. The incident file is
+retried until this boot's copy has been synced to disk.
 
 `acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
 must explicitly raise it, for example `--max-temp 95`; that changes only
