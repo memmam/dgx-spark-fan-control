@@ -26,6 +26,12 @@ ACPI_MAX_LEVEL = 100
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
 WATCHDOG_POLL_SECONDS = 2.0
 WATCHDOG_ZERO_SECONDS = 10.0
+# Any-temperature alert. Idle fans on EC 3.5.8 with the October SoC run near
+# 2700/4050 RPM, so 0/0 is not a normal state. Fifteen seconds is several
+# 2-second polls, long enough to ignore one missed tach sample, and short
+# enough to announce a stop at 39°C well before the chip reaches 70°C.
+# The hot poweroff hold stays at 10 seconds.
+WATCHDOG_STALL_SECONDS = 15.0
 WATCHDOG_SOC_CELSIUS = 70.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 DAEMON_UNIT = "dgx-fan-control.service"
@@ -366,17 +372,52 @@ def run_watchdog_action(action: str) -> int:
     return completed.returncode
 
 
+def recover_cold_fan_stall(thermal_root: Path) -> None:
+    """One ACPI level-100 write when every fan is stopped and the chip is cool.
+
+    Skipped while this kernel module is loaded: ACPI cur_state and the module
+    write the same EC lower floor. Never writes 0 or any level below 40.
+    """
+    if module_is_loaded():
+        LOG.error(
+            "fan stall: not writing ACPI level %d because %s is loaded and "
+            "shares the EC lower-floor register",
+            ACPI_MAX_LEVEL, MODULE_NAME,
+        )
+        return
+    try:
+        set_acpi_fans(
+            thermal_root, ACPI_MAX_LEVEL,
+            module_loaded=False, service_active="inactive", report=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        LOG.error("fan stall: ACPI level %d write failed: %s", ACPI_MAX_LEVEL, exc)
+        return
+    LOG.critical(
+        "fan stall: wrote ACPI Fan level %d because every fan read 0 RPM",
+        ACPI_MAX_LEVEL,
+    )
+
+
 def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  poll_seconds: float = WATCHDOG_POLL_SECONDS,
                  zero_seconds: float = WATCHDOG_ZERO_SECONDS,
+                 stall_seconds: float = WATCHDOG_STALL_SECONDS,
                  soc_celsius: float = WATCHDOG_SOC_CELSIUS,
                  action: str = WATCHDOG_DEFAULT_ACTION,
                  monotonic=None, runner=None, unit_state=None, notifier=None) -> int:
-    """Read ACPI fan tachometers and thermal_zone0. Never writes a fan control."""
+    """Read ACPI fan tachometers and thermal_zone0.
+
+    A cold stop is logged and broadcast. It does not run the poweroff action.
+    While the kernel module is unloaded, that cold stop also tries one ACPI
+    level of 100. Poweroff stays tied to a hot stop.
+    """
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
     if not math.isfinite(zero_seconds) or zero_seconds < 0:
         raise ValueError("zero interval must be finite and non-negative")
+    if not math.isfinite(stall_seconds) or stall_seconds < 0:
+        raise ValueError("stall interval must be finite and non-negative")
     if not math.isfinite(soc_celsius):
         raise ValueError("SoC threshold must be finite")
     if monotonic is None:
@@ -396,12 +437,16 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     signal.signal(signal.SIGINT, request_stop)
     LOG.critical(
         "fan-stall watchdog watching ACPI fans and thermal_zone0; "
-        "0 RPM on every fan for more than %.0fs at >=%.0fC runs %s",
-        zero_seconds, soc_celsius, action,
+        "0 RPM on every fan for more than %.0fs alerts without powering off; "
+        "the same reading for more than %.0fs at >=%.0fC runs %s",
+        stall_seconds, zero_seconds, soc_celsius, action,
     )
-    fault_since: float | None = None
+    zero_since: float | None = None
+    hot_since: float | None = None
     announced_shortage = False
     last_daemon_alert: float | None = None
+    last_stall_alert: float | None = None
+    stall_repair_done = False
     reported_unsupported = False
     while not stop_requested.is_set():
         # A dead daemon can leave a low floor while temperatures stay under
@@ -437,8 +482,11 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             fan_rpms = read_named_fan_rpms(hwmon_root)
             soc_c = read_thermal_zone_c(thermal_root)
         except (OSError, UnicodeError, ValueError, RuntimeError):
-            LOG.exception("fan-stall observation failed; not treating it as a stall")
-            fault_since = None
+            LOG.error("fan-stall observation failed; not treating it as a stall")
+            zero_since = None
+            hot_since = None
+            last_stall_alert = None
+            stall_repair_done = False
         else:
             if len(fan_rpms) < 2:
                 if not announced_shortage:
@@ -448,18 +496,48 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                         len(fan_rpms),
                     )
                     announced_shortage = True
-                fault_since = None
-            elif all(rpm == 0 for rpm in fan_rpms) and soc_c >= soc_celsius:
+                zero_since = None
+                hot_since = None
+                last_stall_alert = None
+                stall_repair_done = False
+            elif all(rpm == 0 for rpm in fan_rpms):
+                announced_shortage = False
                 now = monotonic()
-                if fault_since is None:
-                    fault_since = now
-                held = now - fault_since
-                if fans_stalled(fan_rpms, soc_c, held, soc_limit_c=soc_celsius,
-                                zero_seconds=zero_seconds):
+                if zero_since is None:
+                    zero_since = now
+                held = now - zero_since
+                if soc_c >= soc_celsius:
+                    if hot_since is None:
+                        hot_since = now
+                    hot_held = now - hot_since
+                else:
+                    hot_since = None
+                    hot_held = 0.0
+                if held > stall_seconds:
+                    if (last_stall_alert is None or
+                            now - last_stall_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
+                        message = (
+                            f"dgx-fan-control: ACPI fans read {fan_rpms} RPM "
+                            f"for {held:.1f}s at {soc_c:.1f}C; "
+                            "fans are stopped; not powering off"
+                        )
+                        LOG.critical(message)
+                        try:
+                            notifier(message)
+                        except OSError:
+                            LOG.warning("could not broadcast the fan-stall alert")
+                        last_stall_alert = now
+                    if not stall_repair_done and soc_c < soc_celsius:
+                        stall_repair_done = True
+                        recover_cold_fan_stall(thermal_root)
+                if fans_stalled(
+                    fan_rpms, soc_c, hot_held, soc_limit_c=soc_celsius,
+                    zero_seconds=zero_seconds,
+                ):
                     LOG.critical(
                         "fan stall: ACPI fans read %s RPM for %.1fs while "
                         "thermal_zone0 is %.1fC; running %s",
-                        fan_rpms, held, soc_c, action,
+                        fan_rpms, hot_held, soc_c, action,
                     )
                     status = runner(action)
                     if status != 0:
@@ -467,7 +545,10 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                         return status if isinstance(status, int) else 1
                     return 0
             else:
-                fault_since = None
+                zero_since = None
+                hot_since = None
+                last_stall_alert = None
+                stall_repair_done = False
                 announced_shortage = False
         if stop_requested.is_set():
             break
@@ -1141,7 +1222,8 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
                   module_loaded: bool | None = None,
                   service_active: str | None = None,
                   force: bool = False,
-                  profile: str | None = None) -> None:
+                  profile: str | None = None,
+                  report: bool = True) -> None:
     """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
 
     Refuses while this module is loaded or its daemon is active, unless force
@@ -1196,9 +1278,10 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
             raise RuntimeError(
                 f"ACPI fan update to {level} failed on {len(failures)} device(s)"
             )
-        for line in summaries:
-            print(line)
-        print(acpi_result_note(profile))
+        if report:
+            for line in summaries:
+                print(line)
+            print(acpi_result_note(profile))
     except BaseException:
         fail_hot()
         raise
@@ -1229,10 +1312,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watchdog = subparsers.add_parser(
         "watchdog",
-        help="read ACPI fans and power off if both stay at 0 RPM while hot",
+        help="alert if ACPI fans stay at 0 RPM; power off only if that stop is also hot",
     )
     watchdog.add_argument("--poll-seconds", type=float, default=WATCHDOG_POLL_SECONDS)
     watchdog.add_argument("--zero-seconds", type=float, default=WATCHDOG_ZERO_SECONDS)
+    watchdog.add_argument(
+        "--stall-seconds",
+        type=float,
+        default=WATCHDOG_STALL_SECONDS,
+        help="alert when every fan stays at 0 RPM this long, at any temperature",
+    )
     watchdog.add_argument("--soc-celsius", type=float, default=WATCHDOG_SOC_CELSIUS)
     watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
     acpi_max = subparsers.add_parser(
@@ -1281,6 +1370,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.hwmon_root,
                 poll_seconds=args.poll_seconds,
                 zero_seconds=args.zero_seconds,
+                stall_seconds=args.stall_seconds,
                 soc_celsius=args.soc_celsius,
                 action=args.action,
             )

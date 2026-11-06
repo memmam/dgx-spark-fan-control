@@ -441,6 +441,149 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(actions, [])
 
+    def _stopped_acpi_fans(self, root: Path, rpm: tuple[int, ...], celsius: float):
+        thermal = root / "thermal" / "thermal_zone0"
+        thermal.mkdir(parents=True)
+        (thermal / "temp").write_text(f"{int(celsius * 1000)}\n", encoding="ascii")
+        for index, name in ((0, "cooling_device0"), (1, "cooling_device1")):
+            device = root / "thermal" / name
+            device.mkdir()
+            (device / "type").write_text("Fan\n", encoding="ascii")
+            (device / "cur_state").write_text("40\n", encoding="ascii")
+            (device / "max_state").write_text("100\n", encoding="ascii")
+        hwmon = root / "hwmon" / "hwmon0"
+        hwmon.mkdir(parents=True)
+        (hwmon / "name").write_text("acpi_fan\n", encoding="ascii")
+        for index, value in enumerate(rpm, start=1):
+            (hwmon / f"fan{index}_input").write_text(f"{value}\n", encoding="ascii")
+        return hwmon
+
+    def test_cold_stall_alerts_once_and_does_not_power_off(self):
+        self.assertEqual(CONTROL.WATCHDOG_STALL_SECONDS, 15.0)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (0, 0), 39.0)
+            clock = [0.0]
+            stop = Event()
+            alerts = []
+            actions = []
+
+            def wait(delay):
+                clock[0] += delay
+                if clock[0] > 30:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    poll_seconds=2,
+                    stall_seconds=15,
+                    zero_seconds=10,
+                    soc_celsius=70,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [])
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("not powering off", alerts[0])
+            self.assertEqual(sum("not powering off" in line for line in logs.output), 1)
+            self.assertEqual(sum("wrote ACPI Fan level 100" in line for line in logs.output), 1)
+            for name in ("cooling_device0", "cooling_device1"):
+                self.assertEqual(
+                    (root / "thermal" / name / "cur_state").read_text(), "100\n",
+                )
+
+            clock[0] = 0.0
+            stop.clear()
+            alerts.clear()
+            for name in ("cooling_device0", "cooling_device1"):
+                (root / "thermal" / name / "cur_state").write_text("40\n", encoding="ascii")
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(CONTROL, "module_is_loaded", return_value=True), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="ERROR") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    poll_seconds=2,
+                    stall_seconds=15,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [])
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(sum("not writing ACPI level 100" in line for line in logs.output), 1)
+            self.assertIn("shares the EC lower-floor register", "\n".join(logs.output))
+            self.assertEqual(
+                (root / "thermal" / "cooling_device0" / "cur_state").read_text(), "40\n",
+            )
+
+    def test_one_spinning_fan_or_one_input_does_not_alert(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (0, 2000), 39.0)
+            clock = [0.0]
+            stop = Event()
+            alerts = []
+            actions = []
+
+            def wait(delay):
+                clock[0] += delay
+                if clock[0] > 30:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="INFO"):
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    poll_seconds=2,
+                    stall_seconds=15,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(alerts, [])
+            self.assertEqual(actions, [])
+
+            (root / "hwmon" / "hwmon0" / "fan2_input").unlink()
+            clock[0] = 0.0
+            stop.clear()
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal",
+                    root / "hwmon",
+                    poll_seconds=2,
+                    stall_seconds=15,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(alerts, [])
+            self.assertEqual(actions, [])
+            self.assertTrue(any("will not trip" in line for line in logs.output))
+
     def _acpi_tree(self, root: Path) -> tuple[Path, Path, Path]:
         thermal = root / "thermal"
         thermal.mkdir()

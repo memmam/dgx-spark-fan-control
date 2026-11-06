@@ -136,7 +136,7 @@ floors have no expiry timer. Read the [validation and limitations](docs/validati
 
 ## Known issues
 
-Owner-reported on two DGX Sparks on 5 Nov 2026 (EC `0x03000d07`, kernel
+Reported by the user on two DGX Sparks on 5 Nov 2026 (EC `0x03000d07`, kernel
 `7.0.0-1024-nvidia`, BIOS `5.36_0ACUM028`). These are observations, not a
 verified cause.
 
@@ -154,13 +154,17 @@ repeatedly while the machine was running never produced a 0 RPM reading. The
 suspected trigger is boot-time state: boot order against external airflow, or
 the EC stopping its own fans. That has not been tested.
 
-Anyone running external airflow should read `fan1_input` after every boot. A
-watchdog should treat 0 RPM on both fans with the SoC above about 70°C as a
-fault. `sudo dgx-fan-control watchdog` does that from userspace. It only
-reads `acpi_fan` and `thermal_zone0`. It does not need this kernel module.
-The default action is `systemctl poweroff`. The same command logs and
-broadcasts with `wall` when `dgx-fan-control.service` is not `active`, before
-it looks at temperature. That alert does not power the machine off.
+Anyone running external airflow should read `fan1_input` after every boot.
+`sudo dgx-fan-control watchdog` reads `acpi_fan` and `thermal_zone0`. It does
+not need this kernel module. If every fan stays at 0 RPM for 15 seconds, at
+any temperature, it logs and broadcasts with `wall` and does not power off.
+On a cold stop, and only when `dgx_ec_fan_control` is not loaded, it tries
+once to write ACPI Fan level 100. It never writes level 0. If every fan stays
+at 0 RPM for 10 seconds while `thermal_zone0` is at least 70°C, the default
+action is `systemctl poweroff`. The same command also logs and broadcasts
+when `dgx-fan-control.service` is not `active`, before it looks at
+temperature. That alert does not power the machine off. The cold alert and
+the level-100 write have not been run on hardware yet.
 
 ## Quiet curve
 

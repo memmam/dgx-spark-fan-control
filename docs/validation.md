@@ -38,7 +38,8 @@ The fan service was enabled and started at boot even though an earlier step
 had left it disabled. `module enable` had been enabling it whenever fan
 control was supported. It no longer does that.
 
-Not observed on these boots: the quiet curve, the watchdog trip, and a
+Not observed on these boots: the quiet curve, the watchdog trip, the
+any-temperature 0 RPM alert, the one-time ACPI level-100 repair, and a
 repeated copy of the 188-second wedge. `allow_unverified_writes` stayed off.
 No step in the notes below writes ACPI level 0.
 

@@ -249,21 +249,38 @@ show measured RPM. If a command fails, see [troubleshooting](troubleshooting.md)
 
 ## Watch for stopped fans
 
-This only reads. It does not load the kernel module and does not write a fan
-control. It watches every `fan*_input` under hwmon devices named `acpi_fan`,
-and `thermal_zone0`. If fewer than two fan inputs are visible it does not
-trip. If every one of them stays at 0 RPM for more than 10 seconds while
-`thermal_zone0` is at least 70°C, it logs at critical level and runs
-`systemctl poweroff`.
+It watches every `fan*_input` under hwmon devices named `acpi_fan`, and
+`thermal_zone0`. If fewer than two fan inputs are visible it does not trip.
+On EC 3.5.8 with the October SoC, idle fans run near 2700/4050 RPM, so 0/0
+is not a normal reading.
+
+If every fan stays at 0 RPM for more than 15 seconds, at any temperature, it
+logs one critical line and broadcasts it once with `wall`. That repeats at
+most once a minute, the same interval as the daemon-down alert. It does
+**not** power off for this alone. Fifteen seconds is several 2-second polls,
+so one missed tachometer sample does not alert, and a stop at about 39°C is
+still announced well before the chip would have to reach 70°C.
+`--stall-seconds` changes that hold.
+
+When that cold stop is confirmed and `dgx_ec_fan_control` is not loaded, it
+tries once to write ACPI Fan level 100. It never writes 0 or any level below
+40. If the module is loaded, it skips the write and logs why: ACPI
+`cur_state` and the module share the EC lower-floor register.
+
+If every fan stays at 0 RPM for more than 10 seconds while `thermal_zone0`
+is at least 70°C, it logs at critical level and runs `systemctl poweroff`.
+That hot hold is separate from the 15-second alert.
 
 ```sh
 sudo dgx-fan-control watchdog
 ```
 
-`--zero-seconds`, `--soc-celsius`, and `--action` change the hold time, the
-temperature, and the command. The action is one program plus arguments, not a
-shell pipeline. See the [known issues](../README.md#known-issues) before
-enabling this on a machine that uses external fans.
+`--zero-seconds`, `--stall-seconds`, `--soc-celsius`, and `--action` change
+the hot hold, the any-temperature alert hold, the temperature, and the
+command. The action is one program plus arguments, not a shell pipeline. See
+the [known issues](../README.md#known-issues) before enabling this on a
+machine that uses external fans. The cold alert and the level-100 write have
+not been run on hardware yet.
 
 ## Set the ACPI fan level
 
