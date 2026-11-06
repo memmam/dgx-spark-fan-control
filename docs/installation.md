@@ -164,6 +164,10 @@ If previously installed manually, use the
 [migration instructions](maintenance.md#switch-from-manual-installation-to-dkms)
 first so an old module does not mask the DKMS version.
 
+DKMS does not install the command and does not refresh the stored health
+record. After section 4 installs the command, run the health refresh at the
+end of that section.
+
 ## 3B. Manual build and sign
 
 This route requires repeating the build/install steps for each new kernel:
@@ -183,6 +187,10 @@ The script itself never installs or loads a module.
 For a system without signature enforcement, replace `./scripts/build-sign`
 with `make -C kernel`, then use the same installation commands. An unsigned
 module will not load under enforced Secure Boot.
+
+This build does not install the command and does not refresh the stored
+health record. After section 4 installs the command, run the health refresh
+at the end of that section.
 
 ## 4. Install the command, then load the driver
 
@@ -211,6 +219,17 @@ probing can still reject the firmware contract. See
 EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
 back, are in
 [EC firmware pairing and downgrade](#ec-firmware-pairing-and-downgrade).
+
+Finish by refreshing the stored health record. A reinstall marks the old
+record stale. `--record` saves the current result and, on a healthy run,
+also clears the stored needs-intervention flag and the stall and
+watchdog-reboot markers. The plain command is not sudo and does not write.
+Do not write an ACPI fan level for this check.
+
+```sh
+dgx-fan-control health
+sudo dgx-fan-control health --record
+```
 
 ## 5. Choose your startup mode
 
@@ -254,12 +273,23 @@ sudo systemctl daemon-reload
 sudo systemctl enable dgx-fan-health.service
 sudo systemctl enable dgx-fan-manual.service
 sudo systemctl enable --now dgx-fan-watchdog.service
+dgx-fan-control health
+sudo dgx-fan-control health --record
 ```
+
+`scripts/install-userland` does not run that refresh. After the script
+with the watchdog enabled, run the same two commands. A reinstall marks
+the old record stale.
+`--record` saves the current result and, on a healthy run, also clears the
+stored needs-intervention flag and the stall and watchdog-reboot markers.
+The plain `health` is not sudo and does not write. Do not write an ACPI fan
+level for this check.
 
 To install those files and leave the watchdog disabled, stop before the
 `enable --now` line, or run `sudo ./scripts/install-userland --no-watchdog`.
 The health check still expects the watchdog to be active, so that opt-out
-makes the next health check record needs-intervention.
+makes the next health check record needs-intervention. Do not run
+`health --record` while the watchdog is disabled.
 
 Manual removal of the command, the units, the motd snippet, and the defaults
 file, the same steps as `scripts/uninstall-userland`. This does not unload
@@ -403,9 +433,13 @@ if systemctl is-active --quiet dgx-fan-control.service; then
   sudo systemctl restart dgx-fan-control.service
 fi
 dgx-fan-control health
+sudo dgx-fan-control health --record
 ```
 
-`health` is not run with sudo. Do not write an ACPI fan level for this check.
+A reinstall marks the old record stale. `--record` saves the current result
+and, on a healthy run, also clears the stored needs-intervention flag and
+the stall and watchdog-reboot markers. The plain `health` is not sudo and
+does not write. Do not write an ACPI fan level for this check.
 
 Update the kernel module only when this checkout changes files under
 `kernel/`. Compare the loaded module with this checkout:
@@ -460,10 +494,14 @@ if [ "$restart_performance" -eq 1 ]; then
   sudo systemctl start dgx-fan-control.service
 fi
 dgx-fan-control health
+sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
 
-`health` is not run with sudo. Do not write an ACPI fan level for this check.
+A reinstall marks the old record stale. `--record` saves the current result
+and, on a healthy run, also clears the stored needs-intervention flag and
+the stall and watchdog-reboot markers. The plain `health` is not sudo and
+does not write. Do not write an ACPI fan level for this check.
 
 ## 7B. Update the module by hand
 
@@ -503,10 +541,14 @@ if [ "$restart_performance" -eq 1 ]; then
   sudo systemctl start dgx-fan-control.service
 fi
 dgx-fan-control health
+sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
 
-`health` is not run with sudo. Do not write an ACPI fan level for this check.
+A reinstall marks the old record stale. `--record` saves the current result
+and, on a healthy run, also clears the stored needs-intervention flag and
+the stall and watchdog-reboot markers. The plain `health` is not sudo and
+does not write. Do not write an ACPI fan level for this check.
 
 ## EC firmware pairing and downgrade
 
@@ -560,6 +602,18 @@ sudo fwupdmgr downgrade 8c948e1db381648c8893897e4d09b7b153309991
 power. Check `get-devices` again after the reboot and confirm the version
 before you do anything else. Upgrading to 3.13.7 removes fan-floor control.
 
+A firmware change marks the stored health record stale. `--record` saves
+the current result and, on a healthy run, also clears the stored
+needs-intervention flag and the stall and watchdog-reboot markers. The
+plain `health` is not sudo and does not write. EC 3.13.7 telemetry-only is
+a healthy result, not needs-intervention. Do not write an ACPI fan level
+for this check.
+
+```sh
+dgx-fan-control health
+sudo dgx-fan-control health --record
+```
+
 ### Block EC updates
 
 ```sh
@@ -609,5 +663,13 @@ because a helper cannot read the list it would overwrite.
 
 After a downgrade to 3.5.8, block the EC GUID again with the command in
 the previous section. Confirm with the `fwupdtool` line, not with
-`fwupd.conf`.
+`fwupd.conf`. Then refresh the stored health record again so it matches
+this firmware. A firmware change marks the old record stale. `--record`
+saves the current result and, on a healthy run, also clears the stored
+needs-intervention flag and the stall and watchdog-reboot markers.
+
+```sh
+dgx-fan-control health
+sudo dgx-fan-control health --record
+```
 
