@@ -502,7 +502,7 @@ class UserlandFailureTests(unittest.TestCase):
                 },
             )
             self.assertEqual(problems, [])
-            self.assertIn("progress: hook", lines)
+            self.assertIn("progress: hook (PROGRESS_CHECK)", lines)
             self.assertIn(
                 "job: warn (job may be stuck: no progress 600s, via hook)", lines,
             )
@@ -1959,7 +1959,19 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertIn("watchdog: pass", text)
             self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
             self.assertIn("state=6", (state / CONTROL.MANUAL_STATE_NAME).read_text())
-            self.assertIn("result=healthy", (state / CONTROL.HEALTH_NAME).read_text())
+            stored = (state / CONTROL.HEALTH_NAME).read_text(encoding="ascii")
+            self.assertIn("result=healthy", stored)
+            self.assertIn("ready=n/a\n", stored)
+            self.assertNotIn("ready=not configured", stored)
+
+            with patch.object(CONTROL, "command_succeeded", return_value=True):
+                code, _alerts, _notices = self._health(
+                    root, {"READY_CHECK": "probe"}, snapshot(), record=True,
+                )
+            stored = (state / CONTROL.HEALTH_NAME).read_text(encoding="ascii")
+            self.assertEqual(code, 0)
+            self.assertIn("ready=n/a\n", stored)
+            self.assertNotIn("ready=pass", stored)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2505,6 +2517,211 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertIn("recorded: no", stdout)
             self.assertNotIn("Traceback", combined)
             self.assertEqual(health.read_text(encoding="ascii"), same)
+
+    def test_unsupported_record_stays_but_is_not_shown_when_unlink_is_denied(self):
+        reason = "unsupported firmware; telemetry only"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            flag = state / CONTROL.INTERVENTION_NAME
+            health_text = (
+                "result=needs-intervention\nready=not configured\n"
+                "boot_id=boot-old\ntime=1793949945.325\n"
+                f"reason={reason}\n"
+            )
+            flag_text = f"reason={reason}\nboot_id=boot-old\ntime=1.000\n"
+            CONTROL.write_state_text(health, health_text)
+            CONTROL.write_state_text(flag, flag_text)
+            real_unlink = Path.unlink
+
+            def deny_unlink(self, *args, **kwargs):
+                if self.name in {CONTROL.HEALTH_NAME, CONTROL.INTERVENTION_NAME}:
+                    raise PermissionError(errno.EACCES, "Permission denied")
+                return real_unlink(self, *args, **kwargs)
+
+            def run(argv):
+                with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                     patch.object(CONTROL.os, "geteuid", return_value=1000), \
+                     patch.object(CONTROL, "read_boot_id", return_value="boot-now"), \
+                     patch.object(CONTROL, "read_kernel_log", return_value=(
+                         "pinned EC 3.13.7 capabilities fan0=975..4350 "
+                         "fan1=975..4350\n"
+                         "EC 3.13.7 floor writes disabled; registering hwmon "
+                         "telemetry only, no cooling device\n"
+                     )), \
+                     patch.object(
+                         CONTROL, "read_daemon_facts",
+                         return_value=("inactive", "disabled", 0, "success", 0),
+                     ), \
+                     patch.object(
+                         CONTROL, "watchdog_unit_state",
+                         return_value=("active", "enabled"),
+                     ), \
+                     patch.object(CONTROL, "_module_loaded_now", return_value=True), \
+                     patch.object(Path, "unlink", deny_unlink):
+                    return run_cli([
+                        "--thermal-root", str(root / "thermal"),
+                        "--hwmon-root", str(root / "hwmon"),
+                        *argv,
+                    ])
+
+            code, stdout, stderr = run(["health"])
+            combined = stdout + stderr
+            self.assertEqual(code, 0, combined)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn(f"stored needs-intervention: {CONTROL.DISMISSED_UNSUPPORTED}", stdout)
+            self.assertIn(f"stored health: {CONTROL.DISMISSED_UNSUPPORTED}", stdout)
+            self.assertNotIn("stored health note:", stdout)
+            self.assertNotIn("stale (", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertEqual(health.read_text(encoding="ascii"), health_text)
+            self.assertEqual(flag.read_text(encoding="ascii"), flag_text)
+
+            code, stdout, stderr = run(["status"])
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertNotIn("NEEDS INTERVENTION:", stdout)
+            self.assertEqual(flag.read_text(encoding="ascii"), flag_text)
+
+            kept = health_text.replace(reason, "workload not ready")
+            CONTROL.write_state_text(health, kept)
+            CONTROL.write_state_text(
+                flag, "reason=workload not ready\nboot_id=boot-old\ntime=1.000\n",
+            )
+            code, stdout, stderr = run(["health"])
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertIn("reason=workload not ready", stdout)
+            self.assertIn("stale (", stdout)
+            self.assertNotIn("dismissed:", stdout)
+            self.assertEqual(health.read_text(encoding="ascii"), kept)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            health = state / CONTROL.HEALTH_NAME
+            flag = state / CONTROL.INTERVENTION_NAME
+            CONTROL.write_state_text(
+                health,
+                "result=needs-intervention\nready=not configured\n"
+                f"boot_id=boot-old\ntime=1.000\nreason={reason}\n",
+            )
+            CONTROL.write_state_text(flag, f"reason={reason}\nboot_id=old\ntime=1.000\n")
+            removed = CONTROL.dismiss_unsupported_health_record(health)
+            self.assertTrue(removed)
+            self.assertFalse(health.exists())
+            self.assertTrue(CONTROL.dismiss_unsupported_firmware_flag(flag))
+            self.assertFalse(flag.exists())
+
+    def test_progress_line_names_the_reason_for_every_uid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            CONTROL.observe_hot_job(
+                now=0.0, fan_rpms=[2700, 4050], hottest=40.0, busy=False,
+                defaults={}, state_dir=state, notifier=lambda _message: None,
+                alert_repeat=1800, zero_fan_celsius=85, stuck_seconds=600,
+                state={}, busy_how="nvidia-smi",
+            )
+            idle = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
+            self.assertIn("source=off\n", idle)
+            self.assertIn("detail=no job running\n", idle)
+
+            CONTROL.observe_hot_job(
+                now=1.0, fan_rpms=[2700, 4050], hottest=40.0, busy=True,
+                defaults={}, state_dir=state, notifier=lambda _message: None,
+                alert_repeat=1800, zero_fan_celsius=85, stuck_seconds=600,
+                state={}, busy_how="nvidia-smi",
+                builtin_reader=lambda: (50.0, {}),
+            )
+            busy = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
+            self.assertIn("source=built-in\n", busy)
+            self.assertIn("detail=GPU utilization\n", busy)
+
+            CONTROL.observe_hot_job(
+                now=2.0, fan_rpms=[2700, 4050], hottest=40.0, busy=True,
+                defaults={}, state_dir=state, notifier=lambda _message: None,
+                alert_repeat=1800, zero_fan_celsius=85, stuck_seconds=600,
+                state={}, busy_how="nvidia-smi-failed",
+                builtin_reader=lambda: (None, None),
+            )
+            failed = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
+            self.assertIn("source=off\n", failed)
+            self.assertIn("detail=nvidia-smi failed\n", failed)
+            self.assertNotIn("GPU utilization", failed)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            watch = state / CONTROL.JOB_WATCH_NAME
+            CONTROL.write_state_text(
+                watch,
+                "source=built-in\ndetail=GPU utilization\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+
+            def run(uid):
+                with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                     patch.object(CONTROL.os, "geteuid", return_value=uid), \
+                     patch.object(CONTROL, "read_boot_id", return_value="boot-now"), \
+                     patch.object(CONTROL, "read_kernel_log", return_value=""), \
+                     patch.object(
+                         CONTROL, "read_daemon_facts",
+                         return_value=("inactive", "disabled", None, None, None),
+                     ), \
+                     patch.object(
+                         CONTROL, "watchdog_unit_state",
+                         return_value=("active", "enabled"),
+                     ), \
+                     patch.object(CONTROL, "_module_loaded_now", return_value=True):
+                    return run_cli([
+                        "--thermal-root", str(root / "thermal"),
+                        "--hwmon-root", str(root / "hwmon"),
+                        "health",
+                    ])
+
+            user_code, user_out, user_err = run(1000)
+            root_code, root_out, root_err = run(0)
+            self.assertEqual(user_code, 0, user_out + user_err)
+            self.assertEqual(root_code, 0, root_out + root_err)
+            self.assertIn("progress: built-in (GPU utilization)", user_out)
+            self.assertIn("progress: built-in (GPU utilization)", root_out)
+            self.assertNotIn("job: warn", user_out)
+            self.assertNotIn("job: warn", root_out)
+            self.assertEqual(
+                watch.read_text(encoding="ascii"),
+                "source=built-in\ndetail=GPU utilization\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+
+            CONTROL.write_state_text(
+                watch,
+                "source=off\ndetail=no job running\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+            user_code, user_out, user_err = run(1000)
+            root_code, root_out, root_err = run(0)
+            self.assertEqual(user_code, 0, user_out + user_err)
+            self.assertEqual(root_code, 0, root_out + root_err)
+            self.assertIn("progress: off (no job running)", user_out)
+            self.assertIn("progress: off (no job running)", root_out)
+
+            real_read = Path.read_text
+
+            def deny_watch(self, *args, **kwargs):
+                if self.name == CONTROL.JOB_WATCH_NAME:
+                    raise PermissionError(errno.EACCES, "Permission denied")
+                return real_read(self, *args, **kwargs)
+
+            with patch.object(Path, "read_text", deny_watch):
+                code, stdout, stderr = run(1000)
+            self.assertEqual(code, 0, stdout + stderr)
+            self.assertIn("progress: unknown (needs root)", stdout)
+            self.assertNotIn("progress: off", stdout)
+            self.assertNotIn("progress: built-in", stdout)
+            self.assertIn("health: healthy", stdout)
 
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"

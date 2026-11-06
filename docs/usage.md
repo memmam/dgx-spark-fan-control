@@ -494,7 +494,16 @@ The core checks are fan and thermal only:
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention
-- `progress:` is `hook`, `built-in`, or `off`. A stuck job adds
+- `progress:` is the watchdog's last sample, with the reason:
+  `off (no job running)`, `off (nvidia-smi failed)`,
+  `off (BUSY_CHECK failed)`, `built-in (GPU utilization)`,
+  `built-in (BUSY_CHECK)`, `built-in (PROGRESS_CHECK failed)`,
+  `hook (PROGRESS_CHECK)`, or `off (no watchdog sample)`. Health does not
+  run `nvidia-smi` or `PROGRESS_CHECK` itself, so a normal user and root
+  print the same line from that file. A failed probe is not called GPU
+  utilization. The watchdog still treats the failure as a running job when
+  it decides whether to reboot. No sample yet is `off (no watchdog sample)`.
+  An unreadable sample is `unknown (needs root)`. A stuck job adds
   `job: warn (job may be stuck: ...)`, which does not fail the check and
   does not set needs-intervention
 - `dgx-fan-watchdog.service` is active
@@ -530,10 +539,20 @@ The checks above are this run. The stored lines underneath are the last
 recorded file, which a plain `health` does not rewrite. `recorded: no` means
 it did not. `stored health:` is one line: `result=`, `ready=`, `time=` in
 this machine's local zone, and `reason=` when the stored result is
-needs-intervention. These Sparks are set to UTC, so a stamp looks like
-`time=2026-11-06 07:25:45 UTC`. `sudo timedatectl set-timezone America/Los_Angeles`
-is optional and only changes the display. A time that is not a number is
-printed unchanged.
+needs-intervention. `ready=` is the same token the live `ready:` line shows,
+including `n/a` on EC 3.13.7 telemetry-only. These Sparks are set to UTC, so
+a stamp looks like `time=2026-11-06 07:25:45 UTC`.
+`sudo timedatectl set-timezone America/Los_Angeles` is optional and only
+changes the display. A time that is not a number is printed unchanged.
+
+A stored needs-intervention whose only reason is unsupported firmware is
+removed on read when the process can unlink it. `stored health:` is then
+`none`, and so is `stored needs-intervention:`. If the file is root-owned
+and this user cannot unlink it, the bytes stay and the line is
+`none (dismissed: unsupported firmware is a deliberate state; run sudo
+dgx-fan-control health --record to remove the file)`. That is not a live
+fault. `sudo dgx-fan-control health --record` on a healthy run replaces the
+health file and removes the flag.
 
 The record is marked `stale (...)` for any of these that apply:
 

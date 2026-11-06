@@ -73,7 +73,20 @@ fan speed on this EC either.
 checks are this run. `stored health:` is the last file under
 `/var/lib/dgx-fan-control/health`, and a plain `health` does not rewrite it.
 `recorded: no` means it did not. EC 3.13.7 telemetry-only stays a pass. That
-state is not written as needs-intervention.
+state is not written as needs-intervention. A record that already says
+`reason=unsupported firmware; telemetry only` is removed on read when this
+user can unlink it. Otherwise the line is
+`stored health: none (dismissed: ...)`, not a live needs-intervention, and
+the file is left for `sudo dgx-fan-control health --record` to replace.
+The stored `ready=` matches the live `ready:` line, so telemetry-only
+records `ready=n/a`.
+
+`progress:` repeats the watchdog sample and names the reason, for example
+`off (no job running)` or `built-in (GPU utilization)`. Root and a normal
+user read that same file. A failed `nvidia-smi` is `off (nvidia-smi failed)`,
+not GPU utilization. The sample can change between two commands a few
+seconds apart because the watchdog polls it. The stuck-job line is still
+only a warning.
 
 The time is this Spark's local time, with the zone abbreviation. These
 machines are set to UTC, so expect `time=2026-11-06 07:25:45 UTC`.

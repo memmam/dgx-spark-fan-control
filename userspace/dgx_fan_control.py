@@ -595,13 +595,12 @@ def write_intervention(path: Path, reason: str, boot_id: str | None, when: float
 def dismiss_unsupported_firmware_flag(path: Path) -> bool:
     """Remove a stale unsupported-firmware flag. Other reasons stay.
 
-    A reader that cannot write the directory leaves the file alone. Status
-    still must not treat that reason as a banner.
+    True only when the file is gone. A reader that cannot unlink leaves the
+    file in place; callers must not show that reason as a live fault.
     """
     if not unsupported_firmware_flag_only(read_intervention_reason(path)):
         return False
-    clear_stall_marker(path)
-    return True
+    return clear_stall_marker(path)
 
 
 def access_denied(exc: BaseException) -> bool:
@@ -646,11 +645,15 @@ def intervention_banner(path: Path) -> str:
     return f"NEEDS INTERVENTION: {reason}\n"
 
 
-def clear_stall_marker(path: Path) -> None:
+def clear_stall_marker(path: Path) -> bool:
+    """Remove path. True when it is gone. Permission denied leaves it."""
     try:
         path.unlink()
+    except FileNotFoundError:
+        return True
     except OSError:
-        return
+        return not path.exists()
+    return not path.exists()
 
 
 PREVIOUS_REBOOT_NAME = "previous-watchdog-reboot"
@@ -883,10 +886,15 @@ def builtin_signals_stuck(util: float | None, ticks: dict[int, int] | None,
 
 
 def read_job_watch(state_dir: Path) -> dict[str, str]:
+    """Last watchdog progress sample. ``unreadable=yes`` is not a missing file."""
     path = state_dir / JOB_WATCH_NAME
     try:
         text = path.read_text(encoding="ascii")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if access_denied(exc):
+            return {"unreadable": "yes"}
         return {}
     found = {}
     for line in text.splitlines():
@@ -896,15 +904,42 @@ def read_job_watch(state_dir: Path) -> dict[str, str]:
     return found
 
 
-def write_job_watch(state_dir: Path, source: str, stuck: bool, seconds: float) -> None:
+def write_job_watch(state_dir: Path, source: str, stuck: bool, seconds: float,
+                    detail: str = "") -> None:
     try:
         write_state_text(
             state_dir / JOB_WATCH_NAME,
-            f"source={source}\nstuck={'yes' if stuck else 'no'}\n"
+            f"source={source}\n"
+            f"detail={detail}\n"
+            f"stuck={'yes' if stuck else 'no'}\n"
             f"no_progress_seconds={max(0.0, seconds):.0f}\n",
         )
     except OSError:
         return
+
+
+def format_progress(job_watch: dict[str, str]) -> str:
+    """Progress note, including why. Every uid prints the same stored sample.
+
+    Health does not run nvidia-smi or PROGRESS_CHECK itself. Those probes
+    run in the root watchdog, and a second probe can disagree by uid.
+    """
+    if job_watch.get("unreadable") == "yes":
+        return NEEDS_ROOT
+    source = job_watch.get("source", "")
+    if source not in {"hook", "built-in", "off"}:
+        source = "off"
+    detail = job_watch.get("detail", "").strip()
+    if not detail:
+        if not job_watch:
+            detail = "no watchdog sample"
+        elif source == "hook":
+            detail = "PROGRESS_CHECK"
+        elif source == "built-in":
+            detail = "GPU utilization"
+        else:
+            detail = "no job running"
+    return f"{source} ({detail})"
 
 
 def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
@@ -1659,11 +1694,11 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     )
     if job_watch is None:
         job_watch = read_job_watch(state_dir) if state_dir is not None else {}
+    keep("progress", "note", format_progress(job_watch))
     progress_source = job_watch.get("source", "off")
     if progress_source not in {"hook", "built-in", "off"}:
         progress_source = "off"
-    keep("progress", "note", progress_source)
-    if job_watch.get("stuck") == "yes":
+    if job_watch.get("stuck") == "yes" and job_watch.get("unreadable") != "yes":
         seconds = job_watch.get("no_progress_seconds", "0")
         keep(
             "job", "warn",
@@ -1730,10 +1765,17 @@ def _health_record_fields(text: str) -> dict[str, str]:
     return found
 
 
+DISMISSED_UNSUPPORTED = (
+    "none (dismissed: unsupported firmware is a deliberate state; "
+    "run `sudo dgx-fan-control health --record` to remove the file)"
+)
+
+
 def dismiss_unsupported_health_record(path: Path) -> bool:
     """Drop a stored needs-intervention result that only names unsupported firmware.
 
-    Plain health does not otherwise rewrite this file. A different reason stays.
+    True only when that file is gone. Plain health does not otherwise rewrite
+    it. A different reason stays. Permission denied leaves the bytes in place.
     """
     try:
         fields = _health_record_fields(path.read_text(encoding="ascii"))
@@ -1743,8 +1785,18 @@ def dismiss_unsupported_health_record(path: Path) -> bool:
         return False
     if not unsupported_firmware_flag_only(fields.get("reason", "")):
         return False
-    clear_stall_marker(path)
-    return True
+    return clear_stall_marker(path)
+
+
+def unsupported_health_record(text: str) -> bool:
+    """True when text is still a telemetry-only needs-intervention record."""
+    if text in {"none", NEEDS_ROOT}:
+        return False
+    fields = _health_record_fields(text)
+    return (
+        fields.get("result") == "needs-intervention"
+        and unsupported_firmware_flag_only(fields.get("reason", ""))
+    )
 
 
 def current_firmware_token(thermal_root: Path, hwmon_root: Path, log_text: str) -> str:
@@ -1894,8 +1946,9 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         boot_id = read_boot_id()
     if record is None:
         record = os.geteuid() == 0
-    # Plain health does not record. This one stale reason is still removed
-    # on read, including when the process cannot write and the unlink fails.
+    # Plain health does not rewrite these files. It does unlink a record whose
+    # only reason is unsupported firmware. If that unlink is denied, the
+    # bytes stay and the display treats them as dismissed.
     dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
     dismiss_unsupported_health_record(state_dir / HEALTH_NAME)
     interactive = settle_seconds <= 0
@@ -1979,6 +2032,8 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     print("health: healthy" if not problems else "health: fail", flush=True)
     when = wall_time()
     firmware = current_firmware_token(thermal_root, hwmon_root, seen_log)
+    if any(line == "ready: n/a" for line in lines):
+        ready = "n/a"
     health_path = state_dir / HEALTH_NAME
     intervention_path = state_dir / INTERVENTION_NAME
     if record:
@@ -2020,10 +2075,16 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     stored_flag = _stored_text(intervention_path)
     if stored_flag not in {"none", NEEDS_ROOT} and stored_flag.startswith("reason="):
         stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
-    stored_health, stored_hint = format_stored_health(
-        _stored_text(health_path), boot_id, firmware,
-        current_healthy=not problems,
-    )
+    if unsupported_firmware_flag_only(stored_flag):
+        stored_flag = DISMISSED_UNSUPPORTED
+    stored_raw = _stored_text(health_path)
+    if unsupported_health_record(stored_raw):
+        stored_health, stored_hint = DISMISSED_UNSUPPORTED, None
+    else:
+        stored_health, stored_hint = format_stored_health(
+            stored_raw, boot_id, firmware,
+            current_healthy=not problems,
+        )
     print(f"stored needs-intervention: {stored_flag}", flush=True)
     print(f"stored health: {stored_health}", flush=True)
     if stored_hint:
@@ -2130,22 +2191,35 @@ def _wall(notifier, message: str, what: str) -> None:
         LOG.warning("could not broadcast the %s", what)
 
 
-def progress_source(command: str, state: dict) -> str:
-    """hook when PROGRESS_CHECK is in use, built-in after it fails, else off."""
+def progress_source(command: str, state: dict, busy_how: str = "") -> tuple[str, str]:
+    """Source token and the reason health prints.
+
+    A failed nvidia-smi or BUSY_CHECK still counts as busy for reboot
+    deferral. That failure is not labeled as GPU utilization. Health reads
+    this pair back from the job-watch file, so sudo and a normal user print
+    the same line.
+    """
     if state.get("hook_failed"):
-        return "built-in"
+        return "built-in", "PROGRESS_CHECK failed"
     if command.strip():
-        return "hook"
+        return "hook", "PROGRESS_CHECK"
+    if busy_how == "nvidia-smi-failed":
+        return "off", "nvidia-smi failed"
+    if busy_how == "busy-check-failed":
+        return "off", "BUSY_CHECK failed"
     if state.get("busy"):
-        return "built-in"
-    return "off"
+        if busy_how == "busy-check":
+            return "built-in", "BUSY_CHECK"
+        return "built-in", "GPU utilization"
+    return "off", "no job running"
 
 
 def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | None,
                     busy: bool, defaults: dict[str, str], state_dir: Path,
                     notifier, alert_repeat: float, zero_fan_celsius: float,
                     stuck_seconds: float, state: dict,
-                    progress_reader=None, builtin_reader=None) -> None:
+                    progress_reader=None, builtin_reader=None,
+                    busy_how: str = "") -> None:
     """Track a hot workload. Warn only. Never reboot, power off, or kill.
 
     Progress is sampled whenever a job is busy, so a stall that starts
@@ -2168,10 +2242,12 @@ def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | 
     was_busy = bool(state.get("busy"))
     episode = bool(state.get("episode"))
 
-    def publish(source: str, stuck: bool, seconds: float) -> None:
+    def publish(stuck: bool, seconds: float) -> None:
+        source, detail = progress_source(command, state, busy_how)
         state["source"] = source
+        state["detail"] = detail
         state["stuck"] = stuck
-        write_job_watch(state_dir, source, stuck, seconds)
+        write_job_watch(state_dir, source, stuck, seconds, detail)
 
     if not busy and was_busy and (episode or state.get("saw_hot")):
         started = state.get("episode_started")
@@ -2192,7 +2268,7 @@ def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | 
         state["stuck"] = False
         state["stuck_since_alert"] = None
         state["no_progress_since"] = None
-        publish(progress_source(command, state), False, 0.0)
+        publish(False, 0.0)
         return
 
     if not busy:
@@ -2213,7 +2289,7 @@ def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | 
                 state["hot_until"] = now
         elif episode and hottest is not None:
             state["peak"] = max(state.get("peak") or hottest, hottest)
-        publish(progress_source(command, state), False, 0.0)
+        publish(False, 0.0)
         return
 
     state["busy"] = True
@@ -2308,7 +2384,7 @@ def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | 
             )
             state["stuck_since_alert"] = now
     state["stuck"] = stuck
-    publish(source, stuck, quiet_for)
+    publish(stuck, quiet_for)
 
 
 def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
@@ -2490,6 +2566,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
                 stuck_seconds=stuck_seconds, state=job_state,
                 progress_reader=progress_reader, builtin_reader=builtin_reader,
+                busy_how=busy_how,
             )
             if held >= reboot_seconds:
                 marker = read_stall_marker(marker_path)
@@ -2677,6 +2754,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
                 stuck_seconds=stuck_seconds, state=job_state,
                 progress_reader=progress_reader, builtin_reader=builtin_reader,
+                busy_how=spinning_how,
             )
         else:
             announced_shortage = False
@@ -2733,6 +2811,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
                 stuck_seconds=stuck_seconds, state=job_state,
                 progress_reader=progress_reader, builtin_reader=builtin_reader,
+                busy_how=busy_how,
             )
             hot = hottest is not None and hottest >= zero_fan_celsius
             if hot:
