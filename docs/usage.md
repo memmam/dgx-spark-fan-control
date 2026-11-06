@@ -674,10 +674,11 @@ or an HTTP API. Root jobs and system services are not killed directly.
 even at level 100. Do not hold them under sustained full load. The independent
 watchdog must be active before these commands write; it forces 100 at 80 C,
 stops work at 85 C, and kills at 90 C or timeout. A confirmed stop reboots
-immediately. Shutdown at 95 C is only for an unverified stop or a failed
-reboot, not for residual heat after a reboot was accepted. The incident
-latch survives that reboot and blocks ACPI reapplication. Workload resume
-is a separate, optional post-boot hook.
+immediately. That is phase 1. Shutdown at 95 C does not replace that
+reboot. After the reboot, phase 2 watches the stock EC curve and does not
+write ACPI. If heat returns, it stops the job again and shuts down only
+when heat persists after that stop. There is no second reboot. Workload
+resume is a separate hook that runs at most once at the start of phase 2.
 See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 
 

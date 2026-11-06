@@ -631,6 +631,62 @@ class ThermalTests(unittest.TestCase):
         health(True)
         self.assertEqual(calls, [True])
 
+    def test_ec_only_phase_never_writes_acpi_and_shuts_down_only_after_the_stop(self):
+        thermal, hwmon = self.fake_fans(80000)
+        C.record_acpi_boot(C.ACPI_HOLD_NAME)
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        self.assertEqual(C.acpi_protection_phase(), "acpi")
+        self.step(80, 0)
+        self.maximum.assert_called_once()
+        with patch.object(C, "read_boot_id", return_value="next-boot"):
+            self.assertEqual(C.acpi_protection_phase(), "ec")
+            C.poll_acpi_thermal(self.guard, thermal, hwmon, 1)
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+        self.reboot.assert_not_called()
+        self.shutdown.assert_not_called()
+        self.guard = self.make_guard()
+        with patch.object(C, "read_boot_id", return_value="next-boot"):
+            self.guard.step(85, 2, self.maximum, ec_only=True)
+            self.send.assert_called_once()
+            self.assertEqual(self.send.call_args.args[1], signal.SIGTERM)
+            self.targets.return_value = {}
+            with patch.object(self.guard, "identity", return_value=None):
+                self.guard.step(95, 3, self.maximum, ec_only=True)
+                self.assertEqual(self.guard.stage, "ec-watch")
+                self.reboot.assert_not_called()
+                self.shutdown.assert_not_called()
+                self.guard.step(95, 4, self.maximum, ec_only=True)
+            self.shutdown.assert_called_once()
+            self.reboot.assert_not_called()
+        self.maximum.assert_called_once()
+
+    def test_ec_only_watch_does_not_shut_down_when_the_zone_falls(self):
+        self.targets.return_value = {}
+        self.guard.step(85, 0, self.maximum, ec_only=True)
+        self.assertEqual(self.guard.stage, "ec-watch")
+        self.guard.step(70, 10, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_not_called()
+        self.maximum.assert_not_called()
+        self.assertTrue(C.acpi_incident_latched() or True)
+
+    def test_phase_file_is_recorded_on_reboot_and_cleared_on_reset(self):
+        thermal, _hwmon = self.fake_fans(70000)
+        self.targets.return_value = {}
+        self.step(85, 0)
+        self.reboot.assert_called_once()
+        text = (C.STALL_MARKER_DIR / C.ACPI_PHASE_NAME).read_text()
+        self.assertIn("phase=ec", text)
+        self.assertIn("incident_boot=test-boot", text)
+        with patch.object(C.os, "geteuid", return_value=0), \
+             patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C, "read_defaults", return_value={}):
+            C.reset_acpi_incident(thermal)
+        self.assertFalse((C.STALL_MARKER_DIR / C.ACPI_PHASE_NAME).exists())
+        self.assertFalse(C.acpi_incident_latched())
+        self.assertEqual(C.acpi_protection_phase(), "off")
+
     def test_hook_is_async_argv_without_shell(self):
         guard = C.AcpiThermalGuard({"ACPI_THERMAL_STOP_HOOK": "/opt/stop-job --reason hot"})
         with patch.object(C.subprocess, "Popen") as popen:

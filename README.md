@@ -7,10 +7,11 @@
 > 6660/9990 at about 95 C, and 88.8–89.7 C settled. Do not hold ACPI under
 > sustained full load. The independent watchdog now forces 100/warns at
 > 80 C, stops work via hook/SIGTERM at 85 C, and kills at 90 C (or timeout).
-> A confirmed stop reboots immediately to restore the EC curve. Poweroff at
-> 95 C is only the failure path when that stop cannot be verified or the
-> reboot fails. There is no cool-down wait. The reboot does not relaunch
-> the job. An optional post-boot resume hook is off until configured.
+> A confirmed stop reboots immediately to restore the EC curve. Poweroff
+> does not replace that reboot. The next boot only monitors the stock EC
+> curve: no ACPI writes, no second reboot. If heat returns, it stops the
+> job again and shuts down only when heat persists after that stop. An
+> optional resume hook is off until configured and runs at most once.
 > An incident stays latched across reboot until explicit manual reset.
 > Read [escalation, recovery, configuration, and safeguards](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 > The burn view's GPU temperature can read about 10 C below the hottest

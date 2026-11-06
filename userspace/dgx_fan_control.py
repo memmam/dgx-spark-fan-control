@@ -2621,11 +2621,19 @@ def show_intervention() -> None:
     path = STALL_MARKER_DIR / INTERVENTION_NAME
     dismiss_unsupported_firmware_flag(path)
     if acpi_incident_latched():
-        print(
-            "ACPI thermal incident latched: ACPI writes and fan-curve startup "
-            "inhibited until acpi-incident-reset. Stock EC control is what a "
-            "reboot restores. This latch does not resume or forbid a workload."
-        )
+        if acpi_protection_phase() == "ec":
+            print(
+                "ACPI incident is in EC-only monitoring: no ACPI writes, no "
+                "second reboot, and no automatic resume. A new thermal stop "
+                "can shut down if heat persists. acpi-incident-reset releases "
+                "the latch."
+            )
+        else:
+            print(
+                "ACPI thermal incident latched: ACPI writes and fan-curve startup "
+                "inhibited until acpi-incident-reset. Stock EC control is what a "
+                "reboot restores. This latch does not resume or forbid a workload."
+            )
     banner = intervention_banner(path)
     if banner:
         print(banner, end="")
@@ -4389,6 +4397,7 @@ def acpi_write_refusal(module_loaded: bool, service_active: str) -> str | None:
 ACPI_HOLD_NAME = "acpi-hold-boot"
 ACPI_MAX_NAME = "acpi-max-boot"
 ACPI_INCIDENT_NAME = "acpi-incident"
+ACPI_PHASE_NAME = "acpi-phase"
 ACPI_RESUME_NAME = "acpi-resume-boot"
 ACPI_RESUME_TIMEOUT_SECONDS = 30.0
 
@@ -4411,6 +4420,9 @@ def reset_acpi_incident(thermal_root):
     if hot is None or hot >= guard.fan_c - guard.hysteresis:
         raise RuntimeError("ACPI incident reset refused: hottest zone must be below MAX minus HYSTERESIS")
     (STALL_MARKER_DIR / ACPI_INCIDENT_NAME).unlink()
+    phase = STALL_MARKER_DIR / ACPI_PHASE_NAME
+    if phase.exists():
+        phase.unlink()
     LOG.warning("ACPI incident reset explicitly; no fan level written and no job/service started")
 
 
@@ -4475,6 +4487,42 @@ def record_acpi_boot(name: str, state_dir: Path | None = None) -> None:
         _fsync_existing(path)
         _fsync_existing(path.parent)
         _DURABLE_ACPI_RECORDS.add(key)
+
+
+def acpi_protection_phase(state_dir: Path | None = None) -> str:
+    """acpi while this boot holds or owns the incident; ec after that reboot.
+
+    off means no ACPI incident is active. ec is second-stage protection:
+    stock EC control stays in place, and this phase must not write cur_state.
+    """
+    directory = state_dir or STALL_MARKER_DIR
+    boot = read_boot_id()
+    if not boot:
+        return "off"
+    if _acpi_record_boot(ACPI_HOLD_NAME, directory) == boot:
+        return "acpi"
+    if _acpi_record_boot(ACPI_INCIDENT_NAME, directory) == boot:
+        return "acpi"
+    if acpi_incident_latched(directory):
+        return "ec"
+    return "off"
+
+
+def mark_ec_protection_phase(state_dir: Path | None = None) -> None:
+    """Remember that the next boot is EC-only protection, not another ACPI hold."""
+    boot = read_boot_id()
+    if not boot:
+        raise RuntimeError("cannot record EC-only phase: boot ID unreadable")
+    directory = state_dir or STALL_MARKER_DIR
+    text = f"phase=ec\nincident_boot={boot}\n"
+    with acpi_write_lock():
+        path = directory / ACPI_PHASE_NAME
+        temporary = path.with_suffix(".tmp")
+        write_state_text(temporary, text)
+        _fsync_existing(temporary)
+        temporary.replace(path)
+        _fsync_existing(path)
+        _fsync_existing(path.parent)
 
 
 def _acpi_record_boot(name: str, state_dir: Path) -> str | None:
@@ -4644,6 +4692,7 @@ class AcpiThermalGuard:
         self.hook_process = None
         self.selected = {}
         self.max_logged = False
+        self.ec_logged = False
         self.retired_hooks = []
 
     def number(self, key, fallback):
@@ -4815,7 +4864,7 @@ class AcpiThermalGuard:
                 if fd is not None:
                     os.close(fd)
 
-    def step(self, hot, now, force_max):
+    def step(self, hot, now, force_max, ec_only=False):
         snapshot = None
         def targets():
             # One bounded compute query per poll, even when a hot sample
@@ -4826,8 +4875,17 @@ class AcpiThermalGuard:
             return dict(snapshot)
 
         self.retired_hooks = [p for p in self.retired_hooks if p.poll() is None]
-        # A failed persist must be retried before this poll decides to reboot.
-        self.ensure_incident_latched()
+        if ec_only:
+            if not self.ec_logged:
+                LOG.critical(
+                    "EC-only thermal phase: monitoring stock EC control; "
+                    "no ACPI writes and no second reboot"
+                )
+                self.ec_logged = True
+        else:
+            # A failed persist must be retried before this poll decides to reboot.
+            # EC-only mode must not rewrite the incident boot id.
+            self.ensure_incident_latched()
         if hot is None or not math.isfinite(hot):
             # An accepted recovery reboot stands. A missing sample must not
             # turn it into poweroff, and neither must residual heat.
@@ -4837,9 +4895,15 @@ class AcpiThermalGuard:
                     "reboot was requested; leaving the reboot in place"
                 )
                 return
+            if ec_only:
+                LOG.critical(
+                    "EC-only thermal phase: hottest zone unreadable; "
+                    "not writing ACPI and not powering off on this sample"
+                )
+                return
             LOG.critical("ACPI thermal: hottest zone unreadable; escalating conservatively")
             hot = self.shutdown_c
-        if hot >= self.fan_c:
+        if not ec_only and hot >= self.fan_c:
             # The latch is persisted BEFORE the writes. A failed/partial write
             # is retried next poll; no lower-level writer can undo escalation.
             try:
@@ -4866,14 +4930,34 @@ class AcpiThermalGuard:
                 and self.discovery_complete
             )
 
+        if self.stage == "ec-watch":
+            if not stopped() and hot >= self.stop_c:
+                self.stage = "idle"
+            elif stopped():
+                heat_persists = hot >= self.shutdown_c or (
+                    now - self.since >= self.kill_s
+                    and hot >= self.stop_c - self.hysteresis
+                )
+                if heat_persists:
+                    self._last_resort_shutdown(
+                        hot, "EC-only heat persisted after the workload stopped",
+                    )
+                return
+            else:
+                return
         if self.stage == "incident" and hot >= self.stop_c and not stopped():
             self.stage = "idle"
         if self.stage == "idle" and hot >= self.stop_c:
-            try:
-                record_acpi_boot(ACPI_INCIDENT_NAME)
-            except (OSError, RuntimeError) as exc:
-                LOG.critical("ACPI thermal: cannot persist incident; recovery reboot inhibited: %s", exc)
-            LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; stopping load", hot, self.stop_c)
+            if not ec_only:
+                try:
+                    record_acpi_boot(ACPI_INCIDENT_NAME)
+                except (OSError, RuntimeError) as exc:
+                    LOG.critical("ACPI thermal: cannot persist incident; recovery reboot inhibited: %s", exc)
+            LOG.critical(
+                "%s: hottest %.1fC >= %.1fC; stopping load",
+                "EC-only phase" if ec_only else "ACPI thermal",
+                hot, self.stop_c,
+            )
             self.since = now
             self.stage = "hook"
             try:
@@ -4913,9 +4997,21 @@ class AcpiThermalGuard:
                 # The target snapshot was taken before this signal. Do not
                 # power off in this same poll; the next one can see the stop.
                 entered_kill = True
-        if (self.stage not in ("idle", "reboot", "shutdown")
+        if (ec_only and self.stage not in ("idle", "reboot", "shutdown", "ec-watch")
+                and stopped()):
+            self.finish_hook()
+            LOG.critical(
+                "EC-only phase: workload confirmed stopped; not rebooting and "
+                "not resuming; watching the stock EC curve"
+            )
+            self.stage, self.since = "ec-watch", now
+        elif (not ec_only and self.stage not in ("idle", "reboot", "shutdown")
                 and acpi_record_current(ACPI_INCIDENT_NAME) and stopped()):
             self.finish_hook()
+            try:
+                mark_ec_protection_phase()
+            except (OSError, RuntimeError) as exc:
+                LOG.critical("ACPI thermal: cannot persist EC-only phase: %s", exc)
             LOG.critical(
                 "ACPI thermal: workload confirmed stopped; running systemctl "
                 "reboot to restore EC control; incident remains latched"
@@ -4956,7 +5052,8 @@ class AcpiThermalGuard:
 
 
 def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WATCHDOG_ZERO_FAN_CELSIUS):
-    if not acpi_record_current(ACPI_HOLD_NAME):
+    phase = acpi_protection_phase()
+    if phase == "off":
         return
     if classify_fan_binding(thermal_root, hwmon_root) == "unsupported":
         return
@@ -4980,6 +5077,8 @@ def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WAT
         return
 
     def force_max():
+        if phase == "ec":
+            raise RuntimeError("EC-only phase refuses ACPI writes")
         devices = acpi_fan_devices(thermal_root)
         if not devices:
             raise RuntimeError("no ACPI Fan cooling devices")
@@ -4992,7 +5091,7 @@ def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WAT
                 failures.append(f"{device.name}: {exc}")
         if failures:
             raise RuntimeError("; ".join(failures))
-    guard.step(hot, now, force_max)
+    guard.step(hot, now, force_max, ec_only=(phase == "ec"))
 
 
 def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,

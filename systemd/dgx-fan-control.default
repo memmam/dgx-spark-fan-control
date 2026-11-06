@@ -83,9 +83,11 @@ ACPI_THERMAL_SHUTDOWN=yes
 # Incident latch survives reboot; reset explicitly with acpi-incident-reset.
 ACPI_THERMAL_STOP_HOOK=
 # Optional. Empty disables resume. The boot health unit runs this once on the
-# boot after an ACPI incident. It must exit promptly. It is not a shell and
-# it is not the killed command line. A job that cannot checkpoint does not
-# resume unless this command, or the manager it calls, starts it again.
+# boot after an ACPI incident (EC-only phase). It must exit promptly. It is
+# not a shell and it is not the killed command line. A later thermal stop in
+# that phase does not run it again and does not reboot. A job that cannot
+# checkpoint does not resume unless this command, or the manager it calls,
+# starts it again.
 ACPI_THERMAL_RESUME_HOOK=
 # These additional targets never bypass root/system-process exclusions.
 ACPI_THERMAL_PIDS=

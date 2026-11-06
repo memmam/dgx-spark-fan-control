@@ -212,32 +212,33 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    Otherwise, after **10 seconds** following SIGTERM, send SIGKILL if a
    selected process is still alive or the hottest zone remains at least
    **83 C**. Newly discovered compute processes are included.
-4. **Confirmed stop:** as soon as the workload is verified stopped, whether
-   the hook, SIGTERM, or SIGKILL did it, request `systemctl reboot` to
-   restore EC control. There is no 30 second wait and no requirement that
-   the zone first fall below 78 C. Verification means no remaining selected,
-   GPU-compute, or configured target processes, no protected live targets,
-   and no failed or ambiguous compute query. The reboot is requested on that
-   verifying poll, including when the zone is still at the shutdown ceiling.
-   A failed reboot is retried. If it fails while the zone is already at the
-   shutdown ceiling, the failure path below takes over.
-5. **Last-resort shutdown,** not the normal result of a kill: `systemctl
-   poweroff` runs only when the stop still cannot be verified, or the
-   recovery reboot failed, and heat is uncontrolled. Uncontrolled means the
-   zone is at **95 C**, or it is still at least **83 C** **5 seconds** after
-   SIGKILL. The poll that sends SIGKILL does not also power off; the next
-   poll can see that the processes exited and reboot instead. An accepted
-   reboot is not replaced by poweroff because the zone is still hot or the
-   next sample is missing. Failed shutdown requests are logged and retried.
-   Shutdown is enabled unless explicitly disabled. An unreadable hottest
-   zone while an ACPI hold is armed and the fans are spinning or unknown is
-   treated as the final threshold for this failure path. A verified true
-   zero (both tachometers at 0 RPM) does not use it: an unreadable zone
-   stays on the existing true-zero rule, which does not power off without a
-   readable zone at or above 85 C. This is not a re-arm rule. During a
-   latched incident, legacy cold-stall/foreign-floor reboot paths cannot
-   bypass this recovery verification; the hot true-zero shutdown still
-   takes precedence.
+4. **Phase 1, confirmed stop:** as soon as the workload is verified stopped,
+   whether the hook, SIGTERM, or SIGKILL did it, request `systemctl reboot`
+   to restore stock EC control. There is no cool-down wait. Verification
+   means no remaining selected, GPU-compute, or configured target processes,
+   no protected live targets, and no failed or ambiguous compute query. The
+   reboot is requested on that verifying poll, including when the zone is
+   still at 95 C. That request records EC-only phase for the **next** boot.
+   It does not relaunch the job. A failed reboot is retried. If it fails
+   while the zone is already at the shutdown ceiling, poweroff is the
+   failure path for being unable to hand control back. It is not the normal
+   result of a successful stop. The poll that sends SIGKILL does not also
+   power off.
+5. **Phase 2, the next boot:** the incident file still names the previous
+   boot, so monitoring continues with **no ACPI writes**. Level 100 is not
+   forced at 80 C. The stock EC curve stays in place. The optional resume
+   hook may run once. If the zone again reaches 85 C, stop the workload
+   with the same hook, SIGTERM, and SIGKILL ladder. After that stop is
+   confirmed, watch the temperature. There is no second reboot and no
+   second resume. Shut down only if heat then persists: the zone is at
+   **95 C**, or it is still at least **83 C** five seconds after the stop.
+   If the zone falls below 83 C, leave the machine up. If the stop cannot
+   be verified and heat stays uncontrolled, poweroff is still the failure
+   path. An unreadable zone in this phase does not write ACPI and does not
+   power off on that sample. A verified true zero (both tachometers at 0
+   RPM) stays on the existing true-zero rule in both phases. During a
+   latched incident, legacy cold-stall and foreign-floor reboot paths
+   cannot bypass phase 1's stop verification.
 
 The reboot restores stock EC control. It is not an in-place ACPI recovery,
 and it does not relaunch the process that was stopped. The incident latch
@@ -262,9 +263,11 @@ does not assume the job can be checkpointed. A non-checkpointable job does
 not continue; only this hook, or the workload manager the hook calls, can
 start work again.
 
-`dgx-fan-health.service` (`health --record`) is what runs the hook, once, on
-the boot **after** the incident boot. A plain `health` run does not. The
-hook is skipped unless every one of these is true:
+That boot is phase 2. `dgx-fan-health.service` (`health --record`) is what
+runs the hook, once, at the start of it. EC-only monitoring then continues.
+A later thermal stop in phase 2 does not reboot and does not run the hook
+again. A plain `health` run does not start it. The hook is skipped unless
+every one of these is true:
 
 - the command is set, and this process is root
 - `/var/lib/dgx-fan-control/acpi-incident` exists and names an **earlier**
