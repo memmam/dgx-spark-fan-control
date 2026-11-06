@@ -75,13 +75,23 @@ class ThermalTests(unittest.TestCase):
         self.step(95, 0.2)
         self.shutdown.assert_called_once()
 
-    def test_direct_95_skips_hook_and_all_graces(self):
+    def test_direct_95_kills_then_reboots_when_the_stop_is_verified(self):
         self.step(95, 0)
         self.hook.assert_not_called()
         self.targets.assert_called_once()
         self.assertEqual([c.args[1] for c in self.send.call_args_list],
                          [signal.SIGTERM, signal.SIGKILL])
-        self.shutdown.assert_called_once()
+        self.shutdown.assert_not_called()
+        self.reboot.assert_not_called()
+        self.targets.return_value = {}
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(95, 1)
+        self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
+        self.assertEqual(self.guard.stage, "reboot")
+        self.step(96, 2)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_called_once()
 
     def test_hook_success_gets_grace_and_cooling_prevents_signals(self):
         process = Mock()
@@ -106,37 +116,36 @@ class ThermalTests(unittest.TestCase):
         self.step(85, 0)
         self.assertEqual(self.guard.stage, "term")
 
-    def test_cooling_reboots_only_after_verified_stop_and_never_rearms(self):
+    def test_confirmed_stop_reboots_immediately_without_a_cool_wait(self):
         self.step(85, 0)
-        self.step(77, 1)
-        self.step(79, 20)
-        self.step(77, 21)
+        self.step(95, 1)
+        self.reboot.assert_not_called()
+        self.shutdown.assert_not_called()
         self.targets.return_value = {}
         with patch.object(self.guard, "identity", return_value=None):
-            self.step(77, 50)
-            self.reboot.assert_not_called()
-            self.step(77, 51)
+            self.step(95, 2)
         self.reboot.assert_called_once()
         self.assertEqual(self.guard.stage, "reboot")
         self.assertTrue(C.acpi_record_current(C.ACPI_MAX_NAME))
         self.assertTrue(C.acpi_incident_latched())
         self.shutdown.assert_not_called()
-        self.assertEqual(self.send.call_count, 1)
+        self.step(95, 3)
+        self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
 
     def test_cooling_does_not_reboot_through_alive_jobs_or_missing_query(self):
         self.step(85, 0)
         self.step(77, 1)
-        self.step(77, 31)
         self.reboot.assert_not_called()
         self.targets.return_value = {}
         self.guard.discovery_complete = False
         with patch.object(self.guard, "identity", return_value=None):
-            self.step(77, 32)
+            self.step(77, 2)
         self.reboot.assert_not_called()
         self.guard.discovery_complete = True
         self.guard.blocked_targets = {1}
         with patch.object(self.guard, "identity", return_value=None):
-            self.step(77, 33)
+            self.step(77, 3)
         self.reboot.assert_not_called()
 
     def test_persistent_latch_blocks_startup_and_reset_requires_reboot_and_cooling(self):
@@ -163,15 +172,23 @@ class ThermalTests(unittest.TestCase):
         self.guard = self.make_guard({"ACPI_THERMAL_SHUTDOWN": "no"})
         self.step(95, 0)
         self.shutdown.assert_not_called()
+        self.assertEqual(self.guard.stage, "kill")
+        self.step(95, 1)
+        self.shutdown.assert_not_called()
         self.assertEqual(self.guard.stage, "disabled")
         self.guard = self.make_guard()
         self.shutdown.return_value = 1
-        self.step(95, 1)
         self.step(95, 2)
+        self.shutdown.assert_not_called()
+        self.step(95, 3)
+        self.step(95, 4)
         self.assertEqual(self.shutdown.call_count, 2)
 
-    def test_missing_temperature_fails_conservatively(self):
+    def test_missing_temperature_fails_conservatively_when_stop_is_unverified(self):
         self.step(None, 0)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_not_called()
+        self.step(None, 1)
         self.shutdown.assert_called_once()
 
     def test_invalid_config_rejected(self):
@@ -261,24 +278,26 @@ class ThermalTests(unittest.TestCase):
             C.arm_acpi_monitor(thermal, hwmon)
         self.assertTrue(C.acpi_record_current(C.ACPI_HOLD_NAME))
 
-    def test_restart_same_boot_resumes_incident_and_cold_verified_stop_reboots(self):
+    def test_restart_same_boot_reboots_as_soon_as_the_stop_is_verified(self):
         self.step(85, 0)
         self.guard = self.make_guard()
         self.assertEqual(self.guard.stage, "incident")
         self.targets.return_value = {}
-        self.step(77, 1)
-        self.step(77, 31)
+        self.step(90, 1)
         self.reboot.assert_called_once()
-        self.step(77, 32)
+        self.shutdown.assert_not_called()
+        self.step(95, 2)
         self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
 
-    def test_no_killable_targets_does_not_disable_shutdown(self):
+    def test_already_stopped_workload_reboots_instead_of_shutting_down(self):
         self.targets.return_value = {}
         self.step(85, 0)
-        self.step(90, 1)
-        self.step(95, 2)
-        self.shutdown.assert_called_once()
-        self.reboot.assert_not_called()
+        self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
+        self.step(95, 1)
+        self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
 
     def test_legacy_foreign_floor_reboot_cannot_bypass_incident_cooling(self):
         thermal, hwmon = self.fake_fans(80000)
@@ -295,7 +314,8 @@ class ThermalTests(unittest.TestCase):
             clock = iter([0, 10, 10])
             with patch.object(C, "Event", return_value=event), \
                  patch.object(C.signal, "signal"), \
-                 patch.object(C, "observe_hot_job"):
+                 patch.object(C, "observe_hot_job"), \
+                 patch.object(C, "run_watchdog_action", return_value=0):
                 self.assertEqual(C.run_watchdog(
                     thermal, hwmon, defaults={}, runner=runner,
                     unit_state=lambda: ("inactive", "enabled", C.FOREIGN_FLOOR_EXIT, "exit-code", 0),
@@ -456,18 +476,19 @@ class ThermalTests(unittest.TestCase):
         for fan in C.acpi_fan_devices(thermal):
             self.assertEqual((fan / "cur_state").read_text().strip(), "35")
 
-    def test_unreadable_zone_does_not_replace_an_accepted_recovery_reboot(self):
+    def test_unreadable_or_hot_zone_does_not_replace_an_accepted_recovery_reboot(self):
         self.step(85, 0)
         self.targets.return_value = {}
         with patch.object(self.guard, "identity", return_value=None):
-            self.step(77, 1)
-            self.step(77, 31)
+            self.step(92, 1)
         self.reboot.assert_called_once()
-        self.step(None, 32)
         self.shutdown.assert_not_called()
         self.assertEqual(self.guard.stage, "reboot")
-        self.step(95, 33)
-        self.shutdown.assert_called_once()
+        self.step(None, 2)
+        self.step(95, 3)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_called_once()
+        self.assertEqual(self.guard.stage, "reboot")
 
     def test_incident_persist_is_retried_until_present(self):
         real = C.record_acpi_boot

@@ -655,7 +655,7 @@ before that reboot do not come back by themselves:
   oneshot unit can apply it again if you need the lock.
 - A multi-node workload can lose the pair when one node reboots. The fan
   watchdog still reboots only the machine whose fans stopped or whose floor
-  is foreign, or whose ACPI thermal incident has reached verified cool recovery.
+  is foreign, or whose ACPI thermal incident has a confirmed stopped workload.
 
 For ACPI incident recovery, do not automatically restart the workload. The
 incident latch must be inspected and explicitly reset after reboot; external
@@ -669,9 +669,10 @@ or an HTTP API. Root jobs and system services are not killed directly.
 **Warning:** on EC 3.5.8 ACPI holds replace the stock EC curve until reboot,
 even at level 100. Do not hold them under sustained full load. The independent
 watchdog must be active before these commands write; it forces 100 at 80 C,
-stops work at 85 C, kills at 90 C or timeout, and shuts down at 95 C or the
-post-kill cooling timeout. Verified stopped/cool recovery reboots, with a
-persistent manual-reset incident latch; it never restarts the workload.
+stops work at 85 C, and kills at 90 C or timeout. A confirmed stop reboots
+immediately. Shutdown at 95 C is only for an unverified stop or a failed
+reboot, not for residual heat after a reboot was accepted. The incident
+latch survives that reboot; the tool never restarts the workload.
 See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 
 

@@ -73,12 +73,12 @@ ACPI_THERMAL_SHUTDOWN_C=95
 ACPI_THERMAL_HOOK_SECONDS=10
 ACPI_THERMAL_TERM_SECONDS=10
 ACPI_THERMAL_KILL_SECONDS=5
-ACPI_THERMAL_COOL_SECONDS=30
 ACPI_THERMAL_HYSTERESIS_C=2
 # Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
+# Shutdown is the failure path. A confirmed stop reboots immediately.
 ACPI_THERMAL_SHUTDOWN=yes
 # Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
-# A successful cool recovery reboots; jobs are never restarted by this tool.
+# A confirmed stop reboots with no cool-down wait. Jobs are never restarted.
 # Incident latch survives reboot; reset explicitly with acpi-incident-reset.
 ACPI_THERMAL_STOP_HOOK=
 # These additional targets never bypass root/system-process exclusions.

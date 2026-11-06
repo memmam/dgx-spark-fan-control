@@ -212,27 +212,32 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    Otherwise, after **10 seconds** following SIGTERM, send SIGKILL if a
    selected process is still alive or the hottest zone remains at least
    **83 C**. Newly discovered compute processes are included.
-4. **95 C**, or still at least **83 C** **5 seconds** after SIGKILL:
-   request clean shutdown with `systemctl poweroff`. At 95 C the stop/kill
-   stages and shutdown execute in the same poll without waiting for graces.
-   Failed shutdown requests are logged and retried. Shutdown is enabled
-   unless explicitly disabled in configuration. An unreadable hottest zone
-   while an ACPI hold is armed and the fans are spinning or unknown is
-   treated conservatively as the final threshold; this can stop work and
-   shut down the machine. A verified true zero (both tachometers at 0 RPM)
-   does not: an unreadable zone stays on the existing true-zero rule, which
-   does not power off without a readable zone at or above 85 C.
-5. **Successful recovery:** once the hottest zone stays below **78 C**
-   continuously for **30 seconds**, verify there are no remaining selected,
+4. **Confirmed stop:** as soon as the workload is verified stopped, whether
+   the hook, SIGTERM, or SIGKILL did it, request `systemctl reboot` to
+   restore EC control. There is no 30 second wait and no requirement that
+   the zone first fall below 78 C. Verification means no remaining selected,
    GPU-compute, or configured target processes, no protected live targets,
-   and no failed/ambiguous compute query. Then request `systemctl reboot`
-   to restore EC control. Failed recovery reboots are retried while cool;
-   continued heat still takes the shutdown path. After that reboot command
-   has been accepted, an unreadable sample does not replace it with
-   poweroff; a later finite reading at or above STOP does. This is not a
-   re-arm rule. During a latched incident, legacy cold-stall/foreign-floor
-   reboot paths cannot bypass this recovery verification; the hot true-zero
-   shutdown still takes precedence.
+   and no failed or ambiguous compute query. The reboot is requested on that
+   verifying poll, including when the zone is still at the shutdown ceiling.
+   A failed reboot is retried. If it fails while the zone is already at the
+   shutdown ceiling, the failure path below takes over.
+5. **Last-resort shutdown,** not the normal result of a kill: `systemctl
+   poweroff` runs only when the stop still cannot be verified, or the
+   recovery reboot failed, and heat is uncontrolled. Uncontrolled means the
+   zone is at **95 C**, or it is still at least **83 C** **5 seconds** after
+   SIGKILL. The poll that sends SIGKILL does not also power off; the next
+   poll can see that the processes exited and reboot instead. An accepted
+   reboot is not replaced by poweroff because the zone is still hot or the
+   next sample is missing. Failed shutdown requests are logged and retried.
+   Shutdown is enabled unless explicitly disabled. An unreadable hottest
+   zone while an ACPI hold is armed and the fans are spinning or unknown is
+   treated as the final threshold for this failure path. A verified true
+   zero (both tachometers at 0 RPM) does not use it: an unreadable zone
+   stays on the existing true-zero rule, which does not power off without a
+   readable zone at or above 85 C. This is not a re-arm rule. During a
+   latched incident, legacy cold-stall/foreign-floor reboot paths cannot
+   bypass this recovery verification; the hot true-zero shutdown still
+   takes precedence.
 
 The incident latch survives reboot. It inhibits `acpi-max`, the sweep,
 stall-repair ACPI writes, daemon curve startup, boot restoration of a manual
@@ -275,12 +280,11 @@ explicitly when customizing. Missing keys use these defaults:
 | `ACPI_THERMAL_MAX_C` | `80` | Force and latch level 100 |
 | `ACPI_THERMAL_STOP_C` | `85` | Hook/SIGTERM threshold |
 | `ACPI_THERMAL_KILL_C` | `90` | Immediate SIGKILL threshold |
-| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Immediate post-kill shutdown threshold |
-| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Hook cooling grace |
-| `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace |
-| `ACPI_THERMAL_KILL_SECONDS` | `5` | Post-kill cooling grace |
-| `ACPI_THERMAL_COOL_SECONDS` | `30` | Continuous cool verification before recovery reboot |
-| `ACPI_THERMAL_HYSTERESIS_C` | `2` | STOP minus this is adequate emergency cooling; MAX minus this is recovery/reset temperature |
+| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Last-resort poweroff ceiling when the stop is unverified or reboot failed |
+| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Hook cooling grace before SIGTERM, unless the workload is already confirmed stopped |
+| `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace before SIGKILL |
+| `ACPI_THERMAL_KILL_SECONDS` | `5` | Grace after SIGKILL before last-resort shutdown if the stop is still unverified |
+| `ACPI_THERMAL_HYSTERESIS_C` | `2` | STOP minus this is adequate hook cooling; MAX minus this is the manual reset temperature. Not a reboot delay |
 | `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this new shutdown stage, not true-zero poweroff or recovery reboot |
 | `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable/script plus arguments, parsed with `shlex`, **not a shell expression** |
 | `ACPI_THERMAL_PIDS` | empty | Additional comma/space-separated PIDs |

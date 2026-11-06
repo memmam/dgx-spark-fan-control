@@ -4504,8 +4504,10 @@ class AcpiThermalGuard:
 
     Dependency injection keeps every destructive operation fake in tests.
     Max fan level is latched until reboot. An incident persists across reboot
-    until manual reset. Verified stopped work and 30 seconds below MAX minus
-    hysteresis request a clean reboot, never an automatic workload restart.
+    until manual reset. A confirmed stop reboots immediately to restore the
+    EC curve. There is no cool-down wait and no automatic workload restart.
+    Shutdown is only the failure path when the stop cannot be verified, the
+    recovery reboot fails, or heat stays uncontrolled after that.
     """
     def __init__(self, defaults, *, targets=None, send=None, hook=None, shutdown=None, reboot=None):
         self.defaults = defaults
@@ -4516,7 +4518,8 @@ class AcpiThermalGuard:
         self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
         self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
         self.kill_s = self.number("ACPI_THERMAL_KILL_SECONDS", 5)
-        self.cool_s = self.number("ACPI_THERMAL_COOL_SECONDS", 30)
+        # ACPI_THERMAL_COOL_SECONDS is ignored. Recovery does not wait for a
+        # temperature hold; a confirmed stop reboots on the verifying poll.
         self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
         if not 35 <= self.fan_c < self.stop_c < self.kill_c < self.shutdown_c <= 100:
             raise ValueError("ACPI thermal thresholds must satisfy 35 <= MAX < STOP < KILL < SHUTDOWN <= 100")
@@ -4535,7 +4538,6 @@ class AcpiThermalGuard:
         self.blocked_targets = set()
         self.stage = "incident" if acpi_record_current(ACPI_INCIDENT_NAME) else "idle"
         self.since = 0.0
-        self.cool_since = None
         self.hook_process = None
         self.selected = {}
         self.max_logged = False
@@ -4724,9 +4726,8 @@ class AcpiThermalGuard:
         # A failed persist must be retried before this poll decides to reboot.
         self.ensure_incident_latched()
         if hot is None or not math.isfinite(hot):
-            # systemctl reboot has already been accepted. A missing sample
-            # must not turn that recovery into poweroff. A later finite
-            # reading at or above STOP still re-enters the stop path.
+            # An accepted recovery reboot stands. A missing sample must not
+            # turn it into poweroff, and neither must residual heat.
             if self.stage == "reboot":
                 LOG.critical(
                     "ACPI thermal: hottest zone unreadable after recovery "
@@ -4749,24 +4750,20 @@ class AcpiThermalGuard:
             if not self.max_logged:
                 LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; forcing level 100; EC curve remains replaced", hot, self.fan_c)
                 self.max_logged = True
-        if hot < self.fan_c - self.hysteresis:
-            if self.cool_since is None:
-                self.cool_since = now
-            if (now - self.cool_since >= self.cool_s
-                    and self.stage not in ("idle", "reboot", "shutdown")
-                    and acpi_record_current(ACPI_INCIDENT_NAME)):
-                remaining = targets()
-                survivors = any(self.identity(p) == ident for p, ident in self.selected.items())
-                if not remaining and not survivors and not self.blocked_targets and self.discovery_complete:
-                    self.finish_hook()
-                    LOG.critical("ACPI thermal: workload stopped and hottest zone below %.1fC for %.0fs; running systemctl reboot to restore EC control; incident remains latched", self.fan_c - self.hysteresis, self.cool_s)
-                    if self.reboot() == 0:
-                        self.stage = "reboot"
-                    else:
-                        LOG.critical("ACPI thermal: recovery reboot failed; retrying while cool")
-        else:
-            self.cool_since = None
-        if self.stage in ("incident", "reboot") and hot >= self.stop_c:
+        if self.stage == "reboot":
+            return
+
+        def stopped():
+            remaining = targets()
+            survivors = any(
+                self.identity(pid) == ident for pid, ident in self.selected.items()
+            )
+            return (
+                not remaining and not survivors and not self.blocked_targets
+                and self.discovery_complete
+            )
+
+        if self.stage == "incident" and hot >= self.stop_c and not stopped():
             self.stage = "idle"
         if self.stage == "idle" and hot >= self.stop_c:
             try:
@@ -4798,6 +4795,7 @@ class AcpiThermalGuard:
             self.selected = targets()
             self.send(self.selected, signal.SIGTERM)
             self.stage, self.since = "term", now
+        entered_kill = False
         if self.stage == "term" and (now - self.since >= self.term_s or hot >= self.kill_c):
             live = targets()
             survivors = {p: ident for p, ident in self.selected.items()
@@ -4809,18 +4807,49 @@ class AcpiThermalGuard:
                 LOG.critical("ACPI thermal: load survived or insufficient cooling; SIGKILL workload targets")
                 self.send(live, signal.SIGKILL)
                 self.stage, self.since = "kill", now
-        if self.stage == "kill" and (hot >= self.shutdown_c or
-                (now - self.since >= self.kill_s and hot >= self.stop_c - self.hysteresis)):
-            if self.shutdown_enabled:
-                LOG.critical("ACPI thermal: cooling failed after SIGKILL (%.1fC); running systemctl poweroff", hot)
-                status = self.shutdown()
-                if status != 0:
-                    LOG.critical("ACPI thermal: poweroff failed (%s); will retry next poll", status)
-                else:
-                    self.stage = "shutdown"
-            elif self.stage != "disabled":
-                LOG.critical("ACPI thermal: shutdown explicitly disabled; machine remains hot at %.1fC", hot)
-                self.stage = "disabled"
+                # The target snapshot was taken before this signal. Do not
+                # power off in this same poll; the next one can see the stop.
+                entered_kill = True
+        if (self.stage not in ("idle", "reboot", "shutdown")
+                and acpi_record_current(ACPI_INCIDENT_NAME) and stopped()):
+            self.finish_hook()
+            LOG.critical(
+                "ACPI thermal: workload confirmed stopped; running systemctl "
+                "reboot to restore EC control; incident remains latched"
+            )
+            status = self.reboot()
+            if status == 0:
+                self.stage = "reboot"
+            else:
+                LOG.critical("ACPI thermal: recovery reboot failed (%s)", status)
+                if hot >= self.shutdown_c:
+                    self._last_resort_shutdown(hot, "recovery reboot failed")
+        elif (self.stage == "kill" and not entered_kill and (
+                hot >= self.shutdown_c or (
+                    now - self.since >= self.kill_s
+                    and hot >= self.stop_c - self.hysteresis))):
+            # Still not confirmed stopped. Heat at the ceiling, or still
+            # elevated after the post-kill grace, is the failure path.
+            self._last_resort_shutdown(hot, "workload stop not verified")
+
+    def _last_resort_shutdown(self, hot, reason):
+        if self.stage in ("reboot", "shutdown"):
+            return
+        if not self.shutdown_enabled:
+            LOG.critical(
+                "ACPI thermal: shutdown explicitly disabled; machine remains hot at %.1fC (%s)",
+                hot, reason,
+            )
+            self.stage = "disabled"
+            return
+        LOG.critical(
+            "ACPI thermal: %s (%.1fC); running systemctl poweroff", reason, hot,
+        )
+        status = self.shutdown()
+        if status != 0:
+            LOG.critical("ACPI thermal: poweroff failed (%s); will retry next poll", status)
+        else:
+            self.stage = "shutdown"
 
 
 def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WATCHDOG_ZERO_FAN_CELSIUS):
