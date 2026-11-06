@@ -75,7 +75,8 @@ ACPI_THERMAL_TERM_SECONDS=10
 ACPI_THERMAL_KILL_SECONDS=5
 ACPI_THERMAL_HYSTERESIS_C=2
 # Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
-# Shutdown is the failure path. A confirmed stop reboots immediately.
+# Phase 1: a confirmed stop reboots immediately and does not power off.
+# Phase 2: there is no reboot. Shutdown is only after the post-stop watch.
 ACPI_THERMAL_SHUTDOWN=yes
 # Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
 # A confirmed stop reboots with no cool-down wait. That reboot restores the

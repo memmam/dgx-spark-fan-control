@@ -2465,10 +2465,6 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         boot_id = read_boot_id()
     if record is None:
         record = os.geteuid() == 0
-    # Post-boot resume is separate from restoring the EC curve. Only a
-    # recording health run (the boot unit) may start the optional hook, once.
-    if record and not defaults_denied:
-        maybe_run_acpi_resume_hook(defaults, state_dir=state_dir)
     # Plain health does not rewrite these files. It does unlink a record whose
     # only reason is unsupported firmware. If that unlink is denied, the
     # bytes stay and the display treats them as dismissed.
@@ -2614,6 +2610,17 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
     if stored_hint:
         print(f"stored health note: {stored_hint}", flush=True)
     print("recorded: yes" if record else "recorded: no", flush=True)
+    # Resume only after this recording run passed, and only when the zone is
+    # still below the stop threshold. A phase-2 stop already recorded for
+    # this boot skips the hook inside maybe_run_acpi_resume_hook.
+    if record and not defaults_denied and not problems:
+        try:
+            hottest = read_hottest_temperature_c(thermal_root)
+        except (OSError, RuntimeError, ValueError):
+            hottest = None
+        maybe_run_acpi_resume_hook(
+            defaults, state_dir=state_dir, health_ok=True, hottest_c=hottest,
+        )
     return 0 if not problems else 1
 
 
@@ -3155,7 +3162,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 foreign_rpms = None
             busy, busy_how = sample_work(now, foreign_rpms, hottest)
             if (busy_how != "startup-grace" and held >= reboot_seconds
-                    and not acpi_record_current(ACPI_INCIDENT_NAME)):
+                    and not acpi_incident_latched()):
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
                     marker is not None and boot_id is not None and marker[0] != boot_id
@@ -3405,7 +3412,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                     recover_fan_stall(thermal_root, module_loaded=loaded)
             busy, busy_how = sample_work(now, fan_rpms, hottest)
             if (busy_how != "startup-grace" and held >= reboot_seconds
-                    and not acpi_record_current(ACPI_INCIDENT_NAME)):
+                    and not acpi_incident_latched()):
                 if busy:
                     detail = (
                         "a GPU job is running and the fans are still at 0 RPM"
@@ -3878,6 +3885,8 @@ def write_acpi_fan_level(device: Path, level: int) -> None:
         maximum = int((device / "max_state").read_text(encoding="ascii").strip())
         if level > maximum:
             raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
+        if acpi_protection_phase() == "ec":
+            raise RuntimeError("EC-only phase refuses ACPI writes")
         if level < ACPI_MAX_LEVEL and acpi_record_current(ACPI_MAX_NAME):
             raise RuntimeError("ACPI thermal level 100 is latched until reboot; refusing lower level")
         (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
@@ -4398,6 +4407,7 @@ ACPI_HOLD_NAME = "acpi-hold-boot"
 ACPI_MAX_NAME = "acpi-max-boot"
 ACPI_INCIDENT_NAME = "acpi-incident"
 ACPI_PHASE_NAME = "acpi-phase"
+ACPI_EC_STOP_NAME = "acpi-ec-stop"
 ACPI_RESUME_NAME = "acpi-resume-boot"
 ACPI_RESUME_TIMEOUT_SECONDS = 30.0
 
@@ -4423,6 +4433,10 @@ def reset_acpi_incident(thermal_root):
     phase = STALL_MARKER_DIR / ACPI_PHASE_NAME
     if phase.exists():
         phase.unlink()
+    try:
+        _fsync_existing(STALL_MARKER_DIR)
+    except OSError as exc:
+        LOG.warning("ACPI incident reset: directory sync failed: %s", exc)
     LOG.warning("ACPI incident reset explicitly; no fan level written and no job/service started")
 
 
@@ -4489,23 +4503,55 @@ def record_acpi_boot(name: str, state_dir: Path | None = None) -> None:
         _DURABLE_ACPI_RECORDS.add(key)
 
 
+def _phase_file_ec_boot(state_dir: Path) -> str | None:
+    """incident_boot from acpi-phase when it records phase=ec, else None.
+
+    The incident file's boot id is what selects the phase. This file records
+    the same reboot request for operators and for reset. It does not by itself
+    enable EC-only monitoring.
+    """
+    try:
+        text = (state_dir / ACPI_PHASE_NAME).read_text(encoding="ascii")
+    except OSError:
+        return None
+    phase = None
+    incident_boot = None
+    for line in text.splitlines():
+        if line.startswith("phase="):
+            phase = line.split("=", 1)[1].strip()
+        elif line.startswith("incident_boot="):
+            incident_boot = line.split("=", 1)[1].strip()
+    if phase != "ec" or not incident_boot:
+        return None
+    return incident_boot
+
+
 def acpi_protection_phase(state_dir: Path | None = None) -> str:
     """acpi while this boot holds or owns the incident; ec after that reboot.
 
-    off means no ACPI incident is active. ec is second-stage protection:
-    stock EC control stays in place, and this phase must not write cur_state.
+    The incident file's boot id selects the phase. ``acpi-phase`` records the
+    phase-1 reboot request (``phase=ec`` and ``incident_boot``). It does not
+    override the incident file and does not enable monitoring by itself.
+    A missing boot id does not select acpi, because that phase may force
+    level 100. A surviving incident latch then stays on the no-write path.
     """
     directory = state_dir or STALL_MARKER_DIR
     boot = read_boot_id()
-    if not boot:
+    hold = _acpi_record_boot(ACPI_HOLD_NAME, directory)
+    incident = _acpi_record_boot(ACPI_INCIDENT_NAME, directory)
+    phase_boot = _phase_file_ec_boot(directory)
+    if boot and (hold == boot or incident == boot):
+        return "acpi"
+    if not acpi_incident_latched(directory):
         return "off"
-    if _acpi_record_boot(ACPI_HOLD_NAME, directory) == boot:
-        return "acpi"
-    if _acpi_record_boot(ACPI_INCIDENT_NAME, directory) == boot:
-        return "acpi"
-    if acpi_incident_latched(directory):
-        return "ec"
-    return "off"
+    if phase_boot and boot and phase_boot != incident and incident not in (None, boot):
+        LOG.error(
+            "acpi-phase incident_boot=%s disagrees with acpi-incident %s; "
+            "the incident file selects the phase",
+            phase_boot, incident,
+        )
+    # Latch present, and this boot does not own it (or the boot id is unknown).
+    return "ec"
 
 
 def mark_ec_protection_phase(state_dir: Path | None = None) -> None:
@@ -4533,15 +4579,53 @@ def _acpi_record_boot(name: str, state_dir: Path) -> str | None:
     return text or None
 
 
+def _kill_resume_group(process) -> None:
+    """Kill a timed-out resume hook and its session, if the leader is still ours."""
+    fd = None
+    try:
+        fd = os.pidfd_open(process.pid)
+    except (OSError, AttributeError):
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError as exc:
+        LOG.error("ACPI resume hook: process-group kill failed: %s", exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _run_resume_hook(argv, env) -> int:
+    process = subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        return process.wait(timeout=ACPI_RESUME_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_resume_group(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+
+
 def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
                                state_dir: Path | None = None,
-                               runner=None) -> str:
+                               runner=None,
+                               health_ok: bool = False,
+                               hottest_c: float | None = None) -> str:
     """Optionally resume work after the reboot that restored EC control.
 
     Disabled unless ACPI_THERMAL_RESUME_HOOK is set. The hook is the user's
     command; this does not reconstruct a killed command line. It runs at most
-    once per boot, and only when the incident file is from an earlier boot, so
-    ACPI writes are still inhibited and this boot has not armed a new hold.
+    once per boot, only after health has passed, the zone is below the stop
+    threshold, and this boot's EC-only stop ladder has not already started.
     The incident latch is left in place.
     """
     command = defaults.get("ACPI_THERMAL_RESUME_HOOK", "").strip()
@@ -4560,6 +4644,16 @@ def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
         return "skipped-same-boot"
     if _acpi_record_boot(ACPI_HOLD_NAME, directory) == boot:
         return "skipped-acpi-hold"
+    if _acpi_record_boot(ACPI_EC_STOP_NAME, directory) == boot:
+        return "skipped-thermal-stop"
+    if not health_ok:
+        return "skipped-health"
+    try:
+        stop_c = float(defaults.get("ACPI_THERMAL_STOP_C", 85))
+    except (TypeError, ValueError):
+        stop_c = 85.0
+    if hottest_c is None or not math.isfinite(hottest_c) or hottest_c >= stop_c:
+        return "skipped-temperature"
     if _acpi_record_boot(ACPI_RESUME_NAME, directory) == boot:
         return "already"
     try:
@@ -4582,16 +4676,7 @@ def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
         "DGX_ACPI_RESUME_BOOT": boot,
     })
     if runner is None:
-        def runner(hook_argv, hook_env):
-            completed = subprocess.run(
-                hook_argv,
-                env=hook_env,
-                timeout=ACPI_RESUME_TIMEOUT_SECONDS,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return completed.returncode
+        runner = _run_resume_hook
     LOG.critical(
         "ACPI resume hook starting once for boot %s; incident from boot %s "
         "still blocks ACPI writes; the killed command is not relaunched",
@@ -4948,7 +5033,18 @@ class AcpiThermalGuard:
         if self.stage == "incident" and hot >= self.stop_c and not stopped():
             self.stage = "idle"
         if self.stage == "idle" and hot >= self.stop_c:
-            if not ec_only:
+            if ec_only:
+                # Before any signal, so a concurrent health --record cannot
+                # resume a job this phase has already started to stop.
+                try:
+                    record_acpi_boot(ACPI_EC_STOP_NAME)
+                except (OSError, RuntimeError) as exc:
+                    LOG.error(
+                        "EC-only phase: cannot record thermal stop; "
+                        "resume remains possible until the marker is written: %s",
+                        exc,
+                    )
+            else:
                 try:
                     record_acpi_boot(ACPI_INCIDENT_NAME)
                 except (OSError, RuntimeError) as exc:

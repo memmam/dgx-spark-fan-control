@@ -662,8 +662,10 @@ job. The incident latch blocks another ACPI hold until
 `acpi-incident-reset`; it does not forbid resuming work under that restored
 EC curve. A non-checkpointable job does not continue unless the workload
 manager, or the optional `ACPI_THERMAL_RESUME_HOOK`, knows how to start it
-again. That hook is empty by default and runs at most once from the boot
-health unit. See [optional resume](ec-curve.md#optional-resume-after-the-next-boot).
+again. That hook is empty by default. The boot health unit runs it at most
+once, and only after that health run passes, the zone is below 85 C, and
+this boot has not already started a phase-2 thermal stop. See
+[optional resume](ec-curve.md#optional-resume-after-the-next-boot).
 The stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
 system bus, and it cannot open a network connection to Kubernetes, Slurm,
 or an HTTP API. Root jobs and system services are not killed directly.

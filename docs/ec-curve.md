@@ -225,8 +225,12 @@ All thresholds refer to the **hottest thermal zone**, never the burn view:
    result of a successful stop. The poll that sends SIGKILL does not also
    power off.
 5. **Phase 2, the next boot:** the incident file still names the previous
-   boot, so monitoring continues with **no ACPI writes**. Level 100 is not
-   forced at 80 C. The stock EC curve stays in place. The optional resume
+   boot, so monitoring continues with **no ACPI writes**. `acpi-phase`
+   records that phase 1 requested this reboot. The incident file selects
+   the phase; the phase file does not override it, and the phase file alone
+   does not enable monitoring. If the boot id cannot be read, a surviving
+   incident latch stays on this no-write path. Level 100 is not forced at
+   80 C. The stock EC curve stays in place. The optional resume
    hook may run once. If the zone again reaches 85 C, stop the workload
    with the same hook, SIGTERM, and SIGKILL ladder. After that stop is
    confirmed, watch the temperature. There is no second reboot and no
@@ -263,16 +267,21 @@ does not assume the job can be checkpointed. A non-checkpointable job does
 not continue; only this hook, or the workload manager the hook calls, can
 start work again.
 
-That boot is phase 2. `dgx-fan-health.service` (`health --record`) is what
-runs the hook, once, at the start of it. EC-only monitoring then continues.
-A later thermal stop in phase 2 does not reboot and does not run the hook
-again. A plain `health` run does not start it. The hook is skipped unless
-every one of these is true:
+That boot is phase 2. `dgx-fan-health.service` (`health --record`) may run
+the hook once, only after that health run has passed and the hottest zone
+is below 85 C. If the watchdog has already entered the phase-2 stop ladder
+on this boot, the hook does not run, so it cannot start a job that was
+stopped for heat. The watchdog starts at sysinit; health starts later, and
+the stop is recorded before any signal. A later thermal stop does not
+reboot and does not run the hook again. A plain `health` run, or a failed
+one, does not start it. The hook is skipped unless every one of these is true:
 
 - the command is set, and this process is root
+- this `health --record` run passed, and the hottest zone is below the stop threshold
 - `/var/lib/dgx-fan-control/acpi-incident` exists and names an **earlier**
   boot, so this is a new boot and ACPI writes are still inhibited
 - this boot has not armed an ACPI hold
+- this boot has not already entered the phase-2 stop ladder
 - this boot has not already attempted the hook
 
 The attempt is recorded **before** the command starts. A failure, a timeout

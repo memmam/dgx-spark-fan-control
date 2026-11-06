@@ -560,14 +560,18 @@ class ThermalTests(unittest.TestCase):
         with patch.object(C, "read_boot_id", return_value="next-boot"), \
              patch.object(C.os, "geteuid", return_value=0):
             self.assertEqual(
-                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "ran",
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40.0,
+                ), "ran",
             )
             self.assertEqual(calls[0][0], ["/opt/resume-job", "--once"])
             self.assertEqual(calls[0][1]["DGX_ACPI_INCIDENT_BOOT"], "test-boot")
             self.assertEqual(calls[0][1]["DGX_ACPI_RESUME_BOOT"], "next-boot")
             self.assertTrue(C.acpi_incident_latched())
             self.assertEqual(
-                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "already",
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40.0,
+                ), "already",
             )
         self.assertEqual(len(calls), 1)
 
@@ -596,10 +600,14 @@ class ThermalTests(unittest.TestCase):
             )
             (C.STALL_MARKER_DIR / C.ACPI_HOLD_NAME).unlink()
             self.assertEqual(
-                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "failed",
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40.0,
+                ), "failed",
             )
             self.assertEqual(
-                C.maybe_run_acpi_resume_hook(defaults, runner=runner), "already",
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40.0,
+                ), "already",
             )
         self.assertEqual(len(calls), 1)
 
@@ -607,14 +615,18 @@ class ThermalTests(unittest.TestCase):
         thermal, hwmon = self.fake_fans(40000)
         calls = []
 
-        def health(record):
+        def health(record, healthy):
             with patch.object(
                 C, "maybe_run_acpi_resume_hook",
-                side_effect=lambda *args, **kwargs: calls.append(record) or "disabled",
+                side_effect=lambda *args, **kwargs: calls.append(kwargs) or "disabled",
+            ), patch.object(
+                C, "collect_health_checks",
+                return_value=[] if healthy else ["module: fail"],
             ):
                 return C.run_health(
                     thermal, hwmon, record=record, settle_seconds=0,
-                    defaults={}, state_dir=C.STALL_MARKER_DIR,
+                    defaults={"ACPI_THERMAL_RESUME_HOOK": "/opt/resume-job"},
+                    state_dir=C.STALL_MARKER_DIR,
                     observer=lambda: {
                         "service_active": "inactive",
                         "service_enabled": "disabled",
@@ -626,10 +638,193 @@ class ThermalTests(unittest.TestCase):
                     notify=lambda *_: None,
                 )
 
-        health(False)
+        health(False, True)
         self.assertEqual(calls, [])
-        health(True)
-        self.assertEqual(calls, [True])
+        health(True, False)
+        self.assertEqual(calls, [])
+        health(True, True)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["health_ok"])
+        self.assertLess(calls[0]["hottest_c"], 85)
+
+    def test_resume_skips_failed_health_heat_and_a_stop_already_under_way(self):
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        calls = []
+        defaults = {"ACPI_THERMAL_RESUME_HOOK": "/opt/resume-job"}
+
+        def runner(argv, env):
+            calls.append(argv)
+            return 0
+
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.os, "geteuid", return_value=0):
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=False, hottest_c=40,
+                ), "skipped-health",
+            )
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=90,
+                ), "skipped-temperature",
+            )
+            C.record_acpi_boot(C.ACPI_EC_STOP_NAME)
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40,
+                ), "skipped-thermal-stop",
+            )
+        self.assertEqual(calls, [])
+
+    def test_phase2_stop_preserves_boot_id_and_blocks_a_later_resume(self):
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        calls = []
+
+        def runner(argv, env):
+            calls.append(argv)
+            return 0
+
+        defaults = {"ACPI_THERMAL_RESUME_HOOK": "/opt/resume-job"}
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.os, "geteuid", return_value=0):
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40,
+                ), "ran",
+            )
+            self.guard.step(85, 0, self.maximum, ec_only=True)
+            self.assertEqual(
+                (C.STALL_MARKER_DIR / C.ACPI_INCIDENT_NAME).read_text().strip(),
+                "test-boot",
+            )
+            self.assertEqual(
+                (C.STALL_MARKER_DIR / C.ACPI_EC_STOP_NAME).read_text().strip(),
+                "next-boot",
+            )
+            self.reboot.assert_not_called()
+            self.assertEqual(
+                C.maybe_run_acpi_resume_hook(
+                    defaults, runner=runner, health_ok=True, hottest_c=40,
+                ), "skipped-thermal-stop",
+            )
+        self.assertEqual(len(calls), 1)
+        self.maximum.assert_not_called()
+
+    def test_phase2_post_stop_timer_shuts_down_without_one_sample_at_the_ceiling(self):
+        self.targets.return_value = {}
+        self.guard.step(85, 0, self.maximum, ec_only=True)
+        self.assertEqual(self.guard.stage, "ec-watch")
+        self.guard.step(84, 4, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(84, 5, self.maximum, ec_only=True)
+        self.shutdown.assert_called_once()
+        self.reboot.assert_not_called()
+
+    def test_phase2_true_zero_powers_off_without_an_acpi_write(self):
+        thermal, hwmon = self.fake_fans(85000)
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        for sensor in hwmon.glob("hwmon*"):
+            (sensor / "fan1_input").write_text("0")
+        power = __import__("unittest").mock.Mock(return_value=0)
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C.signal, "signal"), \
+             patch.object(C, "run_watchdog_action",
+                          side_effect=AssertionError("ACPI policy must not power off")), \
+             patch.object(C, "gpu_job_running",
+                          side_effect=AssertionError("must not probe GPU")):
+            status = C.run_watchdog(
+                thermal, hwmon, defaults={}, runner=power,
+                unit_state=lambda: ("inactive", "disabled", 0, "success", 0),
+                notifier=lambda *_: None, monotonic=lambda: 0,
+                marker_path=C.STALL_MARKER_DIR / "true-zero-ec",
+                boot_id="next-boot",
+            )
+        self.assertEqual(status, 0)
+        power.assert_called_once_with(C.WATCHDOG_DEFAULT_ACTION)
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+
+    def test_phase2_legacy_reboot_stays_suppressed(self):
+        thermal, hwmon = self.fake_fans(40000)
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        event = __import__("unittest").mock.Mock()
+        event.is_set.side_effect = [False, True]
+        event.wait.return_value = False
+        runner = __import__("unittest").mock.Mock(return_value=0)
+        clock = iter([0, 10, 10])
+        with patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C, "Event", return_value=event), \
+             patch.object(C.signal, "signal"), \
+             patch.object(C, "observe_hot_job"), \
+             patch.object(C, "run_watchdog_action", return_value=0):
+            self.assertEqual(C.run_watchdog(
+                thermal, hwmon, defaults={}, runner=runner,
+                unit_state=lambda: ("inactive", "enabled", C.FOREIGN_FLOOR_EXIT, "exit-code", 0),
+                notifier=lambda *_: None, monotonic=lambda: next(clock),
+                marker_path=C.STALL_MARKER_DIR / "legacy-stall-ec",
+                boot_id="next-boot", gpu_jobs=lambda: False, reboot_seconds=0,
+            ), 0)
+        runner.assert_not_called()
+
+    def test_unreadable_boot_id_keeps_a_latched_incident_on_the_no_write_path(self):
+        thermal, hwmon = self.fake_fans(95000)
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        with patch.object(C, "read_boot_id", return_value=None):
+            self.assertEqual(C.acpi_protection_phase(), "ec")
+            C.poll_acpi_thermal(self.guard, thermal, hwmon, 0)
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+        self.maximum.assert_not_called()
+
+    def test_leaf_acpi_write_refuses_ec_only_phase(self):
+        thermal, _hwmon = self.fake_fans()
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        fan = C.acpi_fan_devices(thermal)[0]
+        with patch.object(C, "read_boot_id", return_value="next-boot"):
+            with self.assertRaisesRegex(RuntimeError, "EC-only"):
+                C.write_acpi_fan_level(fan, 100)
+            with self.assertRaisesRegex(RuntimeError, "EC-only"):
+                C.write_acpi_fan_level(fan, 35)
+        self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+
+    def test_phase_file_alone_does_not_select_ec_and_missing_file_still_does(self):
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        (C.STALL_MARKER_DIR / C.ACPI_PHASE_NAME).write_text(
+            "phase=ec\nincident_boot=other-boot\n", encoding="ascii",
+        )
+        with patch.object(C, "read_boot_id", return_value="next-boot"):
+            self.assertEqual(C.acpi_protection_phase(), "ec")
+            (C.STALL_MARKER_DIR / C.ACPI_INCIDENT_NAME).unlink()
+            self.assertEqual(C.acpi_protection_phase(), "off")
+
+    def test_reset_syncs_the_state_directory(self):
+        thermal, _hwmon = self.fake_fans(70000)
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        (C.STALL_MARKER_DIR / C.ACPI_PHASE_NAME).write_text(
+            "phase=ec\nincident_boot=test-boot\n", encoding="ascii",
+        )
+        with patch.object(C.os, "geteuid", return_value=0), \
+             patch.object(C, "read_boot_id", return_value="next-boot"), \
+             patch.object(C, "read_defaults", return_value={}), \
+             patch.object(C, "_fsync_existing") as sync:
+            C.reset_acpi_incident(thermal)
+        sync.assert_any_call(C.STALL_MARKER_DIR)
+
+    def test_resume_timeout_kills_the_hook_process_group(self):
+        process = __import__("unittest").mock.Mock()
+        process.pid = 4242
+        process.wait.side_effect = [subprocess.TimeoutExpired(cmd="resume", timeout=30), 0]
+        with patch.object(C.subprocess, "Popen", return_value=process), \
+             patch.object(C.os, "pidfd_open", return_value=9) as opened, \
+             patch.object(C.os, "killpg") as killpg, \
+             patch.object(C.os, "close") as close, \
+             patch.object(C.os, "kill") as kill:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                C._run_resume_hook(["/opt/resume-job"], {})
+        opened.assert_called_once_with(4242)
+        killpg.assert_called_once_with(4242, signal.SIGKILL)
+        close.assert_called_once_with(9)
+        kill.assert_not_called()
 
     def test_ec_only_phase_never_writes_acpi_and_shuts_down_only_after_the_stop(self):
         thermal, hwmon = self.fake_fans(80000)
