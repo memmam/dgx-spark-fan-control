@@ -53,6 +53,12 @@ WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
 CHECK_TIMEOUT_SECONDS = 5.0
+# Built-in GPU sample. A restart can make nvidia-smi fail once and then
+# succeed, so try twice more before calling the sample a gap. The bound is
+# 2s per try plus 0.5s and 1s of backoff, not three full check timeouts.
+NVIDIA_SMI_ATTEMPTS = 3
+NVIDIA_SMI_BACKOFF_SECONDS = (0.5, 1.0)
+NVIDIA_SMI_TIMEOUT_SECONDS = 2.0
 # fwupd ESRT GUID for the DGX Spark embedded controller. The device name is
 # "UEFI Device Firmware", shared with the SoC and other entries. This GUID
 # and a 0x03xxxxxx version identify the EC.
@@ -817,28 +823,88 @@ def process_cpu_ticks(pid: int) -> int | None:
         return None
 
 
+def _nvidia_smi_snippet(text: str) -> str:
+    """One short ASCII line from nvidia-smi stderr, or empty."""
+    line = ""
+    for candidate in (text or "").splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    cleaned = " ".join(line.split())
+    return cleaned.encode("ascii", "replace").decode("ascii")[:80]
+
+
+def run_nvidia_smi(args: list[str], *, sleeper=None,
+                   timeout: float = NVIDIA_SMI_TIMEOUT_SECONDS):
+    """Run nvidia-smi, retrying a transient failure twice.
+
+    Returns (completed, None) on exit 0. Otherwise (None, (exit label, stderr
+    snippet)). A missing binary is not retried. The caller still treats a
+    remaining failure as a running job so a reboot is deferred.
+    """
+    if sleeper is None:
+        sleeper = time.sleep
+    code = "unknown"
+    stderr = ""
+    for attempt in range(NVIDIA_SMI_ATTEMPTS):
+        try:
+            completed = subprocess.run(
+                args, check=False, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            code, stderr = "timeout", ""
+        except FileNotFoundError as exc:
+            return None, ("missing", _nvidia_smi_snippet(str(exc)))
+        except OSError as exc:
+            code, stderr = "error", _nvidia_smi_snippet(str(exc))
+        else:
+            if completed.returncode == 0:
+                return completed, None
+            code = str(completed.returncode)
+            stderr = _nvidia_smi_snippet(completed.stderr or "")
+        if attempt + 1 < NVIDIA_SMI_ATTEMPTS:
+            sleeper(NVIDIA_SMI_BACKOFF_SECONDS[attempt])
+    return None, (code, stderr)
+
+
+def remember_nvidia_smi_failure(code: str, stderr: str) -> None:
+    run_nvidia_smi.last_failure = (code, stderr)
+
+
+def clear_nvidia_smi_failure() -> None:
+    run_nvidia_smi.last_failure = None
+
+
+def gpu_sample_gap_detail() -> str:
+    """Parenthetical for a GPU sample that failed after the short retry."""
+    failure = getattr(run_nvidia_smi, "last_failure", None)
+    code, extra = failure if failure else ("unknown", "")
+    text = (
+        f"could not sample GPU: nvidia-smi exited {code}; "
+        "transient after a restart is normal"
+    )
+    if extra:
+        text += f"; {extra}"
+    return text
+
+
 def read_builtin_progress() -> tuple[float | None, dict[int, int] | None]:
     """GPU utilization percent and per-pid CPU ticks for compute processes.
 
     None means that signal could not be read. A missing signal does not by
-    itself mean the job is stuck.
+    itself mean the job is stuck. nvidia-smi is retried briefly first.
     """
-    try:
-        util_run = subprocess.run(
-            [
-                "nvidia-smi", "--query-gpu=utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
-            check=False, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS,
-        )
-        pid_run = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-            check=False, capture_output=True, text=True, timeout=CHECK_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None, None
+    util_run, _util_failure = run_nvidia_smi(
+        [
+            "nvidia-smi", "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    pid_run, _pid_failure = run_nvidia_smi(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+    )
     util = None
-    if util_run.returncode == 0:
+    if util_run is not None and util_run.returncode == 0:
         values = []
         for line in (util_run.stdout or "").splitlines():
             token = line.strip().split()
@@ -851,7 +917,7 @@ def read_builtin_progress() -> tuple[float | None, dict[int, int] | None]:
         if values:
             util = max(values)
     ticks: dict[int, int] | None = None
-    if pid_run.returncode == 0:
+    if pid_run is not None and pid_run.returncode == 0:
         ticks = {}
         for line in (pid_run.stdout or "").splitlines():
             token = line.strip()
@@ -927,6 +993,11 @@ def format_progress(job_watch: dict[str, str]) -> str:
     if job_watch.get("unreadable") == "yes":
         return NEEDS_ROOT
     source = job_watch.get("source", "")
+    if source == "unknown":
+        # A sampling gap is not a health failure. The next good sample
+        # overwrites this file, so one transient miss does not stick.
+        gap = job_watch.get("detail", "").strip() or "could not sample GPU"
+        return f"unknown ({gap})"
     if source not in {"hook", "built-in", "off"}:
         source = "off"
     detail = job_watch.get("detail", "").strip()
@@ -956,6 +1027,7 @@ def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
         if result is False:
             return False, "busy-check"
         return True, "busy-check-failed"
+    clear_nvidia_smi_failure()
     state = gpu_jobs()
     if state is None:
         return True, "nvidia-smi-failed"
@@ -2101,20 +2173,20 @@ def show_intervention() -> None:
         print(banner, end="")
 
 
-def gpu_job_running() -> bool | None:
+def gpu_job_running(sleeper=None) -> bool | None:
     """True when nvidia-smi lists a compute pid. None when the query fails.
 
     None is treated as a running job so a missed query cannot reboot the machine.
+    A transient failure is retried before this returns None.
     """
-    try:
-        completed = subprocess.run(
-            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
-            check=False, capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    completed, failure = run_nvidia_smi(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        sleeper=sleeper,
+    )
+    if failure is not None:
+        remember_nvidia_smi_failure(failure[0], failure[1])
         return None
-    if completed.returncode != 0:
-        return None
+    clear_nvidia_smi_failure()
     return any(line.strip() for line in (completed.stdout or "").splitlines())
 
 
@@ -2204,7 +2276,7 @@ def progress_source(command: str, state: dict, busy_how: str = "") -> tuple[str,
     if command.strip():
         return "hook", "PROGRESS_CHECK"
     if busy_how == "nvidia-smi-failed":
-        return "off", "nvidia-smi failed"
+        return "unknown", gpu_sample_gap_detail()
     if busy_how == "busy-check-failed":
         return "off", "BUSY_CHECK failed"
     if state.get("busy"):
@@ -2551,7 +2623,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             note_observed_rise(hottest, now)
             busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
             if busy_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                LOG.warning(
+                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                )
                 smi_warned = True
             if busy_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
@@ -2742,7 +2816,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             note_observed_rise(spinning_hottest, now)
             spinning_busy, spinning_how = work_is_in_progress(defaults, gpu_jobs)
             if spinning_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                LOG.warning(
+                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                )
                 smi_warned = True
             if spinning_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
@@ -2799,7 +2875,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                     recover_fan_stall(thermal_root, module_loaded=loaded)
             busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
             if busy_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                LOG.warning(
+                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                )
                 smi_warned = True
             if busy_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")

@@ -84,9 +84,10 @@ records `ready=n/a`.
 
 `progress:` repeats the watchdog sample and names the reason, for example
 `off (no job running)` or `built-in (GPU utilization)`. Root and a normal
-user read that same file. A failed `nvidia-smi` is `off (nvidia-smi failed)`,
-not GPU utilization. The sample can change between two commands a few
-seconds apart because the watchdog polls it. The stuck-job line is still
+user read that same file. `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
+means a short retry still could not run nvidia-smi. It is not a fault:
+health stays healthy, and the next good sample replaces it. The watchdog
+still defers a reboot on that sample. The stuck-job line is still
 only a warning.
 
 The time is this Spark's local time, with the zone abbreviation. These

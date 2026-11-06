@@ -859,12 +859,102 @@ class UserlandFailureTests(unittest.TestCase):
                 root, rpm=(0, 0), celsius=40, gpu=lambda: None, stop_after=80,
             )
             self.assertEqual(actions, [])
-            self.assertIn("nvidia-smi failed; treating a GPU job as running", "\n".join(logs))
-            self.assertIn("deferring reboot", "\n".join(logs))
+            logged = "\n".join(logs)
+            self.assertIn(
+                "could not sample GPU: nvidia-smi exited unknown; "
+                "transient after a restart is normal",
+                logged,
+            )
+            self.assertIn("treating a GPU job as running", logged)
+            self.assertIn("deferring reboot", logged)
 
     def _gpu_failure(self):
-        with patch.object(CONTROL.subprocess, "run", side_effect=OSError("missing")):
+        with patch.object(CONTROL.subprocess, "run", side_effect=OSError("missing")), \
+             patch.object(CONTROL.time, "sleep"):
             return CONTROL.gpu_job_running()
+
+    def test_nvidia_smi_retries_then_a_good_sample_replaces_the_gap(self):
+        calls = {"n": 0}
+
+        def run(args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                return CONTROL.subprocess.CompletedProcess(args, 9, "", "not ready")
+            return CONTROL.subprocess.CompletedProcess(args, 0, "", "")
+
+        sleeps = []
+        with patch.object(CONTROL.subprocess, "run", side_effect=run), \
+             patch.object(CONTROL.time, "sleep", side_effect=sleeps.append):
+            self.assertFalse(CONTROL.gpu_job_running())
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+        self.assertIsNone(getattr(CONTROL.run_nvidia_smi, "last_failure", None))
+
+        def always_fail(args, **_kwargs):
+            return CONTROL.subprocess.CompletedProcess(
+                args, 9, "", "NVML error\nmore",
+            )
+
+        with patch.object(CONTROL.subprocess, "run", side_effect=always_fail), \
+             patch.object(CONTROL.time, "sleep"):
+            self.assertIsNone(CONTROL.gpu_job_running())
+        gap = CONTROL.gpu_sample_gap_detail()
+        self.assertEqual(
+            gap,
+            "could not sample GPU: nvidia-smi exited 9; "
+            "transient after a restart is normal; NVML error",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            CONTROL.observe_hot_job(
+                now=0.0, fan_rpms=[2700, 4050], hottest=40.0, busy=True,
+                defaults={}, state_dir=state, notifier=lambda _message: None,
+                alert_repeat=1800, zero_fan_celsius=85, stuck_seconds=600,
+                state={}, busy_how="nvidia-smi-failed",
+                builtin_reader=lambda: (None, None),
+            )
+            stored = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
+            self.assertIn("source=unknown\n", stored)
+            self.assertIn(gap, stored)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(job_watch=CONTROL.read_job_watch(state)),
+                    record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn(f"progress: unknown ({gap})", text)
+            self.assertNotIn("NEEDS INTERVENTION", text)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+
+            CONTROL.clear_nvidia_smi_failure()
+            CONTROL.observe_hot_job(
+                now=2.0, fan_rpms=[2700, 4050], hottest=40.0, busy=False,
+                defaults={}, state_dir=state, notifier=lambda _message: None,
+                alert_repeat=1800, zero_fan_celsius=85, stuck_seconds=600,
+                state={"busy": True}, busy_how="nvidia-smi",
+            )
+            replaced = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
+            self.assertIn("source=off\n", replaced)
+            self.assertIn("detail=no job running\n", replaced)
+            self.assertNotIn("could not sample GPU", replaced)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(job_watch=CONTROL.read_job_watch(state)),
+                    record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("progress: off (no job running)", text)
+            self.assertNotIn("could not sample GPU", text)
 
     def test_one_spinning_fan_does_not_reboot_or_power_off(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1377,7 +1467,8 @@ class UserlandFailureTests(unittest.TestCase):
         def timed_out(*_args, **_kwargs):
             raise CONTROL.subprocess.TimeoutExpired("cmd", CONTROL.CHECK_TIMEOUT_SECONDS)
 
-        with patch.object(CONTROL.subprocess, "run", side_effect=timed_out):
+        with patch.object(CONTROL.subprocess, "run", side_effect=timed_out), \
+             patch.object(CONTROL.time, "sleep"):
             self.assertEqual(CONTROL.systemctl_query("is-active"), "timeout")
             self.assertEqual(CONTROL.read_kernel_log(), "")
             self.assertIsNone(CONTROL.gpu_job_running())
@@ -2756,8 +2847,9 @@ class UserlandFailureTests(unittest.TestCase):
                 builtin_reader=lambda: (None, None),
             )
             failed = (state / CONTROL.JOB_WATCH_NAME).read_text(encoding="ascii")
-            self.assertIn("source=off\n", failed)
-            self.assertIn("detail=nvidia-smi failed\n", failed)
+            self.assertIn("source=unknown\n", failed)
+            self.assertIn("could not sample GPU: nvidia-smi exited", failed)
+            self.assertIn("transient after a restart is normal", failed)
             self.assertNotIn("GPU utilization", failed)
 
         with tempfile.TemporaryDirectory() as directory:

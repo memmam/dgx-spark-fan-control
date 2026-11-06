@@ -502,14 +502,18 @@ The core checks are fan and thermal only:
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention
 - `progress:` is the watchdog's last sample, with the reason:
-  `off (no job running)`, `off (nvidia-smi failed)`,
-  `off (BUSY_CHECK failed)`, `built-in (GPU utilization)`,
-  `built-in (BUSY_CHECK)`, `built-in (PROGRESS_CHECK failed)`,
-  `hook (PROGRESS_CHECK)`, or `off (no watchdog sample)`. Health does not
+  `off (no job running)`, `off (BUSY_CHECK failed)`,
+  `built-in (GPU utilization)`, `built-in (BUSY_CHECK)`,
+  `built-in (PROGRESS_CHECK failed)`, `hook (PROGRESS_CHECK)`, or
+  `off (no watchdog sample)`.
+  `unknown (could not sample GPU: nvidia-smi exited N; transient after a restart is normal)`
+  means nvidia-smi still failed after a short retry. It does not fail health
+  and does not set needs-intervention. The watchdog still treats that sample
+  as a running job and defers a reboot. The next successful sample replaces
+  the line. Health does not
   run `nvidia-smi` or `PROGRESS_CHECK` itself, so a normal user and root
   print the same line from that file. A failed probe is not called GPU
-  utilization. The watchdog still treats the failure as a running job when
-  it decides whether to reboot. No sample yet is `off (no watchdog sample)`.
+  utilization. No sample yet is `off (no watchdog sample)`.
   An unreadable sample is `unknown (needs root)`. A stuck job adds
   `job: warn (job may be stuck: ...)`, which does not fail the check and
   does not set needs-intervention
