@@ -97,7 +97,8 @@ Then follow the route you originally installed:
   DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
   in the next step or the previous CLI remains.
 
-Refresh the command, the three unit files, and the motd snippet, then load
+Refresh the command, the four unit files (control, watchdog, health, and
+manual), and the motd snippet, then load
 and check the new module. The full update steps, including when to restart
 each service, are in
 [Update the userspace](installation.md#6-update-the-userspace). Rebuild the
@@ -119,6 +120,7 @@ sudo install -D -m 0755 systemd/95-dgx-fan-control \
   /etc/update-motd.d/95-dgx-fan-control
 sudo systemctl daemon-reload
 sudo systemctl enable dgx-fan-health.service
+sudo systemctl enable dgx-fan-manual.service
 sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```

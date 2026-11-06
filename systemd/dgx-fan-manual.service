@@ -1,9 +1,11 @@
 [Unit]
 Description=Reapply the held DGX fan floor
-# Runs after the module can load and before the health check. It does not
-# start the performance curve. An empty last-set record exits without writing.
+# Runs after the module can load and before the health check. Before= orders
+# this oneshot ahead of the performance daemon when both are started. It does
+# not start that daemon. An empty last-set record exits without writing.
 After=systemd-modules-load.service
 Before=dgx-fan-health.service
+Before=dgx-fan-control.service
 
 [Service]
 Type=oneshot

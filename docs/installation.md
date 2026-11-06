@@ -237,8 +237,8 @@ sudo dgx-fan-control health --record
 
 Install the boot-load entry, the unit files, the health check, and the
 command. This enables and starts `dgx-fan-watchdog.service`, and enables
-`dgx-fan-health.service` for the next boot. It does **not** enable
-`dgx-fan-control.service`.
+`dgx-fan-health.service` and `dgx-fan-manual.service` for the next boot.
+It does **not** enable `dgx-fan-control.service`.
 
 ```sh
 sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
@@ -247,11 +247,12 @@ sudo ./scripts/install-userland
 ```
 
 The same commands by hand, without the script. Run them from the checkout.
-This installs the command, the three unit files, the motd snippet, the
-defaults file when it is absent, and the modules-load entry, then reloads
-systemd, enables the health check, and enables the watchdog. It does **not**
-enable `dgx-fan-control.service`. The defaults file is not overwritten when
-it already exists.
+This installs the command, the four unit files (control, watchdog, health,
+and manual), the motd snippet, the defaults file when it is absent, and the
+modules-load entry, then reloads systemd, enables the health check and
+`dgx-fan-manual.service`, and enables the watchdog. It does **not** enable
+`dgx-fan-control.service`. The defaults file is not overwritten when it
+already exists.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
@@ -320,6 +321,23 @@ Then choose one mode:
 | --- | --- | --- |
 | NVIDIA factory curve; manual boosts when needed | Pre-cooling individual jobs | `sudo systemctl disable --now dgx-fan-control.service` |
 | This project's performance curve | Continual temperature-based extra cooling | `sudo systemctl enable --now dgx-fan-control.service` |
+| Held manual floor | A fixed floor across boots, without the performance curve | `sudo dgx-fan-control set-state <n>` |
+
+Install enables `dgx-fan-manual.service`, which reapplies a held floor at the
+next boot. It does not start the performance curve. For that mode, stop the
+performance service, record the floor, and confirm it. See
+[Hold a manual floor](usage.md#hold-a-manual-floor).
+
+```sh
+sudo systemctl disable --now dgx-fan-control.service
+sudo dgx-fan-control set-state <n>
+dgx-fan-control status
+```
+
+`status` shows `manual-floor: N (last-set)`.
+`sudo systemctl disable --now dgx-fan-control.service` alone restores
+NVIDIA's curve only for the current session. A remaining last-set floor
+comes back at the next boot unless `automatic` cleared it.
 
 For factory-curve mode, also clear any manual floor:
 
@@ -335,9 +353,12 @@ not own is not cleared. Enabling the service adds our performance curve.
 `module enable` loads the module and does not enable the service.
 `sudo dgx-fan-control module enable --start-service` is the explicit choice,
 same as the table above. `start`/`stop` change the current session;
-`enable`/`disable` change future boots. Disabling the service alone does not
-clear a manually set non-zero floor, which is why `automatic` is explicit
-above. Do not substitute an ACPI level of 0 for `automatic`.
+`enable`/`disable` change future boots.
+`sudo systemctl disable --now dgx-fan-control.service` alone restores
+NVIDIA's curve only for the current session. A remaining last-set floor
+comes back at the next boot unless `automatic` cleared it, which is why
+`automatic` is explicit above. Do not substitute an ACPI level of 0 for
+`automatic`.
 
 The watchdog is a separate unit. It reads the ACPI fans and `thermal_zone0`
 directly. `systemctl disable --now dgx-fan-control.service` and

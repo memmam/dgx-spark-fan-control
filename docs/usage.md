@@ -32,8 +32,9 @@ dgx-fan-control status
 `/etc/modprobe.d/dgx-fan-control-owned.conf` so the next module load receives
 `owned_state` and `owned_floor`. The kernel probe compares the EC floor with
 that pair. A match is adopted and is not a foreign floor. A mismatch, or no
-record, stays on the foreign-floor path. `dgx-fan-manual.service` reapplies
-the state at boot and does not start the performance curve.
+record, stays on the foreign-floor path. Install enables
+`dgx-fan-manual.service`. That unit reapplies the state at boot and does not
+start the performance curve.
 
 `MANUAL_STATE=` in `/etc/default/dgx-fan-control` overrides the record when
 you set it. Leave it empty to use the last `set-state`.
