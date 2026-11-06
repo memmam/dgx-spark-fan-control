@@ -147,8 +147,9 @@ fwupd can install EC 3.13.7 over 3.5.8 and remove fan-floor control. The
 steps below match
 [EC firmware pairing and downgrade](installation.md#ec-firmware-pairing-and-downgrade).
 
-The EC is a **UEFI Device Firmware** entry. It is not labeled Embedded
-Controller in `get-devices`. The same name is used for the SoC
+In `fwupdmgr get-devices` the EC row is titled **Embedded Controller**
+(seen on both 3.5.8 and 3.13.7). fwupd's verbose log calls it
+**UEFI Device Firmware**. That name is also used for the SoC
 (`b488217b-3895-4fc0-b1bf-ab7005a2d45a`, version `0x02009e0f`) and another
 device (`dd1a238a-5f8e-46bd-9401-a88da99c5a96`, version `0x00000519`). Do
 not flash those when you mean the EC.

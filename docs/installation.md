@@ -554,9 +554,10 @@ reply and then refuses floor writes. Downgrade to 3.5.8, then block EC
 updates so a later fwupd run does not install 3.13.7 again. This page does
 not flash firmware for you. `dgx-fan-control` does not change fwupd settings.
 
-fwupd lists the EC as **UEFI Device Firmware**, not as Embedded Controller.
-Two other entries use that same name. Pick the EC by GUID and version, not
-by the name. The fwupd ESRT device ID is derived from the GUID and the
+In `fwupdmgr get-devices` the EC row is titled **Embedded Controller**
+(seen on both 3.5.8 and 3.13.7). fwupd's verbose log calls it
+**UEFI Device Firmware**, a name two other entries share. Pick the EC by
+GUID and version, not by either name. The fwupd ESRT device ID is derived from the GUID and the
 physical path, so identical boards share it. On DGX Spark the EC device ID
 is `8c948e1db381648c8893897e4d09b7b153309991`. Confirm both of the following
 before any flash:
@@ -572,16 +573,15 @@ before any flash:
 
 Do not flash the SoC entry, or the `0x00000519` entry, when you mean the EC.
 After a successful EC update the summary can say
-`Embedded Controller (0x03000d07 → 0x03000508)`. `get-devices` itself still
-does not label that row Embedded Controller.
+`Embedded Controller (0x03000d07 → 0x03000508)`.
 
 ```sh
 sudo fwupdmgr get-devices
 ```
 
-The unblocked EC row looks like a generic UEFI device: summary
-`UEFI System Resource Table device (Updated via capsule-on-disk)`, current
-version `0x03000508` on 3.5.8. A blocked EC is missing from this list, from
+The unblocked EC row is titled `Embedded Controller`, with summary
+`UEFI System Resource Table device (Updated via capsule-on-disk)` and current
+version `0x03000508` on 3.5.8 or `0x03000d07` on 3.13.7. A blocked EC is missing from this list, from
 `fwupdmgr get-devices --show-all`, and from `fwupdmgr get-updates`.
 To read a blocked EC's version, see
 [Block or allow EC firmware updates](troubleshooting.md#block-or-allow-ec-firmware-updates).
