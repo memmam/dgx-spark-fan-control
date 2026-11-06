@@ -206,8 +206,10 @@ at 90 C, and that poll does not wait out the lower stages.
 1. **70 C, advisory only.** Log one warning. The human text asks for a
    checkpoint or a lighter load and says this is not a failure. The same
    line is machine-readable: `acpi_thermal_advisory` with `phase=acpi` or
-   `phase=ec`, `zone_c`, `advisory_c`, `action=none`, `incident=no`, and
-   `timer=no`. Holding **70 C through 79.9 C** does this and nothing else,
+   `phase=ec`, `zone_c`, `advisory_c`, `hook_c`, `term_c`, `kill_c`,
+   `boot_id`, `incident_boot` (`-` when there is no incident file),
+   `sequence`, `action=none`, and `timer=no`. The incident identifier is
+   `incident_boot`. Holding **70 C through 79.9 C** does this and nothing else,
    for as long as the zone stays there. It does not start the stop hook,
    send a signal, force a fan level, write the incident latch, write the
    phase-2 stop marker, or start a timer. The line is not repeated until
@@ -249,8 +251,9 @@ at 90 C, and that poll does not wait out the lower stages.
    poll, including when the zone is still hot. It does not relaunch the
    job. A failed reboot is retried. Poweroff is not the normal result of a
    successful stop. It is used only if reboot keeps failing and the zone
-   then stays at or above **95 C for 15 seconds**. One sample at 95 C does
-   not power off.
+   then stays at or above **90 C for 15 seconds**. One sample at or above
+   90 C does not power off. A failed reboot while the zone stays below
+   90 C does not power off.
 7. **Phase 2, the next boot:** the incident file still names the previous
    boot, so monitoring continues with **no ACPI writes**. `acpi-phase`
    records that phase 1 requested this reboot. The incident file selects
@@ -261,25 +264,23 @@ at 90 C, and that poll does not wait out the lower stages.
    above, stop the workload the same way: hook at 80 C if configured,
    SIGTERM at 85 C, SIGKILL at 90 C. There is no second reboot and no
    second resume. After the stop is confirmed, watch the zone. Power off
-   only when one of these holds; none of them is a single sample:
+   only when the zone stays at or above **90 C for 15 seconds**. One sample
+   is not enough, and a drop below 90 C starts that clock over. A zone that
+   stays at 84 C, or at 89 C, does not power off on this path however long
+   it stays there.
 
-   - the zone stays at or above **95 C for 15 seconds**
-   - at least **10 seconds** after the stop, the zone is at least **90 C**
-     and at least **2 C** hotter than when the watch started
-   - the zone is still at least **83 C** (85 minus hysteresis) **20 seconds**
-     after the stop
+   SIGKILL and the 10-second SIGTERM grace are workload escalation. They
+   are not poweroff. If the stop cannot be verified, poweroff still waits
+   for the same **15 seconds at or above 90 C**. Five seconds after SIGKILL
+   at 86 C does not power off.
 
-   These are short software fallbacks. They were not timed on hardware and
-   they are not a claim about when a machine will cut power. If the zone
-   falls below 83 C and is not climbing through 90 C, leave the machine up.
-   If the stop cannot be verified, the failure path is still poweroff, but
-   only after the **5 second** post-SIGKILL grace while the zone is at
-   least 83 C. One sample at 95 C during that grace does not power off.
-   An unreadable zone in this phase does not write ACPI and does not power
-   off on that sample. A verified true zero (both tachometers at 0 RPM)
-   stays on the existing true-zero rule in both phases. During a latched
-   incident, legacy cold-stall and foreign-floor reboot paths cannot bypass
-   phase 1's stop verification.
+   These intervals were not timed on hardware and they are not a claim
+   about when a machine will cut power. An unreadable zone in this phase
+   does not write ACPI and does not power off on that sample. A verified
+   true zero (both tachometers at 0 RPM) stays on the existing true-zero
+   rule in both phases, including its separate 85 C cutoff. During a
+   latched incident, legacy cold-stall and foreign-floor reboot paths
+   cannot bypass phase 1's stop verification.
 
 The reboot restores stock EC control. It is not an in-place ACPI recovery,
 and it does not relaunch the process that was stopped. The incident latch
@@ -405,9 +406,17 @@ still hot; a listener should treat the work as idempotent.
    shell. The watchdog starts it and does not wait for it to exit. A hook
    that is still running is not started again and is not killed. A missing
    executable, a bad command, or an exception is logged once for that
-   episode. The next temperature poll still runs. The hook inherits the
-   watchdog sandbox: home directories are hidden, and only `AF_UNIX` is
-   available, so it cannot call a network API. `systemctl start` of a unit
+   episode. The next temperature poll still runs.    The hook is a child of `dgx-fan-watchdog.service`. That unit sets
+   `RestrictAddressFamilies=AF_UNIX`, `ProtectSystem=strict`,
+   `ProtectHome=yes`, and `NoNewPrivileges=yes`. It does **not** set
+   `PrivateNetwork`. `start_new_session` only starts a new session; it
+   does not add or remove those unit settings. This tree was not loaded
+   under systemd and no socket was opened from a child, so inheritance of
+   the address-family filter is what the unit file says, not a measured
+   result. The resume hook is different: it is a child of
+   `dgx-fan-health.service`, which leaves `PrivateNetwork` and
+   `RestrictAddressFamilies` unset so an optional URL can run.
+   `systemctl start` of a unit
    that knows how to notify the job is the usual shape. The hook receives
    `DGX_ACPI_ADVISORY=1` and `DGX_ACPI_ADVISORY_PHASE`, `_ZONE_C`, `_C`,
    `_HOOK_C`, `_TERM_C`, `_KILL_C`, `_BOOT`, `_INCIDENT_BOOT`, `_SEQUENCE`,
@@ -431,14 +440,11 @@ explicitly when customizing. Missing keys use these defaults:
 | `ACPI_THERMAL_MAX_C` | `80` | ACPI phase: force and latch level 100. Both phases: start a configured stop hook. Not a SIGTERM |
 | `ACPI_THERMAL_STOP_C` | `85` | SIGTERM if the workload is not already confirmed stopped |
 | `ACPI_THERMAL_KILL_C` | `90` | SIGKILL. Preempts hook and SIGTERM grace |
-| `ACPI_THERMAL_SHUTDOWN_C` | `95` | Ceiling used by the sustained post-stop and failed-reboot checks. One sample does nothing |
-| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Grace for a hook that actually started. Does not run when no hook is configured |
-| `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace before SIGKILL |
-| `ACPI_THERMAL_KILL_SECONDS` | `5` | After SIGKILL, unverified-stop grace before poweroff if the zone is still at least STOP minus hysteresis |
-| `ACPI_THERMAL_SHUTDOWN_SECONDS` | `15` | How long the zone must stay at or above the ceiling before that path powers off |
-| `ACPI_THERMAL_POST_STOP_SECONDS` | `20` | Phase 2: power off if the zone is still at least STOP minus hysteresis this long after a confirmed stop |
-| `ACPI_THERMAL_RISE_C` | `2` | Phase 2: rise, in degrees, that counts as still climbing after a confirmed stop |
-| `ACPI_THERMAL_RISE_SECONDS` | `10` | Phase 2: minimum watch time before that rise can power off |
+| `ACPI_THERMAL_SHUTDOWN_C` | `90` | Thermal poweroff threshold. The zone must stay at or above this. Below it, this path does not power off |
+| `ACPI_THERMAL_HOOK_SECONDS` | `10` | Grace for a hook that actually started, then SIGTERM. Not a poweroff timer |
+| `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace before SIGKILL. Not a poweroff timer |
+| `ACPI_THERMAL_KILL_SECONDS` | `5` | Accepted and validated. It does not power off and it does not delay SIGKILL |
+| `ACPI_THERMAL_SHUTDOWN_SECONDS` | `15` | How long the zone must stay at or above `SHUTDOWN_C` before poweroff. One sample is not enough |
 | `ACPI_THERMAL_HYSTERESIS_C` | `2` | Clears the advisory below 68 C. Hook cooling is adequate below 83 C. Manual reset requires a zone below 78 C. Not a reboot delay |
 | `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this shutdown stage, not true-zero poweroff or the recovery reboot |
 | `ACPI_THERMAL_STOP_HOOK` | empty | Trusted root executable plus arguments, parsed with `shlex`, **not a shell expression**. Empty keeps the no-hook window through 85 C |
@@ -447,7 +453,7 @@ explicitly when customizing. Missing keys use these defaults:
 | `ACPI_THERMAL_PROCESS_NAMES` | empty | Additional comma/space-separated exact Linux `comm` names (normally at most 15 characters) |
 
 All numeric settings must be finite and positive. Thresholds must satisfy
-`35 <= ADVISORY < MAX < STOP < KILL < SHUTDOWN <= 100`. Hysteresis must be
+`35 <= ADVISORY < MAX < STOP < KILL <= SHUTDOWN <= 100`. Hysteresis must be
 less than STOP minus MAX and less than MAX minus ADVISORY. A temperature
 crossing preempts a grace period. The no-hook path has no grace period
 below STOP.
@@ -471,10 +477,13 @@ A hook runs asynchronously as a direct child executable with arguments, not
 through a shell. It is stopped only through a pidfd taken at spawn, never
 by numeric PID, and only that process: it must return promptly and clean up
 its own descendants. A hook that needs shell syntax should be an
-administrator-maintained script. The watchdog sandbox applies to the hook.
-Home directories are hidden, and `RestrictAddressFamilies=AF_UNIX` blocks
-TCP and UDP, so the hook cannot call a Kubernetes, Slurm, or HTTP API
-itself. `systemctl` over the system bus is allowed. Docker, Slurm,
+administrator-maintained script. The stop hook and the advisory hook are
+children of the watchdog unit. That unit sets
+`RestrictAddressFamilies=AF_UNIX`, hides home directories, and does not set
+`PrivateNetwork`. `start_new_session` does not create that address-family
+line and was not used here as proof of isolation. `systemctl` over the
+system bus uses a Unix socket, which that line allows. The resume hook is
+a child of the health unit, which does not set the address-family line. Docker, Slurm,
 Kubernetes, and systemd `Restart=` policies are not stopped by the fan
 tool. Root and `/system.slice` jobs are not signaled either. Those have to
 be stopped by the hook, or the final shutdown is the fallback. The incident

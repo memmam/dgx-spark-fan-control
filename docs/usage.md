@@ -667,9 +667,10 @@ once, and only after that health run passes, the zone is below 80 C, and
 this boot has not already started a phase-2 thermal stop. An advisory in
 the 70s does not block it. See
 [optional resume](ec-curve.md#optional-resume-after-the-next-boot).
-The stop hook runs inside the watchdog sandbox: it can call `systemctl` on the
-system bus, and it cannot open a network connection to Kubernetes, Slurm,
-or an HTTP API. Root jobs and system services are not killed directly.
+The stop hook is a child of the watchdog unit, which sets
+`RestrictAddressFamilies=AF_UNIX` and does not set `PrivateNetwork`.
+`start_new_session` does not add that restriction. It can call `systemctl`
+on the system bus. Root jobs and system services are not killed directly.
 
 ## Set the ACPI fan level
 
@@ -682,10 +683,12 @@ see [Listening for the advisory](ec-curve.md#listening-for-the-advisory).
 At 80 C it forces level 100
 and starts a configured stop hook; with no hook it waits until 85 C for
 SIGTERM, however long that takes. SIGKILL is at 90 C. A confirmed stop
-reboots immediately. That is phase 1. One sample at 95 C does not replace
-that reboot. After the reboot, phase 2 watches the stock EC curve and does
-not write ACPI. If heat returns, it uses the same 80/85/90 ladder and shuts
-down only when heat persists after that stop. There is no second reboot.
+reboots immediately. That is phase 1. One sample at or above 90 C does not
+replace that reboot and does not power off. After the reboot, phase 2
+watches the stock EC curve and does not write ACPI. If heat returns, it
+uses the same 80/85/90 ladder and powers off only after the zone stays at
+or above 90 C for 15 seconds. Heat that stays below 90 C does not power
+off on this path. There is no second reboot.
 Workload resume is a separate hook that runs at most once at the start of
 phase 2, and only below 80 C.
 See [measured findings, configuration, and safeguards](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).

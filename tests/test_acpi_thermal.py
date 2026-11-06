@@ -41,7 +41,7 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(
             (self.guard.advisory_c, self.guard.fan_c, self.guard.stop_c,
              self.guard.kill_c, self.guard.shutdown_c),
-            (70, 80, 85, 90, 95),
+            (70, 80, 85, 90, 90),
         )
         self.step(69.9, 0)
         self.maximum.assert_not_called()
@@ -222,9 +222,11 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, 1)
         self.step(86, 10)
         self.assertEqual(self.send.call_args.args[1], signal.SIGKILL)
-        self.step(86, 14.9)
+        self.step(86, 100)
         self.shutdown.assert_not_called()
-        self.step(86, 15)
+        self.step(90, 101)
+        self.shutdown.assert_not_called()
+        self.step(90, 116)
         self.shutdown.assert_called_once()
 
     def test_90_preempts_hanging_hook_and_term_grace(self):
@@ -245,7 +247,7 @@ class ThermalTests(unittest.TestCase):
         self.shutdown.assert_not_called()
         self.step(95, 9.7)
         self.shutdown.assert_not_called()
-        self.step(95, 14.6)
+        self.step(90, 24.6)
         self.shutdown.assert_called_once()
 
     def test_direct_95_kills_then_reboots_when_the_stop_is_verified(self):
@@ -364,14 +366,14 @@ class ThermalTests(unittest.TestCase):
         self.step(95, 0)
         self.shutdown.assert_not_called()
         self.assertEqual(self.guard.stage, "kill")
-        self.step(95, 4.9)
+        self.step(95, 14.9)
         self.shutdown.assert_not_called()
-        self.step(95, 5)
+        self.step(95, 15)
         self.shutdown.assert_not_called()
         self.assertEqual(self.guard.stage, "disabled")
         self.guard = self.make_guard()
         self.shutdown.return_value = 1
-        self.step(95, 10)
+        self.step(95, 0)
         self.shutdown.assert_not_called()
         self.step(95, 15)
         self.step(95, 16)
@@ -381,9 +383,9 @@ class ThermalTests(unittest.TestCase):
         self.step(None, 0)
         self.shutdown.assert_not_called()
         self.reboot.assert_not_called()
-        self.step(None, 4.9)
+        self.step(None, 14.9)
         self.shutdown.assert_not_called()
-        self.step(None, 5)
+        self.step(None, 15)
         self.shutdown.assert_called_once()
 
     def test_invalid_config_rejected(self):
@@ -395,7 +397,8 @@ class ThermalTests(unittest.TestCase):
                        {"ACPI_THERMAL_HYSTERESIS_C": "8"},
                        {"ACPI_THERMAL_ADVISORY_C": "80"},
                        {"ACPI_THERMAL_ADVISORY_C": "78", "ACPI_THERMAL_HYSTERESIS_C": "2"},
-                       {"ACPI_THERMAL_SHUTDOWN_SECONDS": "0"}):
+                       {"ACPI_THERMAL_SHUTDOWN_SECONDS": "0"},
+                       {"ACPI_THERMAL_SHUTDOWN_C": "89"}):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 self.make_guard(config)
 
@@ -409,7 +412,11 @@ class ThermalTests(unittest.TestCase):
         self.step(84, 0)
         self.step(84, 3)
         self.assertEqual(self.send.call_args.args[1], signal.SIGKILL)
-        self.step(84, 5)
+        self.step(84, 30)
+        self.shutdown.assert_not_called()
+        self.step(94, 31)
+        self.shutdown.assert_not_called()
+        self.step(94, 46)
         self.shutdown.assert_called_once()
 
     def fake_fans(self, temp=80000):
@@ -920,28 +927,34 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.maximum.assert_not_called()
 
-    def test_phase2_post_stop_timer_shuts_down_without_one_sample_at_the_ceiling(self):
+    def test_phase2_below_90_does_not_power_off_and_90_needs_the_interval(self):
         self.targets.return_value = {}
         self.guard.step(85, 0, self.maximum, ec_only=True)
         self.assertEqual(self.guard.stage, "ec-watch")
-        self.guard.step(95, 1, self.maximum, ec_only=True)
+        self.guard.step(84, 100, self.maximum, ec_only=True)
         self.shutdown.assert_not_called()
-        self.guard.step(84, 19, self.maximum, ec_only=True)
+        self.guard.step(89, 200, self.maximum, ec_only=True)
         self.shutdown.assert_not_called()
-        self.guard.step(84, 20, self.maximum, ec_only=True)
+        self.guard.step(90, 201, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(95, 215, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(90, 216, self.maximum, ec_only=True)
         self.shutdown.assert_called_once()
         self.reboot.assert_not_called()
         self.maximum.assert_not_called()
 
-    def test_phase2_rise_shuts_down_only_after_the_watch_interval(self):
+    def test_phase2_drop_below_90_restarts_the_poweroff_clock(self):
         self.targets.return_value = {}
-        self.guard.step(88, 0, self.maximum, ec_only=True)
+        self.guard.step(90, 0, self.maximum, ec_only=True)
         self.assertEqual(self.guard.stage, "ec-watch")
-        self.guard.step(91, 9, self.maximum, ec_only=True)
+        self.guard.step(95, 14, self.maximum, ec_only=True)
         self.shutdown.assert_not_called()
-        self.guard.step(91, 10, self.maximum, ec_only=True)
+        self.guard.step(89, 14.5, self.maximum, ec_only=True)
+        self.guard.step(90, 20, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(90, 35, self.maximum, ec_only=True)
         self.shutdown.assert_called_once()
-        self.reboot.assert_not_called()
 
     def test_phase2_true_zero_powers_off_without_an_acpi_write(self):
         thermal, hwmon = self.fake_fans(85000)

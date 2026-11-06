@@ -4758,21 +4758,20 @@ class AcpiThermalGuard:
         self.fan_c = self.number("ACPI_THERMAL_MAX_C", 80)
         self.stop_c = self.number("ACPI_THERMAL_STOP_C", 85)
         self.kill_c = self.number("ACPI_THERMAL_KILL_C", 90)
-        self.shutdown_c = self.number("ACPI_THERMAL_SHUTDOWN_C", 95)
+        self.shutdown_c = self.number("ACPI_THERMAL_SHUTDOWN_C", 90)
         self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
         self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
+        # Validated so a bad value still refuses the config. It does not
+        # power the machine off. SIGKILL uses KILL_C and TERM_SECONDS.
         self.kill_s = self.number("ACPI_THERMAL_KILL_SECONDS", 5)
         self.shutdown_s = self.number("ACPI_THERMAL_SHUTDOWN_SECONDS", 15)
-        self.post_stop_s = self.number("ACPI_THERMAL_POST_STOP_SECONDS", 20)
-        self.rise_c = self.number("ACPI_THERMAL_RISE_C", 2)
-        self.rise_s = self.number("ACPI_THERMAL_RISE_SECONDS", 10)
         # ACPI_THERMAL_COOL_SECONDS is ignored. Recovery does not wait for a
         # temperature hold; a confirmed stop reboots on the verifying poll.
         self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
-        if not 35 <= self.advisory_c < self.fan_c < self.stop_c < self.kill_c < self.shutdown_c <= 100:
+        if not 35 <= self.advisory_c < self.fan_c < self.stop_c < self.kill_c <= self.shutdown_c <= 100:
             raise ValueError(
                 "ACPI thermal thresholds must satisfy "
-                "35 <= ADVISORY < MAX < STOP < KILL < SHUTDOWN <= 100"
+                "35 <= ADVISORY < MAX < STOP < KILL <= SHUTDOWN <= 100"
             )
         if not 0 < self.hysteresis < self.stop_c - self.fan_c:
             raise ValueError("ACPI thermal hysteresis must be positive and less than STOP - MAX")
@@ -4805,7 +4804,6 @@ class AcpiThermalGuard:
         self.advisory_hook = self.start_advisory_hook
         self.reaction_logged = False
         self.ceiling_since = None
-        self.watch_c = None
         self.retired_hooks = []
 
     def hook_command(self) -> str:
@@ -4958,16 +4956,16 @@ class AcpiThermalGuard:
         return now - self.ceiling_since >= self.shutdown_s
 
     def post_stop_reason(self, hot, now):
-        """Phase-2 reason to power off, or None. One sample is never enough."""
-        elapsed = now - self.since
+        """Phase-2 reason to power off, or None.
+
+        Only a zone that stays at or above the shutdown threshold. A sample
+        below that threshold never powers off, however long it lasts.
+        """
         if self.ceiling_held(hot, now):
-            return "zone stayed at or above the shutdown ceiling after the stop"
-        if (elapsed >= self.rise_s and hot >= self.kill_c
-                and self.watch_c is not None
-                and hot >= self.watch_c + self.rise_c):
-            return "zone rose through the kill threshold after the stop"
-        if elapsed >= self.post_stop_s and hot >= self.stop_c - self.hysteresis:
-            return "zone stayed elevated after the stop"
+            return (
+                "zone stayed at or above %.1fC after the stop"
+                % self.shutdown_c
+            )
         return None
 
     def number(self, key, fallback):
@@ -5341,7 +5339,6 @@ class AcpiThermalGuard:
                 "EC-only phase: workload confirmed stopped; not rebooting and "
                 "not resuming; watching the stock EC curve"
             )
-            self.watch_c = hot
             self.ceiling_since = None
             self.stage, self.since = "ec-watch", now
         elif (not ec_only and self.stage not in ("idle", "reboot", "shutdown")
@@ -5364,12 +5361,17 @@ class AcpiThermalGuard:
                     self._last_resort_shutdown(
                         hot, "recovery reboot failed and the shutdown ceiling held",
                     )
-        elif (self.stage == "kill" and not entered_kill
-                and now - self.since >= self.kill_s
-                and hot >= self.stop_c - self.hysteresis):
-            # One sample at the shutdown ceiling does not power off. The
-            # post-kill grace is the unverified-stop fallback.
-            self._last_resort_shutdown(hot, "workload stop not verified")
+        elif self.stage == "kill":
+            # SIGKILL already happened. Staying under the shutdown threshold
+            # does not power off. The first sample at the threshold only
+            # starts the clock.
+            held = self.ceiling_held(hot, now)
+            if held and not entered_kill:
+                self._last_resort_shutdown(
+                    hot,
+                    "workload stop not verified and the zone stayed at or "
+                    "above %.1fC" % self.shutdown_c,
+                )
 
     def _last_resort_shutdown(self, hot, reason):
         if self.stage in ("reboot", "shutdown"):

@@ -72,6 +72,10 @@ MANUAL_STATE=
 # 80 C starts the stop hook when one is configured, and in the ACPI phase
 # also forces level 100. With no hook, 80 C does not send SIGTERM.
 # 85 C is SIGTERM. 90 C is SIGKILL. Degrees of headroom are not seconds.
+# Poweroff is separate from SIGKILL: the zone must stay at or above
+# SHUTDOWN_C for SHUTDOWN_SECONDS. One sample does not power off.
+# A zone that stays below SHUTDOWN_C does not power off. The true-zero
+# 85 C path is not this rule.
 ACPI_THERMAL_ADVISORY_C=70
 # Optional. Empty disables it. Executable plus arguments, not a shell.
 # Started when the advisory is published and never waited on. It does not
@@ -80,17 +84,13 @@ ACPI_THERMAL_ADVISORY_HOOK=
 ACPI_THERMAL_MAX_C=80
 ACPI_THERMAL_STOP_C=85
 ACPI_THERMAL_KILL_C=90
-ACPI_THERMAL_SHUTDOWN_C=95
+ACPI_THERMAL_SHUTDOWN_C=90
 ACPI_THERMAL_HOOK_SECONDS=10
 ACPI_THERMAL_TERM_SECONDS=10
 ACPI_THERMAL_KILL_SECONDS=5
-# Phase 2, after a confirmed stop: one sample never powers off.
-# 15 s at or above SHUTDOWN_C, or a 2 C rise through KILL_C over 10 s,
-# or 20 s still at or above STOP minus HYSTERESIS. Not a measured trip time.
+# How long the zone must stay at or above SHUTDOWN_C before poweroff.
+# Not a measured trip time. KILL_SECONDS does not power off.
 ACPI_THERMAL_SHUTDOWN_SECONDS=15
-ACPI_THERMAL_POST_STOP_SECONDS=20
-ACPI_THERMAL_RISE_C=2
-ACPI_THERMAL_RISE_SECONDS=10
 ACPI_THERMAL_HYSTERESIS_C=2
 # Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
 # Phase 1: a confirmed stop reboots immediately and does not power off.
