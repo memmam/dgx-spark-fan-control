@@ -2,15 +2,16 @@
 Description=DGX Spark additive fan-floor controller
 After=systemd-modules-load.service
 Wants=systemd-modules-load.service
-StartLimitIntervalSec=300
-StartLimitBurst=3
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/dgx-fan-control daemon
 # Restart after every exit, including 69. Preventing that restart left a low
-# floor in place for 1 d 19 h (tenhkspark, 2026-10-31). StartLimitBurst in
-# the [Unit] section stops an immediate exit from restarting without limit.
+# floor in place for 1 d 19 h (tenhkspark, 2026-10-31). StartLimitIntervalSec=0
+# means systemd does not give up. An immediate exit, including unsupported
+# firmware (exit 0), is retried every RestartSec. The watchdog reports a unit
+# that is not active.
 Restart=always
 RestartSec=30s
 TimeoutStopSec=30s

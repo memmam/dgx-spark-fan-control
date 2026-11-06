@@ -113,9 +113,10 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", SERVICE)
         self.assertNotIn("modprobe", SERVICE)
         self.assertIn("Restart=always\n", SERVICE)
+        self.assertIn("RestartSec=30s\n", SERVICE)
+        self.assertIn("StartLimitIntervalSec=0\n", SERVICE)
         self.assertNotIn("RestartPreventExitStatus", SERVICE)
-        self.assertIn("StartLimitBurst=3", SERVICE)
-        self.assertIn("StartLimitIntervalSec=300", SERVICE)
+        self.assertNotIn("StartLimitBurst", SERVICE)
 
 
 if __name__ == "__main__":

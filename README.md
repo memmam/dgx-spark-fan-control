@@ -175,6 +175,13 @@ sudo DGX_FAN_CURVE=quiet dgx-fan-control daemon
 A systemd drop-in can set `Environment=DGX_FAN_CURVE=quiet`. Both curves keep
 the state-1 pin and never select state 0 while the daemon runs.
 
+The service restarts every 30 seconds with no start-rate limit
+(`Restart=always`, `RestartSec=30s`, `StartLimitIntervalSec=0`). A crash loop
+is retried forever instead of being left failed. Unsupported firmware exits 0,
+so that case also restarts every 30 seconds. The repeating log line is the
+accepted tradeoff. `dgx-fan-control watchdog` still reports a unit that is not
+`active`.
+
 ## Firmware pairing
 
 The kernel module's FF-A path does not provide fan control when EC 3.5.8 is
