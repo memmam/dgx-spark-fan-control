@@ -2603,6 +2603,8 @@ class UserlandFailureTests(unittest.TestCase):
                 "cooling-device: n/a (EC 3.13.7: telemetry only, control unsupported)",
                 text,
             )
+            self.assertIn(f"clock-cap: {CONTROL.CLOCK_CAP_HINT}", text)
+            self.assertIn("MiaAI-Lab sparkLimiter", CONTROL.CLOCK_CAP_HINT)
             self.assertIn("daemon: n/a/stopped (unsupported firmware)", text)
             self.assertIn("mode: n/a (last-set 6 kept)", text)
             self.assertIn("ready: n/a", text)
@@ -3670,6 +3672,7 @@ class UserlandFailureTests(unittest.TestCase):
             combined = stdout + stderr
             self.assertEqual(code, 0, combined)
             self.assertIn(CONTROL.TELEMETRY_ONLY_STATUS, stdout)
+            self.assertIn(f"clock-cap: {CONTROL.CLOCK_CAP_HINT}\n", stdout)
             self.assertNotIn("NEEDS INTERVENTION:", combined)
             self.assertFalse(flag.exists())
             self.assertIn("state=6", (state / CONTROL.MANUAL_STATE_NAME).read_text())

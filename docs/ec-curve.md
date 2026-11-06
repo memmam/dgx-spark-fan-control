@@ -40,7 +40,16 @@ throughput suggest the reported scale changed rather than the fan speed.
 That is an inference: fan speed was not measured independently.
 
 On 3.13.7 the host cannot set a floor, so the firmware curve is the only
-cooling control.
+fan control. `status` and `health` print a `clock-cap:` line there. Capping
+the GPU clock is the remaining way to run cooler under load:
+
+```sh
+sudo nvidia-smi -lgc 0,2200
+```
+
+The 2200 MHz figure is the default in MiaAI-Lab's
+[sparkLimiter](https://github.com/MiaAI-Lab/sparkLimiter). `sudo nvidia-smi -rgc`
+removes the cap.
 
 ## After the load stops
 

@@ -32,6 +32,14 @@ ACPI_MIN_LEVEL = 40
 ACPI_MAX_LEVEL = 100
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
 TELEMETRY_ONLY_STATUS = "control unsupported on this firmware (telemetry only)"
+# On telemetry-only firmware the EC curve is the only fan control, and it
+# holds base speed until about 80 C (docs/ec-curve.md). A GPU clock cap is
+# the remaining lever. 2200 MHz is the default in MiaAI-Lab's sparkLimiter.
+CLOCK_CAP_HINT = (
+    "fans follow the EC curve only (base speed until about 80 C); to run "
+    "cooler under load, cap the GPU clock with sudo nvidia-smi -lgc 0,2200 "
+    "(2200 MHz from MiaAI-Lab sparkLimiter); see docs/ec-curve.md"
+)
 WATCHDOG_POLL_SECONDS = 2.0
 WATCHDOG_ZERO_SECONDS = 10.0
 # Any-temperature alert. Idle fans on EC 3.5.8 with the October SoC run near
@@ -2062,6 +2070,7 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
             "cooling-device", "note",
             f"n/a ({firmware_label}: telemetry only, control unsupported)",
         )
+        keep("clock-cap", "note", CLOCK_CAP_HINT)
     elif managed_off:
         keep("cooling-device", "note", "skipped (module disabled by module disable)")
     elif devices is None:
@@ -4716,6 +4725,7 @@ def main(argv: list[str] | None = None) -> int:
             active, enabled = watchdog_unit_state()
             show_intervention()
             print(TELEMETRY_ONLY_STATUS)
+            print(f"clock-cap: {CLOCK_CAP_HINT}")
             print(format_watchdog_status(active, enabled), end="")
             return 0
         # automatic on telemetry-only firmware: there is no floor to clear in
