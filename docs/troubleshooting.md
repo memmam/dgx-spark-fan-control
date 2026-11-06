@@ -62,9 +62,10 @@ is kept for a later downgrade to EC 3.5.8. Fans, temperature, and the
 watchdog are still checked. Health fails only when a firmware that should
 accept floor control has no cooling device, or when telemetry is missing.
 
-`fan1_input` and `fan2_input` under the `dgx_ec_fan` hwmon device should still
-be readable. Do not register a second fan driver or send raw mailbox commands
-to work around the rejection. The ACPI `Fan` cooling device does not change
+`fan1_input` and `fan2_input` on the single `dgx_ec_fan` hwmon device should
+still be readable. ACPI tachometers are separate `acpi_fan` devices, one
+`fan1_input` each. Do not register a second fan driver or send raw mailbox
+commands to work around the rejection. The ACPI `Fan` cooling device does not change
 fan speed on this EC either.
 
 ## Stored health still says needs-intervention
@@ -385,7 +386,7 @@ Confirm with RPM, not with the cooling state alone:
 
 ```sh
 dgx-fan-control status
-# then the hwmon fan1_input / fan2_input commands in the usage guide
+# then the dgx_ec_fan fan*_input reads in the usage guide
 ```
 
 The kernel log line `clearing zero lower clamp` means that latch was present

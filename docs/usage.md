@@ -275,15 +275,19 @@ Find the hwmon device by name because numeric indexes change across boots:
 
 ```sh
 for device in /sys/class/hwmon/hwmon*; do
-  if [ "$(cat "$device/name" 2>/dev/null)" = dgx_ec_fan ]; then
-    printf 'Fan 1: %s RPM\n' "$(cat "$device/fan1_input")"
-    printf 'Fan 2: %s RPM\n' "$(cat "$device/fan2_input")"
-  fi
+  [ "$(cat "$device/name" 2>/dev/null)" = dgx_ec_fan ] || continue
+  for input in "$device"/fan*_input; do
+    [ -e "$input" ] || continue
+    echo "$device $(basename "$input" _input)=$(cat "$input")"
+  done
 done
 ```
 
-`status` shows the requested state and hottest thermal zone; the hwmon files
-show measured RPM. If a command fails, see [troubleshooting](troubleshooting.md).
+That name is one device with `fan1_input` and `fan2_input`. It is not the
+ACPI tachometers. Those are separate `acpi_fan` devices, one `fan1_input`
+each on these Sparks. `status` shows the requested state and hottest thermal
+zone; the hwmon files show measured RPM. If a command fails, see
+[troubleshooting](troubleshooting.md).
 
 ## Watch for stopped fans
 
@@ -486,11 +490,14 @@ The core checks are fan and thermal only:
 - `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
 - `dgx-fan-control.service` is active when it is enabled, and it did not
   exit 78
-- both ACPI fans read nonzero RPM. The line includes each `acpi_fan`
-  tachometer (`fan1=… fan2=… RPM`) and each ACPI `Fan` `cur_state`.
-  That tachometer is not the `dgx_ec_fan` mailbox telemetry. On EC 3.13.7
-  a `cur_state` write does not change RPM, so a nonzero level next to
-  `fan1=0` is a tachometer reading, and a real 0 still fails
+- both ACPI fans read nonzero RPM. The line lists every `fan*_input`
+  under every hwmon device named `acpi_fan`, plus each ACPI `Fan`
+  `cur_state`. One device with two inputs prints `fan1=… fan2=… RPM`.
+  These Sparks have one `fan1_input` on each of two `acpi_fan` devices, so
+  the line is `hwmon0:fan1=… hwmon1:fan1=… RPM`. Fewer than two readings,
+  or any 0, fails. That tachometer is not the `dgx_ec_fan` mailbox
+  telemetry. On EC 3.13.7 a `cur_state` write does not change RPM, so a
+  nonzero level next to a 0 RPM reading is still a tachometer failure
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention

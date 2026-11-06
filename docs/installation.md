@@ -608,21 +608,27 @@ power. Check `get-devices` again after the reboot and confirm the version
 before the fan check or the health refresh. Upgrading to 3.13.7 removes
 fan-floor control.
 
-If the version is 3.5.8, confirm both fans report nonzero RPM before that
-refresh. `dgx-fan-control status` prints the cooling state, not RPM. Health
-and the watchdog read the `acpi_fan` tachometers:
+If the version is 3.5.8, confirm both fans before that refresh.
+`dgx-fan-control status` prints the cooling state, not RPM. Health and the
+watchdog collect every `fan*_input` under every hwmon device named
+`acpi_fan`. On these Sparks each fan is its own `acpi_fan` device, and that
+device has only `fan1_input`.
 
 ```sh
 for device in /sys/class/hwmon/hwmon*; do
-  if [ "$(cat "$device/name" 2>/dev/null)" = acpi_fan ]; then
-    echo "$device fan1=$(cat "$device/fan1_input") fan2=$(cat "$device/fan2_input")"
-  fi
+  [ "$(cat "$device/name" 2>/dev/null)" = acpi_fan ] || continue
+  for input in "$device"/fan*_input; do
+    [ -e "$input" ] || continue
+    echo "$device $(basename "$input" _input)=$(cat "$input")"
+  done
 done
 ```
 
-Both values must be greater than 0. On EC 3.5.8 an ACPI level of 0 stops
-the fans. If either reads 0 RPM, immediately run
+There should be two `acpi_fan` readings in total, one per device on this
+hardware, and every one must be greater than 0. A missing reading is not
+confirmed. If any reading is missing or 0 RPM, immediately run
 `sudo dgx-fan-control acpi-max`, then read the tachometers again.
+On EC 3.5.8 an ACPI level of 0 stops the fans.
 `acpi-max` writes level 100. Never write `cur_state` 0 or any ACPI level
 below 40. If `acpi-max` refuses because the module or
 `dgx-fan-control.service` is active, stop that service, unload

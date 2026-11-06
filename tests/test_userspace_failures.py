@@ -1692,6 +1692,115 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(actions, [])
             self.assertTrue(any("will not trip" in line for line in logs.output))
 
+    def test_two_acpi_fan_devices_are_the_two_tachometers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            first = root / "hwmon" / "hwmon0"
+            (first / "fan2_input").unlink()
+            (first / "fan1_input").write_text("2066\n", encoding="ascii")
+            second = root / "hwmon" / "hwmon1"
+            second.mkdir()
+            (second / "name").write_text("acpi_fan\n", encoding="ascii")
+            (second / "fan1_input").write_text("2152\n", encoding="ascii")
+
+            self.assertEqual(
+                CONTROL.read_named_fan_rpms(root / "hwmon"), [2066, 2152],
+            )
+            status, detail = CONTROL._fan_status(root / "hwmon", root / "thermal")
+            self.assertEqual(status, "pass", detail)
+            self.assertIn("hwmon0:fan1=2066", detail)
+            self.assertIn("hwmon1:fan1=2152", detail)
+            self.assertNotIn("fan2=", detail)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(), record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn(
+                "fans: pass (hwmon0:fan1=2066 hwmon1:fan1=2152 RPM", text,
+            )
+
+            (second / "fan1_input").write_text("0\n", encoding="ascii")
+            status, detail = CONTROL._fan_status(root / "hwmon", root / "thermal")
+            self.assertEqual(status, "fail", detail)
+            self.assertIn("hwmon1:fan1=0", detail)
+
+            (second / "fan1_input").unlink()
+            status, detail = CONTROL._fan_status(root / "hwmon", root / "thermal")
+            self.assertEqual(status, "fail", detail)
+            self.assertIn("hwmon0:fan1=2066", detail)
+            self.assertNotIn("hwmon1:fan1", detail)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (2066,), 40.0)
+            second = root / "hwmon" / "hwmon1"
+            second.mkdir()
+            (second / "name").write_text("acpi_fan\n", encoding="ascii")
+            (second / "fan1_input").write_text("2152\n", encoding="ascii")
+            clock = [0.0]
+            stop = Event()
+            alerts = []
+            actions = []
+
+            def wait(delay):
+                clock[0] += delay
+                if clock[0] > 4:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, stall_seconds=15,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(alerts, [])
+            self.assertEqual(actions, [])
+            self.assertFalse(any("will not trip" in line for line in logs.output))
+
+            (root / "hwmon" / "hwmon0" / "fan1_input").write_text(
+                "0\n", encoding="ascii",
+            )
+            (second / "fan1_input").write_text("0\n", encoding="ascii")
+            clock[0] = 0.0
+            stop.clear()
+
+            def wait_stall(delay):
+                clock[0] += delay
+                if clock[0] > 30:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(stop, "wait", side_effect=wait_stall), \
+                 self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, stall_seconds=15,
+                    monotonic=lambda: clock[0],
+                    runner=lambda action: actions.append(action),
+                    unit_state=lambda: "active",
+                    notifier=alerts.append,
+                )
+            self.assertEqual(status, 0)
+            self.assertTrue(alerts)
+            self.assertIn("fans are stopped", alerts[0])
+            self.assertFalse(any("will not trip" in line for line in logs.output))
+            self.assertTrue(any("wrote ACPI Fan level 100" in line for line in logs.output))
+
     def _acpi_tree(self, root: Path) -> tuple[Path, Path, Path]:
         thermal = root / "thermal"
         thermal.mkdir()
