@@ -253,8 +253,13 @@ class ModuleModeTests(unittest.TestCase):
         from threading import Event
         from unittest.mock import patch
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "enabled", 69))
+        self.assertFalse(CONTROL.daemon_needs_alarm("failed", "enabled", 69))
+        self.assertFalse(CONTROL.daemon_needs_alarm("failed", "disabled", 69))
         self.assertTrue(CONTROL.daemon_needs_alarm("inactive", "enabled", 1))
-        self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled", 69))
+        self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled", 1))
+        self.assertFalse(CONTROL.daemon_needs_alarm(
+            "failed", "enabled", 1, firmware_unsupported=True,
+        ))
         alerts = []
         actions = []
         stop = Event()

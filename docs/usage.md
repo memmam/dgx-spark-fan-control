@@ -499,8 +499,11 @@ The core checks are fan and thermal only:
   warn and the unknown do not fail the check and do not set
   needs-intervention. `status` does not query fwupd
 - EC 3.13.7 telemetry-only is not a failure. `firmware:` says control is
-  unsupported, and the cooling device, daemon, mode, and ready lines are
-  `n/a`. A last-set floor is kept. This does not set needs-intervention
+  unsupported, and the cooling device, mode, and ready lines are `n/a`.
+  A service left enabled reports
+  `daemon: n/a (unsupported firmware; service enabled but idle)`. The
+  watchdog does not broadcast for exit 69 or for this firmware. A last-set
+  floor is kept. This does not set needs-intervention
 
 `READY_CHECK` runs in the same pass. Empty means not configured, and the
 fan checks alone decide. A command succeeds on exit 0. A URL succeeds on

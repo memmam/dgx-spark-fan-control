@@ -1984,7 +1984,10 @@ class UserlandFailureTests(unittest.TestCase):
             text = stdout.getvalue()
             self.assertEqual(code, 0, text)
             self.assertIn("health: healthy", text)
-            self.assertIn("daemon: n/a/stopped (unsupported firmware)", text)
+            self.assertIn(
+                "daemon: n/a (unsupported firmware; service enabled but idle)",
+                text,
+            )
             self.assertIn("mode: n/a", text)
             self.assertIn("ec-updates: warn", text)
             self.assertIn("stored needs-intervention: none", text)
@@ -2041,6 +2044,57 @@ class UserlandFailureTests(unittest.TestCase):
                 )
             self.assertEqual(status, 0)
             self.assertFalse((Path(directory) / CONTROL.INTERVENTION_NAME).exists())
+
+        alerts = []
+        stop = Event()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (2073, 2154), 40.0)
+            hwmon = root / "hwmon" / "hwmon1"
+            hwmon.mkdir()
+            (hwmon / "name").write_text(
+                CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii",
+            )
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+                 self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    unit_state=lambda: ("failed", "enabled", 1),
+                    notifier=alerts.append,
+                    runner=lambda action: 0,
+                    monotonic=lambda: 0.0,
+                    marker_path=root / "marker" / "true-zero-reboot",
+                    boot_id="boot-a",
+                    defaults={},
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(alerts, [])
+            self.assertFalse(any("is not active" in line for line in logs.output))
+            self.assertTrue(any("not alerting" in line for line in logs.output))
+
+        alerts = []
+        stop = Event()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
+             self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+            status = CONTROL.run_watchdog(
+                Path("/tmp/dgx-fan-missing"),
+                Path("/tmp/dgx-fan-missing"),
+                unit_state=lambda: ("failed", "enabled", CONTROL.UNSUPPORTED_FIRMWARE_EXIT),
+                notifier=alerts.append,
+                runner=lambda action: 0,
+                monotonic=lambda: 0.0,
+                marker_path=Path(directory) / "true-zero-reboot",
+                boot_id="boot-a",
+                defaults={},
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(alerts, [])
+        self.assertFalse(any("is not active" in line for line in logs.output))
 
     def test_unsupported_firmware_flag_clears_on_read_and_is_never_written(self):
         reason = "unsupported firmware; telemetry only"

@@ -419,12 +419,17 @@ def daemon_stop_is_manual(active: str, enabled: str,
 def daemon_needs_alarm(active: str, enabled: str = "enabled",
                        exec_status: int | None = None,
                        result: str | None = None,
-                       n_restarts: int | None = None) -> bool:
+                       n_restarts: int | None = None,
+                       firmware_unsupported: bool = False) -> bool:
     """Alarm on a crash, a nonzero exit, or a restart loop.
 
-    A manual stop does not alarm. Exit 69 and 78 do not alarm here; the
-    health check reports those probes. A failed unit still alarms.
+    A manual stop does not alarm. Exit 69 does not alarm in any unit state,
+    including failed and enabled: that is the telemetry-only probe. Exit 78
+    does not alarm unless the unit is failed. Recognized unsupported firmware
+    is not a fault whether the unit is enabled or disabled.
     """
+    if firmware_unsupported or exec_status == UNSUPPORTED_FIRMWARE_EXIT:
+        return False
     if daemon_stop_is_manual(active, enabled, exec_status, result):
         return False
     if (
@@ -437,7 +442,7 @@ def daemon_needs_alarm(active: str, enabled: str = "enabled",
         return False
     if active == "failed":
         return True
-    if exec_status in (UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT):
+    if exec_status == FOREIGN_FLOOR_EXIT:
         return False
     if enabled == "disabled" and active == "inactive":
         return False
@@ -1527,7 +1532,12 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
         and n_restarts >= DAEMON_RESTART_LOOP
         and not manual
     )
-    if recognized:
+    if recognized and service_enabled == "enabled" and service_active != "active":
+        keep(
+            "daemon", "note",
+            "n/a (unsupported firmware; service enabled but idle)",
+        )
+    elif recognized:
         keep("daemon", "note", "n/a/stopped (unsupported firmware)")
     elif service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
         keep("daemon", "unknown")
@@ -2365,14 +2375,22 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         manual_stop = daemon_stop_is_manual(
             active_state, enabled_state, exec_status, unit_result,
         )
+        device_count = floor_devices(thermal_root)
+        firmware_unsupported = telemetry_only_firmware(
+            "", None, telemetry_hwmon_present(hwmon_root),
+            None if device_count is None else len(device_count),
+        )
         restart_loop = (
             n_restarts is not None
             and n_restarts >= DAEMON_RESTART_LOOP
             and not manual_stop
             and active_state == "active"
+            and not firmware_unsupported
+            and exec_status != UNSUPPORTED_FIRMWARE_EXIT
         )
         if daemon_needs_alarm(
             active_state, enabled_state, exec_status, unit_result, n_restarts,
+            firmware_unsupported=firmware_unsupported,
         ):
             now = monotonic()
             state_key = (active_state, enabled_state, exec_status, n_restarts)
@@ -2409,12 +2427,12 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         else:
             last_daemon_wall = None
             last_daemon_state = None
-            if (exec_status == UNSUPPORTED_FIRMWARE_EXIT and
-                    not reported_unsupported):
+            if ((exec_status == UNSUPPORTED_FIRMWARE_EXIT or firmware_unsupported)
+                    and not reported_unsupported):
                 LOG.warning(
-                    "dgx-fan-control: %s last exited %s "
-                    "(fan control unsupported); not alerting",
-                    DAEMON_UNIT, exec_status,
+                    "dgx-fan-control: %s is not a fault on unsupported "
+                    "firmware (active=%s enabled=%s exit=%s); not alerting",
+                    DAEMON_UNIT, active_state, enabled_state, exec_status,
                 )
                 reported_unsupported = True
         try:

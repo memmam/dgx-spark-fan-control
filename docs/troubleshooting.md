@@ -53,7 +53,11 @@ dgx-fan-control status
 That line is printed once. It is not also written to the log.
 `dgx-fan-control health` does not fail this state and does not set
 needs-intervention. The cooling device, the daemon, and the mode are
-`n/a`: telemetry is up and floor control is not. A last-set manual floor
+`n/a`: telemetry is up and floor control is not. A service left enabled
+from an earlier firmware reports
+`n/a (unsupported firmware; service enabled but idle)`, not failed, and
+the watchdog does not broadcast. `module enable` still leaves the service
+disabled unless `--force-service` or `--start-service` is set. A last-set manual floor
 is kept for a later downgrade to EC 3.5.8. Fans, temperature, and the
 watchdog are still checked. Health fails only when a firmware that should
 accept floor control has no cooling device, or when telemetry is missing.
