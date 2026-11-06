@@ -215,8 +215,8 @@ manual floor: the daemon refuses to start and systemd does not restart that
 exit either. `module enable` on EC
 3.13.7 loads telemetry and leaves the service disabled unless
 `--force-service` is set. `dgx-fan-control watchdog` does not alarm when the
-unit's last exit is 69. Exit 79, a held floor, is also quiet: `start` is
-refused until `automatic` clears the record. It still reports a failed unit,
+unit's last exit is 69. Exit 79, a held floor, is also quiet: the daemon exits
+79 on every start until `automatic` clears the record. It still reports a failed unit,
 and an enabled unit that is inactive for another reason.
 
 ## Firmware pairing
@@ -279,7 +279,7 @@ field is the exit code and `ExecMainExitTimestamp`.
 The watchdog does not treat a disabled, inactive service as a fault. It also
 stays quiet when the unit's last exit status is 69, the startup result for
 unsupported fan control, and when the last exit is 79, a held floor.
-`start` is refused while that floor is held. `module status` reports the exit
+Every start exits 79 while that floor is held. `module status` reports the exit
 code, with the time it happened, when the unit is failed or still enabled
 and inactive. It still
 alerts when the unit is `failed`, or enabled but inactive after another exit.

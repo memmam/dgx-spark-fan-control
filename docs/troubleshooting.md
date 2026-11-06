@@ -325,7 +325,8 @@ The service uses `Restart=always` with a 30-second delay and
 `StartLimitIntervalSec=0`, so a crash is retried forever. Exit 69 is reserved
 for the daemon's startup check that fan control is unsupported. Exit 78 is
 reserved for a foreign lower floor. Exit 79 is reserved for a held manual
-floor: `start` is refused and the cooling state is left as it is.
+floor: the daemon exits right after it starts and leaves the cooling
+state as it is.
 `RestartPreventExitStatus=69 78 79` stops only those exits from looping.
 A transport failure or crash does not use those codes, so it still restarts.
 Exit 69 used to
@@ -361,8 +362,8 @@ a later login. `sudo dgx-fan-control health --clear` removes the flag after
 you have dealt with it. A later recorded pass removes it as well.
 
 `dgx-fan-control watchdog` does not alarm when the last exit is 69. Exit 79,
-a held floor, is one info line and no broadcast. `start` is refused while
-that floor is held. Exit 78
+a held floor, is one info line and no broadcast. Every start exits 79
+while that floor is held. Exit 78
 is one broadcast and then journal lines, and then that one reboot. It still
 logs on every poll, and broadcasts when the state changes or every 30
 minutes, when the unit is `failed` or enabled but inactive for another

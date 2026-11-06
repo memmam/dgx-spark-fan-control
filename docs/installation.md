@@ -378,8 +378,8 @@ not write the flag or the record.
 `dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
 If you have explicitly enabled the performance
 service, stop it without disabling it, confirm the watchdog journal then
-shows the daemon-not-active alert, and start it again. `start` is refused
-while a floor is held. The daemon exits 79 and the watchdog does not alert
+shows the daemon-not-active alert, and start it again. While a floor is
+held, the daemon exits 79 right after `start`, and the watchdog does not alert
 for that exit.
 
 ```sh

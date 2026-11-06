@@ -172,8 +172,8 @@ sudo journalctl -u dgx-fan-control.service -n 30
 ```
 
 Use `sudo systemctl enable dgx-fan-control.service` if you also want this at
-boot. `sudo systemctl start dgx-fan-control.service` is refused while a floor
-is held: the daemon exits 79 and leaves the cooling state unchanged. Clear
+boot. While a floor is held, `sudo systemctl start dgx-fan-control.service`
+returns, then the daemon exits 79 and leaves the cooling state unchanged. Clear
 the record with `sudo dgx-fan-control automatic` first. `automatic` does not
 start the daemon. If the service is enabled, the next boot starts it; start
 it now with `sudo systemctl start dgx-fan-control.service` after the record
@@ -458,8 +458,8 @@ After a reboot, `systemctl is-active dgx-fan-watchdog.service` should print
 `active`, and `journalctl -u dgx-fan-watchdog.service` should contain
 `fan-stall watchdog watching`. If the performance service is enabled, stop
 it without disabling it and confirm the watchdog journal shows the
-daemon-not-active alert, then start it again. `start` is refused while a
-floor is held: the daemon exits 79, the cooling state stays, and the
+daemon-not-active alert, then start it again. While a floor is held,
+the daemon exits 79 right after `start`, the cooling state stays, and the
 watchdog does not alert for that exit.
 
 ```sh
@@ -509,7 +509,7 @@ The core checks are fan and thermal only:
 - `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
 - `dgx-fan-control.service` is active when it is enabled, and it did not
   exit 78. Exit 79 is a note, `stopped (held floor N; automatic clears it)`,
-  not a failure and not needs-intervention. `start` is refused while that
+  not a failure and not needs-intervention. every start exits 79 while that
   floor is held
 - both ACPI fans read nonzero RPM. The line lists every `fan*_input`
   under every hwmon device named `acpi_fan`, plus each ACPI `Fan`
