@@ -563,6 +563,9 @@ The core checks are fan and thermal only:
   `status` does not query fwupd
 - EC 3.13.7 telemetry-only is not a failure. `firmware:` says control is
   unsupported, and the cooling device, mode, and ready lines are `n/a`.
+  A `clock-cap:` note follows, in `health` and `status`, suggesting
+  `sudo nvidia-smi -lgc 0,2200` (the default in MiaAI-Lab's sparkLimiter).
+  It is advice only and nothing applies it; see [the EC curve](ec-curve.md).
   A service left enabled reports
   `daemon: n/a (unsupported firmware; service enabled but idle)`. The
   watchdog does not broadcast for exit 69 or for this firmware. A last-set

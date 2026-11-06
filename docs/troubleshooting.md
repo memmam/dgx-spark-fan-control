@@ -47,10 +47,12 @@ on after the module is loaded.
 
 ```sh
 dgx-fan-control status
-# control unsupported on this firmware
+# control unsupported on this firmware (telemetry only)
+# clock-cap: fans follow the EC curve only (base speed until about 80 C); ...
 ```
 
-That line is printed once. It is not also written to the log.
+The first line is printed once. The `clock-cap:` line is advice only; nothing
+changes GPU clocks. See [the EC curve](ec-curve.md). It is not also written to the log.
 `dgx-fan-control health` does not fail this state and does not set
 needs-intervention. The cooling device, the daemon, and the mode are
 `n/a`: telemetry is up and floor control is not. A service left enabled

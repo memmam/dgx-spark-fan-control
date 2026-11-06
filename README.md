@@ -83,7 +83,8 @@ longer set that enable bit. This is deliberate access control. Floor writes on
 3.13.7 are therefore expected to fail. Version 0.1.6 still accepts the exact
 capability reply. Probe on that profile reads capabilities and telemetry only.
 It does not send a floor command, and it does not create a cooling device.
-`dgx-fan-control status` then prints `control unsupported on this firmware` once.
+`dgx-fan-control status` then prints `control unsupported on this firmware` once,
+followed by an advisory `clock-cap:` line ([why](docs/ec-curve.md)).
 Floor writes require `allow_unverified_writes=1` at module load, which logs a
 warning. The 3.13.7 state table behind that switch is **not qualified**. Do
 not enable it to test a machine whose fans have stopped.
