@@ -6,3 +6,4 @@ python3 -m unittest discover -s "${root}/tests" -v
 bash -n "${root}/scripts/check" "${root}/scripts/build-sign" \
   "${root}/scripts/generate-signing-key" "${root}/scripts/install-userland" \
   "${root}/scripts/uninstall-userland" "${root}/dkms.conf"
+python3 -m py_compile "${root}/scripts/acpi-floor-sweep"

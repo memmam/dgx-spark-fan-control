@@ -70,3 +70,23 @@ Stop the service and run `sudo dgx-fan-control automatic`, then log the
 `nvidia-smi --query-gpu=temperature.gpu,utilization.gpu` once a second while
 a sustained GPU load runs. `gpu-burn` builds with `make` on the Spark without
 Docker. Restore any held floor afterward.
+
+## Measuring a lower ACPI floor
+
+The ACPI command refuses levels below 40. Level 30 comes from forum
+measurements (about 1940 RPM, with level 20 stalling one fan), and 40 is a
+margin above it, not a measured limit. To measure it on your own machine, run
+`scripts/acpi-floor-sweep` as root on EC 3.5.8, at idle, with the module
+unloaded and `dgx-fan-control.service` stopped:
+
+```
+sudo systemctl stop dgx-fan-control.service
+sudo modprobe -r dgx_ec_fan_control
+sudo scripts/acpi-floor-sweep 40 35 30
+```
+
+It holds each level for 180 seconds and logs both fans and the hottest zone
+every second to a CSV. It writes level 100 at once if a fan reads 0 or is
+missing, a fan drops below 1000 RPM, the hottest zone reaches 60 C, or the run
+is interrupted, and it always writes 100 when it finishes. It never writes a
+level below 30. EC 3.13.7 ignores these writes, so a run there measures nothing.
