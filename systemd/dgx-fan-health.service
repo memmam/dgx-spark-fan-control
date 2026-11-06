@@ -10,7 +10,7 @@ After=multi-user.target dgx-fan-watchdog.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/sbin/dgx-fan-control health
+ExecStart=/usr/local/sbin/dgx-fan-control health --record --settle 45
 TimeoutStartSec=120s
 
 # READY_CHECK and the notify hook may be a URL or another networked command.

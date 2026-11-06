@@ -893,7 +893,7 @@ class UserlandFailureTests(unittest.TestCase):
         (device / "max_state").write_text("12\n", encoding="ascii")
 
     def _health(self, root: Path, defaults, snapshot, *, settle=0.0, boot="boot-b",
-                clock=None, sleeper=None):
+                clock=None, sleeper=None, record=True):
         alerts = []
         notices = []
         if clock is None:
@@ -914,6 +914,7 @@ class UserlandFailureTests(unittest.TestCase):
             notifier=alerts.append,
             boot_id=boot,
             notify=lambda _defaults, summary: notices.append(summary),
+            record=record,
         )
         return code, alerts, notices
 
@@ -1062,14 +1063,189 @@ class UserlandFailureTests(unittest.TestCase):
     def test_health_clear_removes_the_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
-            CONTROL.write_intervention(
-                state / CONTROL.INTERVENTION_NAME, "workload not ready", "boot-b", 1.0,
-            )
-            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+            flag = state / CONTROL.INTERVENTION_NAME
+            CONTROL.write_intervention(flag, "workload not ready", "boot-b", 1.0)
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL.os, "geteuid", return_value=1000):
+                code, stdout, stderr = run_cli(["health", "--clear"])
+            self.assertEqual(code, 1)
+            self.assertIn("health --clear requires root", stdout)
+            self.assertNotIn("Traceback", stdout + stderr)
+            self.assertNotIn("Permission denied", stdout + stderr)
+            self.assertTrue(flag.exists())
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL.os, "geteuid", return_value=0):
                 code, stdout, _stderr = run_cli(["health", "--clear"])
             self.assertEqual(code, 0)
             self.assertIn("cleared the needs-intervention flag", stdout)
-            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+            self.assertFalse(flag.exists())
+
+    def test_interactive_health_is_one_pass_and_does_not_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            CONTROL.write_stall_marker(state / CONTROL.STALL_MARKER_NAME, "boot-a", 1.0)
+            CONTROL.write_intervention(
+                state / CONTROL.INTERVENTION_NAME, "old reason", "boot-a", 1.0,
+            )
+
+            def refuse_wait(delay):
+                raise AssertionError(f"interactive health slept {delay}")
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, alerts, notices = self._health(
+                    root, {}, self._healthy_snapshot(module_loaded=False),
+                    sleeper=refuse_wait, record=False,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 1)
+            self.assertEqual(alerts, [])
+            self.assertEqual(notices, [])
+            self.assertIn(
+                "module: fail (kernel module dgx_ec_fan_control is not loaded)",
+                text,
+            )
+            self.assertLess(text.index("module:"), text.index("health: fail"))
+            self.assertIn("recorded: no", text)
+            self.assertIn("stored needs-intervention: old reason", text)
+            self.assertTrue((state / CONTROL.STALL_MARKER_NAME).exists())
+            self.assertIn("old reason", (state / CONTROL.INTERVENTION_NAME).read_text())
+
+    def test_unreadable_sysfs_is_unknown_needs_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon"
+            thermal.chmod(0)
+            hwmon.chmod(0)
+            try:
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code, _alerts, _notices = self._health(
+                        root, {}, self._healthy_snapshot(), record=False,
+                    )
+            finally:
+                thermal.chmod(0o755)
+                hwmon.chmod(0o755)
+            text = stdout.getvalue()
+            self.assertEqual(code, 1)
+            self.assertIn("cooling-device: unknown (needs root)", text)
+            self.assertIn("fans: unknown (needs root)", text)
+            self.assertIn("temperature: unknown (needs root)", text)
+            self.assertNotIn("Permission denied", text)
+            self.assertIn("recorded: no", text)
+
+    def test_settle_logs_each_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            calls = {"n": 0}
+
+            def observer():
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return self._healthy_snapshot(module_loaded=False)
+                return self._healthy_snapshot()
+
+            clock = [0.0]
+
+            def sleep(delay):
+                clock[0] += delay
+
+            with self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code = CONTROL.run_health(
+                        root / "thermal", root / "hwmon",
+                        settle_seconds=10, poll_seconds=2,
+                        state_dir=root / "state", defaults={},
+                        monotonic=lambda: clock[0], wall_time=lambda: 1.0,
+                        sleeper=sleep, observer=observer, boot_id="boot-b",
+                        notifier=lambda message: None,
+                        notify=lambda _defaults, summary: None,
+                        record=False,
+                    )
+            self.assertEqual(code, 0)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(clock[0], 2.0)
+            text = "\n".join(logs.output)
+            self.assertIn("health attempt 1:", text)
+            self.assertIn(
+                "module: fail (kernel module dgx_ec_fan_control is not loaded)",
+                text,
+            )
+            self.assertIn("health: healthy", stdout.getvalue())
+            self.assertFalse((root / "state").exists())
+
+    def test_external_checks_time_out_instead_of_hanging(self):
+        def timed_out(*_args, **_kwargs):
+            raise CONTROL.subprocess.TimeoutExpired("cmd", CONTROL.CHECK_TIMEOUT_SECONDS)
+
+        with patch.object(CONTROL.subprocess, "run", side_effect=timed_out):
+            self.assertEqual(CONTROL.systemctl_query("is-active"), "timeout")
+            self.assertEqual(CONTROL.read_kernel_log(), "")
+            self.assertIsNone(CONTROL.gpu_job_running())
+            self.assertEqual(CONTROL.command_succeeded("in-flight"), "timeout")
+        with patch.object(CONTROL, "command_succeeded", return_value="timeout"):
+            self.assertEqual(
+                CONTROL.ready_for_work({"READY_CHECK": "in-flight"}), "timeout",
+            )
+            busy, how = CONTROL.work_is_in_progress(
+                {"BUSY_CHECK": "in-flight"},
+                lambda: (_ for _ in ()).throw(AssertionError("smi")),
+            )
+            self.assertTrue(busy)
+            self.assertEqual(how, "busy-check-failed")
+
+    def test_status_reports_unreadable_sysfs_without_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            hwmon = root / "hwmon"
+            thermal.mkdir()
+            hwmon.mkdir()
+            thermal.chmod(0)
+            try:
+                code, stdout, stderr = run_cli([
+                    "--thermal-root", str(thermal),
+                    "--hwmon-root", str(hwmon),
+                    "status",
+                ])
+            finally:
+                thermal.chmod(0o755)
+            combined = stdout + stderr
+            self.assertEqual(code, 0)
+            self.assertIn("unknown (needs root)", stdout)
+            self.assertNotIn("Permission denied", combined)
+            self.assertNotIn("Traceback", combined)
+
+    def test_record_flag_requires_root_and_still_prints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "absent-state"
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state), \
+                 patch.object(CONTROL.os, "geteuid", return_value=1000), \
+                 patch.object(CONTROL, "read_daemon_unit", return_value=("inactive", "disabled", None)), \
+                 patch.object(CONTROL, "watchdog_unit_state", return_value=("active", "enabled")), \
+                 patch.object(CONTROL, "_module_loaded_now", return_value=True):
+                code, stdout, stderr = run_cli([
+                    "--thermal-root", str(root / "thermal"),
+                    "--hwmon-root", str(root / "hwmon"),
+                    "health", "--record",
+                ])
+            combined = stdout + stderr
+            self.assertEqual(code, 1)
+            self.assertIn("health --record requires root", stdout)
+            self.assertIn("health: healthy", stdout)
+            self.assertIn("module: pass", stdout)
+            self.assertIn("recorded: no", stdout)
+            self.assertNotIn("Traceback", combined)
+            self.assertNotIn("Permission denied", combined)
+            self.assertFalse(state.exists())
 
     def test_one_spinning_fan_or_one_input_does_not_alert(self):
         with tempfile.TemporaryDirectory() as directory:

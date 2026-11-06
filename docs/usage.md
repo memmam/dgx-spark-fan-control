@@ -367,9 +367,15 @@ run on hardware yet.
 It does not depend on the watchdog. The watchdog keeps its own safety loop
 from early boot. The health check is the "login and SSH are up" result.
 
-`dgx-fan-control health` polls for up to 45 seconds (`--settle-seconds`, or
-`HEALTH_SETTLE_SECONDS` in the defaults file). The core checks are fan and
-thermal only:
+`dgx-fan-control health` does not need root. It does one pass and prints
+each check as it finishes, with `pass`, `fail (reason)`, or
+`unknown (needs root)`. A check that cannot be read is `unknown (needs root)`,
+not an error. The command exits nonzero when any check fails or is unknown.
+It also prints a needs-intervention flag or health file it can read.
+`systemctl`, `READY_CHECK`, `nvidia-smi`, and the kernel log read each time
+out after 5 seconds.
+
+The core checks are fan and thermal only:
 
 - `dgx_ec_fan_control` is loaded
 - `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
@@ -379,25 +385,30 @@ thermal only:
 - the hottest zone is readable and under 85°C
 - `dgx-fan-watchdog.service` is active
 
-`READY_CHECK` runs only after those pass. Empty means not configured, and
-the fan checks alone decide. A command succeeds on exit 0. A URL succeeds
-on an HTTP status from 200 through 299. Each try times out after 5 seconds,
-and a slow load is retried until the settle window ends. Failure sets
-`needs-intervention` with the reason `workload not ready`.
+`READY_CHECK` runs in the same pass. Empty means not configured, and the
+fan checks alone decide. A command succeeds on exit 0. A URL succeeds on
+an HTTP status from 200 through 299. Failure is the reason `workload not
+ready`.
 
-On pass it logs healthy, clears the reboot marker and the intervention
-flag, and writes `/var/lib/dgx-fan-control/health` with the result,
-`ready=pass`, `ready=fail`, or `ready=not configured`, the time, and the
-boot id. If this boot followed a watchdog reboot, it logs and broadcasts
-`recovered after watchdog reboot` once. On failure it writes the flag, logs
-critical, and does not reboot. `status` and `module status` print
-`NEEDS INTERVENTION:` while the flag is present.
-`dgx-fan-control health --clear` removes the flag. A later pass removes it
-too. `/etc/update-motd.d/95-dgx-fan-control` prints the reason on a later
-SSH login.
+The boot unit is different. `dgx-fan-health.service` runs
+`dgx-fan-control health --record --settle 45` as root. `--settle 45` retries
+for 45 seconds so a slow module load can still pass, and each failed attempt
+is one journal line naming the failing checks. `--record` writes
+`/var/lib/dgx-fan-control/health`, clears the reboot marker on pass, and on
+failure writes the needs-intervention flag. It does not reboot. If this boot
+followed a watchdog reboot, a pass logs and broadcasts `recovered after
+watchdog reboot` once. Root, including `sudo dgx-fan-control health`, records
+the same way. `--record` without root prints that it requires root and still
+prints the checks.
 
-`DGX_FAN_NOTIFY` is empty by default. When set, the summary is written to
-that command's standard input on failure and on recovery.
+`status` prints `NEEDS INTERVENTION:` while the flag is readable, and
+`unknown (needs root)` for a sysfs value it cannot read.
+`dgx-fan-control health --clear` removes the flag and requires root.
+A later recorded pass removes it too.
+`/etc/update-motd.d/95-dgx-fan-control` prints the reason on a later SSH login.
+
+`DGX_FAN_NOTIFY` is empty by default. When a recorded check has it set, the
+summary is written to that command's standard input on failure and on recovery.
 
 ## After a watchdog reboot
 

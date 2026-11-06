@@ -29,6 +29,3 @@ BUSY_CHECK=
 # Overrides dgx-fan-control watchdog --max-defer-seconds when set.
 MAX_DEFER_SECONDS=1800
 
-# Optional. Empty keeps the health check's 45 second settle window.
-# Keep this under the health unit's TimeoutStartSec of 120 seconds.
-HEALTH_SETTLE_SECONDS=

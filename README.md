@@ -173,7 +173,9 @@ protects the machine. A second boot that is still at 0 RPM powers off. Work
 in progress waits, and the hottest zone at 85°C powers off. A foreign floor
 reboots once the same way, without the repair; the next boot records
 needs-intervention instead of powering off. `dgx-fan-health.service` checks
-fans and thermals after boot. 85°C is a margin under the kernel critical
+fans and thermals after boot and retries for 45 seconds.
+`dgx-fan-control health` prints the same checks in one pass and does not
+need root. 85°C is a margin under the kernel critical
 trip near 104°C, using a reported rise of about 4°C/s, not a published EC
 cutoff. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
 also logs and broadcasts

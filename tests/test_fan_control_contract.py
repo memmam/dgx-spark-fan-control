@@ -160,7 +160,10 @@ class UserlandPolicyTests(unittest.TestCase):
         self.assertIn("rm -f /etc/update-motd.d/95-dgx-fan-control\n", UNINSTALL_USERLAND)
         health = (ROOT / "systemd" / "dgx-fan-health.service").read_text()
         self.assertIn("Type=oneshot\n", health)
-        self.assertIn("ExecStart=/usr/local/sbin/dgx-fan-control health\n", health)
+        self.assertIn(
+            "ExecStart=/usr/local/sbin/dgx-fan-control health --record --settle 45\n",
+            health,
+        )
         self.assertIn("After=multi-user.target dgx-fan-watchdog.service\n", health)
         self.assertNotIn("Requires=", health)
         self.assertNotIn("PrivateNetwork=", health)

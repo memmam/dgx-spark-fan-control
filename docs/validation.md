@@ -48,7 +48,9 @@ Exit 78 stops that loop. The recovery is a reboot, which clears the ACPI
 floor. Do not write ACPI level 0, and do not toggle the service to clear it.
 The watchdog's 85°C poweroff, the deferral while work is in progress, the
 reboot marker, the one foreign-floor reboot, the needs-intervention flag,
-and the post-boot health check have not been run on hardware. 85°C is a
+and the post-boot health check have not been run on hardware. An
+interactive `dgx-fan-control health` is one read-only pass. The 45 second
+retry runs only from `dgx-fan-health.service`. 85°C is a
 margin under the kernel critical trip near 104°C (104.8 in the tonyd2wild
 notes). Those notes show a hotspot rising about 4°C/s, fast enough to pass
 that trip before the next sample is logged. 85°C, polled every 2 seconds,

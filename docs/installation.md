@@ -352,7 +352,9 @@ sudo journalctl -u dgx-fan-health.service -b --no-pager
 
 Both `is-active` commands should print `active`. The watchdog journal should
 contain `fan-stall watchdog watching`. The health journal should contain
-`dgx-fan-control: healthy`, or a needs-intervention line when a check failed.
+`health: healthy`, or a needs-intervention line when a check failed.
+`dgx-fan-control health` as a normal user prints the same checks in one pass
+and does not write the flag.
 `dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
 If you have explicitly enabled the performance
 service, stop it without disabling it, confirm the watchdog journal then

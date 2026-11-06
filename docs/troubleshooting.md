@@ -200,10 +200,11 @@ not a true-zero stall and the watchdog does not run the repair. It does
 reboot once, after the same hold and the same deferral as a true zero. If
 the next boot still has the foreign floor, it writes
 `/var/lib/dgx-fan-control/needs-intervention` and does not reboot again and
-does not power off. `dgx-fan-control health` reports the same failure, and
-the motd snippet shows it on a later login. `dgx-fan-control health --clear`
-removes the flag after you have dealt with it. A later passing check
-removes it as well.
+does not power off. `dgx-fan-control health` reports the same failure
+without root, in one pass, and does not write anything. The boot unit
+retries for 45 seconds and records the flag. The motd snippet shows it on
+a later login. `sudo dgx-fan-control health --clear` removes the flag after
+you have dealt with it. A later recorded pass removes it as well.
 
 `dgx-fan-control watchdog` does not alarm when the last exit is 69. Exit 78
 is one broadcast and then journal lines, and then that one reboot. It still

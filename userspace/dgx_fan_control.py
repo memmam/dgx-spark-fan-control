@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
 CHECK_TIMEOUT_SECONDS = 5.0
+NEEDS_ROOT = "unknown (needs root)"
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 WATCHDOG_REBOOT_ACTION = "systemctl reboot"
 DAEMON_UNIT = "dgx-fan-control.service"
@@ -224,8 +226,13 @@ def systemctl_query(verb: str, unit: str = DAEMON_UNIT) -> str:
         completed = subprocess.run(
             ["systemctl", verb, unit],
             check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
         return "unknown"
     lines = (completed.stdout or "").strip().splitlines()
     return lines[0] if lines else "unknown"
@@ -251,8 +258,9 @@ def systemctl_show_properties(unit: str, names: tuple[str, ...]) -> dict[str, st
     try:
         completed = subprocess.run(
             command, check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return {}
     found: dict[str, str] = {}
     for line in (completed.stdout or "").splitlines():
@@ -456,10 +464,32 @@ def write_intervention(path: Path, reason: str, boot_id: str | None, when: float
     )
 
 
+def access_denied(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EPERM)
+
+
+def scandir_names(path: Path) -> list[str] | None:
+    """Directory entry names, or None when the directory is not readable."""
+    try:
+        with os.scandir(path) as scanned:
+            names = [entry.name for entry in scanned]
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        if access_denied(exc):
+            return None
+        return []
+    return sorted(names)
+
+
 def read_intervention_reason(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="ascii")
-    except OSError:
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
         return None
     for line in text.splitlines():
         key, separator, value = line.partition("=")
@@ -540,10 +570,18 @@ def recovery_already_announced(state_dir: Path, boot_id: str | None) -> bool:
 
 
 def read_defaults(path: Path = NOTIFY_DEFAULT) -> dict[str, str]:
-    """KEY=VALUE lines from /etc/default/dgx-fan-control. Missing file is empty."""
+    """KEY=VALUE lines from /etc/default/dgx-fan-control. Missing file is empty.
+
+    Permission denied is raised so a health check can say it needs root
+    instead of treating the file as unset.
+    """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if access_denied(exc):
+            raise
         return {}
     found = {}
     for raw in text.splitlines():
@@ -555,10 +593,11 @@ def read_defaults(path: Path = NOTIFY_DEFAULT) -> dict[str, str]:
     return found
 
 
-def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> bool | None:
-    """True on success, False on a clean non-zero exit, None if it cannot be run.
+def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> bool | None | str:
+    """True on success, False on a clean non-zero exit.
 
-    An http or https URL is a GET. None covers timeouts and other failures.
+    An http or https URL is a GET. ``timeout`` and ``unknown (needs root)``
+    name those outcomes. None is any other failure.
     """
     command = command.strip()
     if not command:
@@ -567,13 +606,27 @@ def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> b
         try:
             with urllib.request.urlopen(command, timeout=timeout) as response:
                 return 200 <= getattr(response, "status", 200) < 300
-        except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+        except TimeoutError:
+            return "timeout"
+        except urllib.error.URLError as exc:
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                return "timeout"
+            return None
+        except OSError as exc:
+            if access_denied(exc):
+                return NEEDS_ROOT
+            return None
+        except ValueError:
             return None
     try:
         completed = subprocess.run(
             command, shell=True, check=False, timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
         return None
     return completed.returncode == 0
 
@@ -587,9 +640,11 @@ def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
     command = defaults.get("BUSY_CHECK", "").strip()
     if command:
         result = command_succeeded(command)
-        if result is None:
-            return True, "busy-check-failed"
-        return result, "busy-check"
+        if result is True:
+            return True, "busy-check"
+        if result is False:
+            return False, "busy-check"
+        return True, "busy-check-failed"
     state = gpu_jobs()
     if state is None:
         return True, "nvidia-smi-failed"
@@ -597,11 +652,15 @@ def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
 
 
 def ready_for_work(defaults: dict[str, str]) -> str:
-    """pass, fail, or not configured. A URL or command failure is fail."""
+    """pass, fail, timeout, not configured, or unknown (needs root)."""
     command = defaults.get("READY_CHECK", "").strip()
     if not command:
         return "not configured"
     result = command_succeeded(command)
+    if result == NEEDS_ROOT:
+        return NEEDS_ROOT
+    if result == "timeout":
+        return "timeout"
     if result is True:
         return "pass"
     return "fail"
@@ -622,49 +681,175 @@ def configured_float(defaults: dict[str, str], key: str, fallback: float) -> flo
     return value
 
 
-def fan_health_reasons(thermal_root: Path, hwmon_root: Path, *,
-                       module_loaded: bool, service_active: str,
-                       service_enabled: str, exec_status: int | None,
-                       watchdog_active: str, soc_celsius: float,
-                       log_text: str = "") -> list[str]:
-    """Fan and thermal checks only. Empty means those checks passed.
+def _emit_check(name: str, status: str, detail: str, emit) -> str | None:
+    """Print one check. Return the flag text when it is not a pass."""
+    if status == "pass":
+        emit(f"{name}: pass")
+        return None
+    if status == "unknown":
+        emit(f"{name}: {NEEDS_ROOT}")
+        return f"{name}: {NEEDS_ROOT}"
+    emit(f"{name}: fail ({detail})")
+    return detail
 
-    The performance daemon is required only when it is enabled. Exit 78, a
-    missing cooling device, a stopped fan, an unreadable or hot zone, and a
-    stopped watchdog are failures.
-    """
-    reasons = []
-    if not module_loaded:
-        reasons.append("kernel module dgx_ec_fan_control is not loaded")
-    devices = cooling_devices(thermal_root)
-    foreign = (
-        exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
-    ) or (
-        len(devices) != 1 and "refusing to replace existing lower floor" in log_text
-    )
-    if foreign:
-        reasons.append("probe refused a foreign lower floor")
-    elif len(devices) != 1:
-        reasons.append("dgx_ec_fan_floor cooling device is missing")
-    if service_enabled == "enabled" and service_active != "active":
-        reasons.append(f"{DAEMON_UNIT} is not active ({service_active})")
+
+def _module_loaded_now() -> bool | None:
+    """True, False, or None when /sys/module cannot be read."""
+    path = Path("/sys/module") / MODULE_NAME
     try:
-        rpms = read_named_fan_rpms(hwmon_root)
-    except (OSError, UnicodeError, ValueError, RuntimeError):
-        reasons.append("ACPI fan inputs are unreadable")
-    else:
-        if len(rpms) < 2 or any(rpm == 0 for rpm in rpms):
-            reasons.append("ACPI fans are not all nonzero")
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if access_denied(exc):
+            return None
+        return False
+    return stat.S_ISDIR(mode)
+
+
+def _count_floor_devices(thermal_root: Path) -> int | None:
+    names = scandir_names(thermal_root)
+    if names is None:
+        return None
+    found = 0
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        try:
+            kind = (thermal_root / name / "type").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return None
+            continue
+        if kind == COOLING_DEVICE_TYPE:
+            found += 1
+    return found
+
+
+def _fan_status(hwmon_root: Path) -> tuple[str, str]:
+    names = scandir_names(hwmon_root)
+    if names is None:
+        return "unknown", ""
+    rpms: list[int] = []
+    for name in names:
+        device = hwmon_root / name
+        try:
+            kind = (device / "name").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return "unknown", ""
+            continue
+        if kind != ACPI_FAN_NAME:
+            continue
+        fan_names = scandir_names(device)
+        if fan_names is None:
+            return "unknown", ""
+        for fan in fan_names:
+            if not (fan.startswith("fan") and fan.endswith("_input")):
+                continue
+            try:
+                rpms.append(int((device / fan).read_text(encoding="ascii").strip()))
+            except OSError as exc:
+                if access_denied(exc):
+                    return "unknown", ""
+                return "fail", "ACPI fan inputs are unreadable"
+            except (UnicodeError, ValueError):
+                return "fail", "ACPI fan inputs are unreadable"
+    if len(rpms) < 2 or any(rpm == 0 for rpm in rpms):
+        return "fail", "ACPI fans are not all nonzero"
+    return "pass", ""
+
+
+def _temperature_status(thermal_root: Path, soc_celsius: float) -> tuple[str, str]:
     try:
         hottest = read_hottest_temperature_c(thermal_root)
+    except PermissionError:
+        return "unknown", ""
     except (OSError, RuntimeError, ValueError):
-        reasons.append("hottest zone is not readable")
+        return "fail", "hottest zone is not readable"
+    if hottest >= soc_celsius:
+        return "fail", f"hottest zone is {hottest:.1f}C"
+    return "pass", ""
+
+
+def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
+                          module_loaded: bool | None, service_active: str,
+                          service_enabled: str, exec_status: int | None,
+                          watchdog_active: str, soc_celsius: float,
+                          log_text: str | None, ready: str, emit) -> list[str]:
+    """Run every check, emitting each line before the next external call.
+
+    ``log_text`` None means read the kernel log only if a missing cooling
+    device still needs to be classified. The returned list is flag text for
+    checks that did not pass. ``ready`` is pass, fail, timeout, not
+    configured, or unknown (needs root).
+    """
+    problems: list[str] = []
+
+    def keep(name: str, status: str, detail: str = "") -> None:
+        problem = _emit_check(name, status, detail, emit)
+        if problem:
+            problems.append(problem)
+
+    if module_loaded is None:
+        module_loaded = _module_loaded_now()
+    if module_loaded is None:
+        keep("module", "unknown")
+    elif module_loaded:
+        keep("module", "pass")
     else:
-        if hottest >= soc_celsius:
-            reasons.append(f"hottest zone is {hottest:.1f}C")
-    if watchdog_active != "active":
-        reasons.append(f"{WATCHDOG_UNIT} is not active ({watchdog_active})")
-    return reasons
+        keep("module", "fail", "kernel module dgx_ec_fan_control is not loaded")
+
+    devices = _count_floor_devices(thermal_root)
+    foreign = exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
+    if devices is None:
+        keep("cooling-device", "unknown")
+    elif foreign:
+        keep("cooling-device", "fail", "probe refused a foreign lower floor")
+    elif devices != 1:
+        if log_text is None and module_loaded is True:
+            log_text = read_kernel_log()
+        if log_text and "refusing to replace existing lower floor" in log_text:
+            keep("cooling-device", "fail", "probe refused a foreign lower floor")
+        else:
+            keep("cooling-device", "fail", "dgx_ec_fan_floor cooling device is missing")
+    else:
+        keep("cooling-device", "pass")
+
+    if service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
+        keep("daemon", "unknown")
+    elif service_active == "timeout" or service_enabled == "timeout":
+        keep("daemon", "fail", "systemctl timed out")
+    elif service_active == "unknown" or service_enabled == "unknown":
+        keep("daemon", "fail", "systemctl state unknown")
+    elif service_enabled == "enabled" and service_active != "active":
+        keep("daemon", "fail", f"{DAEMON_UNIT} is not active ({service_active})")
+    else:
+        keep("daemon", "pass")
+
+    keep("fans", *_fan_status(hwmon_root))
+    keep("temperature", *_temperature_status(thermal_root, soc_celsius))
+
+    if watchdog_active == NEEDS_ROOT:
+        keep("watchdog", "unknown")
+    elif watchdog_active == "timeout":
+        keep("watchdog", "fail", "systemctl timed out")
+    elif watchdog_active != "active":
+        keep("watchdog", "fail", f"{WATCHDOG_UNIT} is not active ({watchdog_active})")
+    else:
+        keep("watchdog", "pass")
+
+    if ready == "not configured":
+        emit("ready: not configured")
+    elif ready == "pass":
+        emit("ready: pass")
+    elif ready == "timeout":
+        keep("ready", "fail", "READY_CHECK timed out")
+    elif ready == NEEDS_ROOT:
+        keep("ready", "unknown")
+    else:
+        keep("ready", "fail", "workload not ready")
+    return problems
 
 
 def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
@@ -693,29 +878,44 @@ def run_notify(defaults: dict[str, str], summary: str) -> None:
         LOG.warning("notify hook failed: %s", exc)
 
 
+def _stored_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return "none"
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
+        return "none"
+
+
 def run_health(thermal_root: Path, hwmon_root: Path, *,
-               settle_seconds: float = HEALTH_SETTLE_SECONDS,
+               settle_seconds: float = 0,
                poll_seconds: float = HEALTH_POLL_SECONDS,
                soc_celsius: float = WATCHDOG_SOC_CELSIUS,
                state_dir: Path | None = None,
                defaults: dict[str, str] | None = None,
                monotonic=None, wall_time=None, sleeper=None,
                observer=None, notifier=None, boot_id: str | None = None,
-               notify=None) -> int:
-    """Check fans and thermals, then the optional READY_CHECK.
+               notify=None, record: bool | None = None) -> int:
+    """Print fan, thermal, and READY_CHECK results.
 
-    Polls until the settle window ends so a slow module load can still pass.
-    READY_CHECK runs only after the fan checks pass. Its failure is the
-    reason 'workload not ready'. A pass clears the reboot and intervention
-    markers. A failure records the flag and does not reboot.
+    An interactive call uses one pass and does not write. ``settle_seconds``
+    retries until the checks pass; the boot unit passes that. Lines are
+    printed as each check finishes on a single pass. While settling, each
+    failed attempt is one journal line. Writing the health file, clearing
+    markers, broadcasting, and setting the flag happen only when ``record``
+    is true. The default records when the effective uid is 0.
     """
     if state_dir is None:
         state_dir = STALL_MARKER_DIR
+    defaults_denied = False
     if defaults is None:
-        defaults = read_defaults()
-    settle_seconds = configured_float(
-        defaults, "HEALTH_SETTLE_SECONDS", settle_seconds,
-    )
+        try:
+            defaults = read_defaults()
+        except OSError as exc:
+            defaults = {}
+            defaults_denied = access_denied(exc)
     if not math.isfinite(settle_seconds) or settle_seconds < 0:
         raise ValueError("health settle interval must be finite and non-negative")
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
@@ -732,65 +932,123 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
         notify = run_notify
     if boot_id is None:
         boot_id = read_boot_id()
+    if record is None:
+        record = os.geteuid() == 0
+    interactive = settle_seconds <= 0
     deadline = monotonic() + settle_seconds
+    attempt = 0
+    lines: list[str] = []
+    problems: list[str] = []
     ready = "not configured"
-    reasons = ["health check did not run"]
-    while True:
+
+    def evaluate(emit) -> list[str]:
+        nonlocal ready
         if observer is None:
             active, enabled, exec_status = read_daemon_unit()
             watchdog_active, _watchdog_enabled = watchdog_unit_state()
             snapshot = {
-                "module_loaded": module_is_loaded(),
+                "module_loaded": None,
                 "service_active": active,
                 "service_enabled": enabled,
                 "exec_status": exec_status,
                 "watchdog_active": watchdog_active,
-                "log_text": read_kernel_log(),
             }
+            log_text = None
         else:
             snapshot = observer()
-        reasons = fan_health_reasons(
-            thermal_root, hwmon_root, soc_celsius=soc_celsius, **snapshot,
-        )
-        if not reasons:
+            log_text = snapshot.get("log_text", "")
+        if defaults_denied:
+            ready = NEEDS_ROOT
+        else:
             ready = ready_for_work(defaults)
-            if ready == "fail":
-                reasons = ["workload not ready"]
-            else:
-                break
-        if monotonic() >= deadline:
+        return collect_health_checks(
+            thermal_root, hwmon_root,
+            module_loaded=snapshot.get("module_loaded", None),
+            service_active=snapshot["service_active"],
+            service_enabled=snapshot["service_enabled"],
+            exec_status=snapshot.get("exec_status"),
+            watchdog_active=snapshot["watchdog_active"],
+            soc_celsius=soc_celsius,
+            log_text=log_text,
+            ready=ready,
+            emit=emit,
+        )
+
+    while True:
+        attempt += 1
+        lines = []
+        if interactive:
+            problems = evaluate(lambda line: (lines.append(line), print(line, flush=True)))
+        else:
+            problems = evaluate(lines.append)
+        if not problems or interactive or monotonic() >= deadline:
+            if problems and not interactive:
+                LOG.info("health attempt %d: %s", attempt, "; ".join(
+                    line for line in lines if not line.endswith(": pass")
+                    and line != "ready: not configured" and line != "ready: pass"
+                ))
             break
+        failing = [
+            line for line in lines
+            if not line.endswith(": pass")
+            and line != "ready: not configured" and line != "ready: pass"
+        ]
+        LOG.info("health attempt %d: %s", attempt, "; ".join(failing))
         sleeper(poll_seconds)
+    if not interactive:
+        for line in lines:
+            print(line, flush=True)
+    print("health: healthy" if not problems else "health: fail", flush=True)
     when = wall_time()
     health_path = state_dir / HEALTH_NAME
     intervention_path = state_dir / INTERVENTION_NAME
-    if not reasons:
-        previous = pending_watchdog_reboot(state_dir, boot_id)
-        clear_stall_marker(state_dir / STALL_MARKER_NAME)
-        clear_stall_marker(intervention_path)
-        clear_stall_marker(state_dir / PREVIOUS_REBOOT_NAME)
-        write_health_record(health_path, "healthy", ready, [], boot_id, when)
-        if previous and not recovery_already_announced(state_dir, boot_id):
-            message = "dgx-fan-control: recovered after watchdog reboot"
-            LOG.info(message)
-            _wall(notifier, message, "recovery notice")
-            write_state_text(
-                state_dir / RECOVERY_ANNOUNCED_NAME,
-                f"boot_id={boot_id or ''}\n",
-            )
-            notify(defaults, message + "\n")
-        else:
-            LOG.info("dgx-fan-control: healthy")
-        return 0
-    reason = "; ".join(reasons)
-    write_intervention(intervention_path, reason, boot_id, when)
-    write_health_record(
-        health_path, "needs-intervention", ready, reasons, boot_id, when,
-    )
-    message = f"dgx-fan-control: needs intervention: {reason}"
-    LOG.critical(message)
-    notify(defaults, message + "\n")
-    return 1
+    if record:
+        try:
+            if not problems:
+                previous = pending_watchdog_reboot(state_dir, boot_id)
+                clear_stall_marker(state_dir / STALL_MARKER_NAME)
+                clear_stall_marker(intervention_path)
+                clear_stall_marker(state_dir / PREVIOUS_REBOOT_NAME)
+                write_health_record(health_path, "healthy", ready, [], boot_id, when)
+                if previous and not recovery_already_announced(state_dir, boot_id):
+                    message = "dgx-fan-control: recovered after watchdog reboot"
+                    LOG.info(message)
+                    _wall(notifier, message, "recovery notice")
+                    write_state_text(
+                        state_dir / RECOVERY_ANNOUNCED_NAME,
+                        f"boot_id={boot_id or ''}\n",
+                    )
+                    notify(defaults, message + "\n")
+                else:
+                    LOG.info("dgx-fan-control: healthy")
+            else:
+                reason = "; ".join(problems)
+                write_intervention(intervention_path, reason, boot_id, when)
+                write_health_record(
+                    health_path, "needs-intervention", ready, problems, boot_id, when,
+                )
+                message = f"dgx-fan-control: needs intervention: {reason}"
+                LOG.critical(message)
+                notify(defaults, message + "\n")
+        except OSError as exc:
+            if access_denied(exc):
+                print("recorded: no (needs root)", flush=True)
+                return 1
+            raise
+    stored_flag = _stored_text(intervention_path)
+    if stored_flag not in {"none", NEEDS_ROOT} and stored_flag.startswith("reason="):
+        stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
+    stored_health = _stored_text(health_path)
+    if stored_health not in {"none", NEEDS_ROOT}:
+        kept = [
+            line for line in stored_health.splitlines()
+            if line.startswith("result=") or line.startswith("ready=")
+        ]
+        stored_health = " ".join(kept) if kept else stored_health.splitlines()[0]
+    print(f"stored needs-intervention: {stored_flag}", flush=True)
+    print(f"stored health: {stored_health}", flush=True)
+    print("recorded: yes" if record else "recorded: no", flush=True)
+    return 0 if not problems else 1
 
 
 def show_intervention() -> None:
@@ -939,7 +1197,11 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     if gpu_jobs is None:
         gpu_jobs = gpu_job_running
     if defaults is None:
-        defaults = read_defaults()
+        try:
+            defaults = read_defaults()
+        except OSError:
+            LOG.warning("could not read %s; BUSY_CHECK is unset", NOTIFY_DEFAULT)
+            defaults = {}
     max_defer_seconds = configured_float(
         defaults, "MAX_DEFER_SECONDS", max_defer_seconds,
     )
@@ -1327,15 +1589,28 @@ def require_control(thermal_root: Path, hwmon_root: Path, *,
 
 
 def read_hottest_temperature_c(thermal_root: Path) -> float:
+    names = scandir_names(thermal_root)
+    if names is None:
+        raise PermissionError(errno.EACCES, "thermal zones are not readable")
     readings = []
-    for path in sorted(thermal_root.glob("thermal_zone*/temp")):
+    denied = False
+    for name in names:
+        if not name.startswith("thermal_zone"):
+            continue
+        path = thermal_root / name / "temp"
         try:
             millidegrees = int(path.read_text(encoding="ascii").strip())
-        except (OSError, UnicodeError, ValueError):
+        except OSError as exc:
+            if access_denied(exc):
+                denied = True
+            continue
+        except (UnicodeError, ValueError):
             continue
         if 0 < millidegrees <= 200_000:
             readings.append(millidegrees / 1000.0)
     if not readings:
+        if denied:
+            raise PermissionError(errno.EACCES, "thermal zones are not readable")
         raise RuntimeError("no valid kernel thermal-zone readings are available")
     return max(readings)
 
@@ -1388,8 +1663,9 @@ def read_kernel_log() -> str:
     try:
         completed = subprocess.run(
             ["dmesg"], check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return ""
     return completed.stdout or ""
 
@@ -2135,13 +2411,21 @@ def build_parser() -> argparse.ArgumentParser:
     health.add_argument(
         "--clear",
         action="store_true",
-        help="remove the needs-intervention flag",
+        help="remove the needs-intervention flag; requires root",
     )
     health.add_argument(
-        "--settle-seconds",
+        "--settle",
         type=float,
-        default=HEALTH_SETTLE_SECONDS,
-        help="keep polling this long so a slow boot can still pass",
+        default=0,
+        help=(
+            "seconds to retry; interactive health does one pass, "
+            f"the boot unit passes {HEALTH_SETTLE_SECONDS:.0f}"
+        ),
+    )
+    health.add_argument(
+        "--record",
+        action="store_true",
+        help="write the health file and needs-intervention flag; requires root",
     )
     health.add_argument("--poll-seconds", type=float, default=HEALTH_POLL_SECONDS)
     return parser
@@ -2220,15 +2504,31 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "health":
             if args.clear:
+                if os.geteuid() != 0:
+                    print("dgx-fan-control health --clear requires root")
+                    return 1
                 clear_stall_marker(STALL_MARKER_DIR / INTERVENTION_NAME)
                 print("cleared the needs-intervention flag")
                 return 0
-            return run_health(
+            record_denied = args.record and os.geteuid() != 0
+            if record_denied:
+                print("dgx-fan-control health --record requires root")
+            code = run_health(
                 args.thermal_root,
                 args.hwmon_root,
-                settle_seconds=args.settle_seconds,
+                settle_seconds=args.settle,
                 poll_seconds=args.poll_seconds,
+                record=os.geteuid() == 0,
             )
+            if record_denied and code == 0:
+                return 1
+            return code
+        if args.command == "status" and scandir_names(args.thermal_root) is None:
+            show_intervention()
+            print(f"state={NEEDS_ROOT} hottest={NEEDS_ROOT}")
+            active, enabled = watchdog_unit_state()
+            print(format_watchdog_status(active, enabled), end="")
+            return 0
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
@@ -2239,17 +2539,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             try:
                 state = read_state(cooling_device)
+            except OSError as exc:
+                if not access_denied(exc):
+                    raise
+                state = None
             except RuntimeError as exc:
                 if "floor was changed outside this driver" in str(exc):
                     show_intervention()
                     print(exc)
                     return 1
                 raise
+            try:
+                hottest = read_hottest_temperature_c(args.thermal_root)
+            except OSError as exc:
+                if not access_denied(exc):
+                    raise
+                hottest = None
             active, enabled = watchdog_unit_state()
             show_intervention()
-            print(format_cooling_status(
-                state, read_hottest_temperature_c(args.thermal_root),
-            ))
+            if state is None or hottest is None:
+                state_text = NEEDS_ROOT if state is None else f"{state}/{MAX_STATE}"
+                hottest_text = NEEDS_ROOT if hottest is None else f"{hottest:.1f}C"
+                print(f"state={state_text} hottest={hottest_text}")
+            else:
+                print(format_cooling_status(state, hottest))
             print(format_watchdog_status(active, enabled), end="")
             return 0
     except ControlUnsupported as exc:
