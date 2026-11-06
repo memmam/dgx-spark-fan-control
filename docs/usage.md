@@ -327,14 +327,23 @@ overrides the flag. When the limit runs out and the fans are still at 0
 RPM, or the floor is still foreign, the watchdog broadcasts a critical
 alert and keeps deferring. It does not reboot through work.
 
-If the hottest thermal zone, the maximum across every zone, reaches
-`--soc-celsius` while the fans are at 0 RPM, it powers off immediately.
-That does not wait for `--reboot-seconds`, and it does not matter whether
-work is in progress. The default is **85°C**. A stall itself does not
-require a high temperature: both tachometers at 0 RPM are enough.
+If the hottest thermal zone reaches `--zero-fan-celsius` while **both**
+fans read 0 RPM, it powers off immediately. That does not wait for
+`--reboot-seconds`, and it does not matter whether work is in progress.
+The default is **85°C**. `--soc-celsius` is a deprecated alias for that
+true-zero cutoff. A stall itself does not require a high temperature:
+both tachometers at 0 RPM are enough. Spinning fans are not powered off
+for temperature.
 
-85°C is a margin, not a measured EC limit. The kernel's critical trip is
-about 104°C (104.8 in
+85°C is not a general limit. A published 4-node DGX Spark setup
+([tenhkspark/dgx-spark-tuning](https://github.com/tenhkspark/dgx-spark-tuning))
+reports GPU temperatures of about 72–77°C and a **system** temperature of
+about **84°C** during a 1M-token prefill, with the fans healthy and 0 ms
+of throttling. That figure is user-reported, not a specification. A
+healthy machine under heavy load can sit next to 85°C while the fans are
+spinning, so that cutoff must not power the machine off in that state.
+
+The kernel's critical trip is about 104°C (104.8 in
 [tonyd2wild/DGX-Spark-Hard-Poweroff-Fix](https://github.com/tonyd2wild/DGX-Spark-Hard-Poweroff-Fix)).
 That repository reports a hotspot spiking from about 90°C to about 98°C in
 about 2 seconds, roughly 4°C/s, before a hard power cut. At that rate the
@@ -343,9 +352,13 @@ logged, so the cut the repository calls faster than Linux can log is
 consistent with the ordinary critical trip. The repository's other
 suggestion, a thermal/over-current cut, is the alternative. No sourced EC
 temperature cutoff exists. 98°C there is the last reading that was logged,
-not a limit. The watchdog polls every 2 seconds. From 85°C, a 4°C/s rise
-still leaves several samples before 104.8°C, which is time for a clean
-poweroff.
+not a limit. Userspace polling cannot beat a rise of about 4°C/s to that
+trip: a fixed threshold near the spike would miss it and only look like
+protection. The defenses that work are keeping the fans running, which is
+what the true-zero path is for, and avoiding the spike in the first place
+with a fan floor or pre-cool. If the hottest zone rises about 4°C/s between
+polls, the watchdog writes one observational journal line and takes no
+action.
 
 A `wall` broadcast for a daemon that is enabled but not running is sent when
 that state changes, and again at most every 30 minutes
@@ -357,9 +370,9 @@ The fans are already held high. One broadcast says a reboot clears the ACPI
 floor, then the journal repeats it. After `--reboot-seconds`, with no work
 in progress, it reboots once. If the next boot still has that floor, it
 writes `/var/lib/dgx-fan-control/needs-intervention` and does not reboot
-again and does not power off. The hottest zone at or above 85°C is still a
-poweroff, including while a reboot is deferred. The true-zero and 85°C
-poweroff paths stay armed whether or not the health check has failed.
+again and does not power off. A foreign floor holds the fans high, so
+temperature does not power the machine off on that path. The true-zero
+poweroff stays armed whether or not the health check has failed.
 
 Install starts this as `dgx-fan-watchdog.service`, either with
 `scripts/install-userland` or the manual commands in
@@ -388,7 +401,7 @@ sudo systemctl start dgx-fan-control.service
 Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
 path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
-`--stall-seconds`, `--reboot-seconds`, `--soc-celsius`, `--action`,
+`--stall-seconds`, `--reboot-seconds`, `--zero-fan-celsius`, `--action`,
 `--reboot-action`, `--alert-repeat-seconds`, and `--max-defer-seconds`
 change the alert hold, the reboot hold, the hottest-zone poweroff
 temperature, the poweroff command, the reboot command, how often a standing
@@ -422,7 +435,9 @@ The core checks are fan and thermal only:
 - `dgx-fan-control.service` is active when it is enabled, and it did not
   exit 78
 - both ACPI fans read nonzero RPM
-- the hottest zone is readable and under 85°C
+- the hottest zone is readable. At or above 85°C with the fans spinning
+  the line is `warn (hot under load)`, which does not fail the check and
+  does not set needs-intervention
 - `dgx-fan-watchdog.service` is active
 
 `READY_CHECK` runs in the same pass. Empty means not configured, and the

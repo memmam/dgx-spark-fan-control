@@ -354,6 +354,40 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled"))
         self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled"))
 
+    def test_spinning_fans_near_85c_do_not_power_off_or_fail_health(self):
+        foreign = ("inactive", "enabled", CONTROL.FOREIGN_FLOOR_EXIT)
+        for celsius in (84.0, 90.0):
+            for state in ("active", foreign):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                        root, rpm=(2700, 4050), celsius=celsius,
+                        gpu=lambda: False, stop_after=12, unit_state=state,
+                    )
+                    self.assertEqual(actions, [], (celsius, state))
+                    self.assertNotIn("running systemctl poweroff", "\n".join(logs))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            for millic, expect in (
+                (84000, "temperature: pass (84.0C)"),
+                (90000, "temperature: warn (hot under load, 90.0C)"),
+            ):
+                (root / "thermal" / "thermal_zone0" / "temp").write_text(
+                    f"{millic}\n", encoding="ascii",
+                )
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code, _alerts, _notices = self._health(
+                        root, {}, self._healthy_snapshot(), record=True,
+                    )
+                self.assertEqual(code, 0, expect)
+                self.assertIn(expect, stdout.getvalue())
+                self.assertFalse(
+                    (root / "state" / CONTROL.INTERVENTION_NAME).exists(),
+                    expect,
+                )
+
     def test_true_zero_powers_off_at_85c_with_no_work_in_progress(self):
         self.assertEqual(CONTROL.WATCHDOG_SOC_CELSIUS, 85.0)
         self.assertEqual(CONTROL.WATCHDOG_DEFAULT_ACTION, "systemctl poweroff")
@@ -361,7 +395,7 @@ class UserlandFailureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _status, actions, _alerts, logs, _marker = self._drive_watchdog(
-                root, rpm=(0, 0), celsius=86, gpu=lambda: False, stop_after=10,
+                root, rpm=(0, 0), celsius=85, gpu=lambda: False, stop_after=10,
                 soc=85, reboot_seconds=60,
             )
             self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
@@ -831,11 +865,11 @@ class UserlandFailureTests(unittest.TestCase):
             root2 = root / "hot"
             root2.mkdir()
             _status, actions, _alerts, logs, _marker = self._drive_watchdog(
-                root2, rpm=(2700, 4050), celsius=86, gpu=lambda: True,
+                root2, rpm=(2700, 4050), celsius=90, gpu=lambda: True,
                 stop_after=20, unit_state=state,
             )
-            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
-            self.assertIn("hottest zone", "\n".join(logs))
+            self.assertEqual(actions, [])
+            self.assertNotIn("running systemctl poweroff", "\n".join(logs))
 
     def test_busy_check_defers_reboots_and_treats_failure_as_busy(self):
         def refuse_nvidia():

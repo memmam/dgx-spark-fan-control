@@ -169,16 +169,17 @@ the module is unloaded, or the module's maximum state if it is loaded. It
 never writes level 0. About 60 seconds after the zeros began, with no work
 in progress, it reboots once. The default signal is an `nvidia-smi` compute
 process, and only when `BUSY_CHECK` is unset. A persistent server keeps that
-default busy, so the reboot stays deferred and only the 85°C poweroff
-protects the machine. A second boot that is still at 0 RPM powers off. Work
-in progress waits, and the hottest zone at 85°C powers off. A foreign floor
-reboots once the same way, without the repair; the next boot records
-needs-intervention instead of powering off. `dgx-fan-health.service` checks
+default busy, so the reboot stays deferred and only a true zero at 85°C
+powers the machine off. A second boot that is still at 0 RPM powers off.
+Work in progress waits, and a true zero at 85°C still powers off. Spinning
+fans are not powered off for temperature. A foreign floor reboots once the
+same way, without the repair; the next boot records needs-intervention
+instead of powering off. `dgx-fan-health.service` checks
 fans and thermals after boot and retries for 45 seconds.
 `dgx-fan-control health` prints the same checks in one pass and does not
-need root. 85°C is a margin under the kernel critical
-trip near 104°C, using a reported rise of about 4°C/s, not a published EC
-cutoff. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
+need root. Userspace cannot beat a rise of about 4°C/s to the kernel
+critical trip near 104°C. Keeping the fans running, and pre-cooling, are
+the defenses. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
 also logs and broadcasts
 when `dgx-fan-control.service` is not `active`, before it looks at
 temperature. That alert does not power the machine off. The cold alert and

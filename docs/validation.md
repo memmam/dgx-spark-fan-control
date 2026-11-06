@@ -46,19 +46,23 @@ On a later boot the performance service on one Spark restarted 196 times,
 every 30 seconds, because probe had refused a foreign floor left by ACPI.
 Exit 78 stops that loop. The recovery is a reboot, which clears the ACPI
 floor. Do not write ACPI level 0, and do not toggle the service to clear it.
-The watchdog's 85°C poweroff, the deferral while work is in progress, the
-reboot marker, the one foreign-floor reboot, the needs-intervention flag,
-and the post-boot health check have not been run on hardware. An
-interactive `dgx-fan-control health` is one read-only pass. The 45 second
-retry runs only from `dgx-fan-health.service`. 85°C is a
-margin under the kernel critical trip near 104°C (104.8 in the tonyd2wild
-notes). Those notes show a hotspot rising about 4°C/s, fast enough to pass
-that trip before the next sample is logged. 85°C, polled every 2 seconds,
-leaves time for a clean poweroff. It is not a sourced EC cutoff. The
-default busy signal is `nvidia-smi` compute apps, and only when `BUSY_CHECK`
-is unset. A persistent server keeps that default busy, so the reboot waits
-until the 30 minute deferral limit alerts, and still does not reboot
-through work. Only the 85°C poweroff stops a machine that stays busy.
+The watchdog's true-zero 85°C poweroff, the deferral while work is in
+progress, the reboot marker, the one foreign-floor reboot, the
+needs-intervention flag, and the post-boot health check have not been run
+on hardware. An interactive `dgx-fan-control health` is one read-only pass.
+The 45 second retry runs only from `dgx-fan-health.service`. 85°C applies
+only when both tachometers read 0. It is not a limit while the fans spin.
+A user-reported 1M-token prefill
+([tenhkspark/dgx-spark-tuning](https://github.com/tenhkspark/dgx-spark-tuning))
+reached about 84°C system temperature with healthy fans. The kernel
+critical trip is near 104°C (104.8 in the tonyd2wild notes). Those notes
+show a hotspot rising about 4°C/s, fast enough to pass that trip before
+the next sample is logged. Userspace cannot beat that rise with another
+threshold. The default busy signal is `nvidia-smi` compute apps, and only
+when `BUSY_CHECK` is unset. A persistent server keeps that default busy,
+so the reboot waits until the 30 minute deferral limit alerts, and still
+does not reboot through work. Only a true zero at 85°C powers off a
+machine that stays busy.
 No step in the notes below writes ACPI level 0.
 
 Recheck, on each Spark, after installing this command and module:

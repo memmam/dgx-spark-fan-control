@@ -35,7 +35,13 @@ WATCHDOG_ZERO_SECONDS = 10.0
 # enough to announce a stop at 39°C well before a clean shutdown at 85°C.
 WATCHDOG_STALL_SECONDS = 15.0
 WATCHDOG_REBOOT_SECONDS = 60.0
-WATCHDOG_SOC_CELSIUS = 85.0
+WATCHDOG_ZERO_FAN_CELSIUS = 85.0
+# Deprecated name for WATCHDOG_ZERO_FAN_CELSIUS. The 85 C poweroff is only
+# for a true zero. It is not a limit while the fans are spinning.
+WATCHDOG_SOC_CELSIUS = WATCHDOG_ZERO_FAN_CELSIUS
+# Journal-only. A rise this fast can pass the 104.8 C critical trip between
+# polls, so userspace does not act on it.
+OBSERVED_RISE_C_PER_S = 4.0
 WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
@@ -746,7 +752,10 @@ def _emit_check(name: str, status: str, detail: str, emit) -> str | None:
     ``note`` is a deliberate state. It is printed and is not a failure.
     """
     if status == "pass":
-        emit(f"{name}: pass")
+        emit(f"{name}: pass" if not detail else f"{name}: pass ({detail})")
+        return None
+    if status == "warn":
+        emit(f"{name}: warn ({detail})")
         return None
     if status == "note":
         emit(f"{name}: {detail}")
@@ -1152,16 +1161,22 @@ def _fan_status(hwmon_root: Path) -> tuple[str, str]:
     return "pass", ""
 
 
-def _temperature_status(thermal_root: Path, soc_celsius: float) -> tuple[str, str]:
+def _temperature_status(thermal_root: Path, zero_fan_celsius: float,
+                        fans_spinning: bool) -> tuple[str, str]:
+    """Readable temperature is never a health failure while the fans spin.
+
+    At or above the true-zero cutoff the line is a warning only. The 85 C
+    poweroff belongs to the watchdog's true-zero branch, not to this check.
+    """
     try:
         hottest = read_hottest_temperature_c(thermal_root)
     except PermissionError:
         return "unknown", ""
     except (OSError, RuntimeError, ValueError):
         return "fail", "hottest zone is not readable"
-    if hottest >= soc_celsius:
-        return "fail", f"hottest zone is {hottest:.1f}C"
-    return "pass", ""
+    if fans_spinning and hottest >= zero_fan_celsius:
+        return "warn", f"hot under load, {hottest:.1f}C"
+    return "pass", f"{hottest:.1f}C"
 
 
 def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
@@ -1308,8 +1323,14 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     else:
         keep("mode", "note", "not configured")
 
-    keep("fans", *_fan_status(hwmon_root))
-    keep("temperature", *_temperature_status(thermal_root, soc_celsius))
+    fan_status, fan_detail = _fan_status(hwmon_root)
+    keep("fans", fan_status, fan_detail)
+    keep(
+        "temperature",
+        *_temperature_status(
+            thermal_root, soc_celsius, fans_spinning=(fan_status == "pass"),
+        ),
+    )
 
     if watchdog_active == NEEDS_ROOT:
         keep("watchdog", "unknown")
@@ -1645,7 +1666,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  zero_seconds: float = WATCHDOG_ZERO_SECONDS,
                  stall_seconds: float = WATCHDOG_STALL_SECONDS,
                  reboot_seconds: float = WATCHDOG_REBOOT_SECONDS,
-                 soc_celsius: float = WATCHDOG_SOC_CELSIUS,
+                 zero_fan_celsius: float | None = None,
+                 soc_celsius: float | None = None,
                  alert_repeat_seconds: float = WATCHDOG_ALERT_REPEAT_SECONDS,
                  nonzero_clear_seconds: float = WATCHDOG_NONZERO_CLEAR_SECONDS,
                  action: str = WATCHDOG_DEFAULT_ACTION,
@@ -1665,14 +1687,18 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     set, overrides ``max_defer_seconds``.
     """
     del zero_seconds  # Hot shutdown now follows the hottest zone, not a second hold.
+    if zero_fan_celsius is None:
+        zero_fan_celsius = (
+            soc_celsius if soc_celsius is not None else WATCHDOG_ZERO_FAN_CELSIUS
+        )
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
     if not math.isfinite(stall_seconds) or stall_seconds < 0:
         raise ValueError("stall interval must be finite and non-negative")
     if not math.isfinite(reboot_seconds) or reboot_seconds < 0:
         raise ValueError("reboot interval must be finite and non-negative")
-    if not math.isfinite(soc_celsius):
-        raise ValueError("SoC threshold must be finite")
+    if not math.isfinite(zero_fan_celsius):
+        raise ValueError("true-zero poweroff temperature must be finite")
     if not math.isfinite(alert_repeat_seconds) or alert_repeat_seconds < 0:
         raise ValueError("alert repeat interval must be finite and non-negative")
     if not math.isfinite(max_defer_seconds) or max_defer_seconds < 0:
@@ -1713,8 +1739,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         "fan-stall watchdog watching ACPI fans and the hottest thermal zone; "
         "0 RPM on every fan for more than %.0fs alerts and attempts a repair; "
         "still stopped after %.0fs reboots when no work is in progress; "
-        "the hottest zone at %.0fC powers off immediately, with or without work",
-        stall_seconds, reboot_seconds, soc_celsius,
+        "a true zero powers off at %.0fC. Spinning fans are not powered off "
+        "for temperature",
+        stall_seconds, reboot_seconds, zero_fan_celsius,
     )
     zero_since: float | None = None
     nonzero_since: float | None = None
@@ -1736,6 +1763,30 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     foreign_defer_wall: float | None = None
     zero_defer_since: float | None = None
     zero_defer_wall: float | None = None
+    last_observed_c: float | None = None
+    last_observed_at: float | None = None
+
+    def note_observed_rise(hottest: float | None, when: float) -> None:
+        """Journal a fast rise. This does not power off or reboot."""
+        nonlocal last_observed_c, last_observed_at
+        if hottest is None:
+            return
+        if (
+            last_observed_c is not None
+            and last_observed_at is not None
+            and when > last_observed_at
+        ):
+            elapsed = when - last_observed_at
+            rate = (hottest - last_observed_c) / elapsed
+            if rate >= OBSERVED_RISE_C_PER_S:
+                LOG.warning(
+                    "observational: hottest zone rose %.1fC in %.1fs "
+                    "(%.1fC/s). No action. Userspace polling cannot beat a "
+                    "rise this fast to the critical trip",
+                    hottest - last_observed_c, elapsed, rate,
+                )
+        last_observed_c = hottest
+        last_observed_at = when
     while not stop_requested.is_set():
         active_state, enabled_state, exec_status, unit_result, n_restarts = (
             split_unit_state(unit_state())
@@ -1759,6 +1810,7 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 hottest = read_hottest_temperature_c(thermal_root)
             except (OSError, RuntimeError, ValueError):
                 hottest = None
+            note_observed_rise(hottest, now)
             busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
             if busy_how == "nvidia-smi-failed" and not smi_warned:
                 LOG.warning("nvidia-smi failed; treating a GPU job as running")
@@ -1766,17 +1818,6 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             if busy_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
                 smi_warned = True
-            hot = hottest is not None and hottest >= soc_celsius
-            if hot:
-                LOG.critical(
-                    "foreign floor: hottest zone is %.1fC; running %s",
-                    hottest, action,
-                )
-                status = runner(action)
-                if status != 0:
-                    LOG.critical("fan-stall action exited %s", status)
-                    return status if isinstance(status, int) else 1
-                return 0
             if held >= reboot_seconds:
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
@@ -1984,7 +2025,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             if busy_how == "busy-check-failed" and not smi_warned:
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
                 smi_warned = True
-            hot = hottest is not None and hottest >= soc_celsius
+            note_observed_rise(hottest, now)
+            hot = hottest is not None and hottest >= zero_fan_celsius
             if hot:
                 if busy:
                     LOG.critical(
@@ -2896,7 +2938,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=WATCHDOG_STALL_SECONDS,
         help="alert when every fan stays at 0 RPM this long, at any temperature",
     )
-    watchdog.add_argument("--soc-celsius", type=float, default=WATCHDOG_SOC_CELSIUS)
+    watchdog.add_argument(
+        "--zero-fan-celsius",
+        type=float,
+        default=None,
+        help="power off a true zero when the hottest zone reaches this; default 85. Not used while fans spin",
+    )
+    watchdog.add_argument(
+        "--soc-celsius",
+        type=float,
+        default=None,
+        help="deprecated alias for --zero-fan-celsius",
+    )
     watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
     watchdog.add_argument(
         "--reboot-seconds",
@@ -2997,6 +3050,7 @@ def main(argv: list[str] | None = None) -> int:
                 zero_seconds=args.zero_seconds,
                 stall_seconds=args.stall_seconds,
                 reboot_seconds=args.reboot_seconds,
+                zero_fan_celsius=args.zero_fan_celsius,
                 soc_celsius=args.soc_celsius,
                 alert_repeat_seconds=args.alert_repeat_seconds,
                 action=args.action,
