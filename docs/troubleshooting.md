@@ -174,7 +174,7 @@ sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
 ```
 
 Expect `is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.
-`dgx-fan-control health` prints `ec-updates: pass (blocked)`,
+`sudo dgx-fan-control health` prints `ec-updates: pass (blocked)`,
 `ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)`, or
 `ec-updates: unknown (...)`. That line does not fail health and does not
 set needs-intervention.

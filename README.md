@@ -178,8 +178,9 @@ fans are not powered off for temperature. A foreign floor reboots once the
 same way, without the repair; the next boot records needs-intervention
 instead of powering off. `dgx-fan-health.service` checks
 fans and thermals after boot and retries for 45 seconds.
-`dgx-fan-control health` prints the same checks in one pass and does not
-need root. Userspace cannot beat a rise of about 4°C/s to the kernel
+`sudo dgx-fan-control health` prints the same checks in one pass. Without
+root, some checks read `unknown (needs root)`. Userspace cannot beat a rise
+of about 4°C/s to the kernel
 critical trip near 104°C. Keeping the fans running, and pre-cooling, are
 the defenses. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
 also logs and broadcasts

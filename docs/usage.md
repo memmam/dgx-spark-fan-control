@@ -481,7 +481,8 @@ run on hardware yet.
 It does not depend on the watchdog. The watchdog keeps its own safety loop
 from early boot. The health check is the "login and SSH are up" result.
 
-`dgx-fan-control health` does not need root. It does one pass and prints
+Run `sudo dgx-fan-control health`. It also runs without root, but then some
+checks read `unknown (needs root)`. It does one pass and prints
 each check as it finishes, with `pass`, `fail (reason)`, or
 `unknown (needs root)`. A check that cannot be read is `unknown (needs root)`,
 not an error. The command exits nonzero when any check fails or is

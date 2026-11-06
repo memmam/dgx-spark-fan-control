@@ -229,7 +229,7 @@ result. That does not apply to `sudo dgx-fan-control acpi-max` when a
 downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ```sh
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
@@ -276,7 +276,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable dgx-fan-health.service
 sudo systemctl enable dgx-fan-manual.service
 sudo systemctl enable --now dgx-fan-watchdog.service
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
@@ -373,8 +373,8 @@ sudo journalctl -u dgx-fan-health.service -b --no-pager
 Both `is-active` commands should print `active`. The watchdog journal should
 contain `fan-stall watchdog watching`. The health journal should contain
 `health: healthy`, or a needs-intervention line when a check failed.
-`dgx-fan-control health` as a normal user prints the same checks in one pass
-and does not write the flag.
+`sudo dgx-fan-control health` prints the same checks in one pass and does
+not write the flag or the record.
 `dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
 If you have explicitly enabled the performance
 service, stop it without disabling it, confirm the watchdog journal then
@@ -451,7 +451,7 @@ fi
 if systemctl is-active --quiet dgx-fan-control.service; then
   sudo systemctl restart dgx-fan-control.service
 fi
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
@@ -519,7 +519,7 @@ if [ "$restart_performance" -eq 1 ]; then
 else
   sudo systemctl restart dgx-fan-manual.service
 fi
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
@@ -571,7 +571,7 @@ if [ "$restart_performance" -eq 1 ]; then
 else
   sudo systemctl restart dgx-fan-manual.service
 fi
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
@@ -670,7 +670,7 @@ Do not write an ACPI level to make this health check pass or to provoke a
 result. That does not apply to the `acpi-max` safety step above.
 
 ```sh
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
@@ -700,7 +700,7 @@ sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
 A blocked EC produces a line containing
 `is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.
 
-`dgx-fan-control health` reports the same fact without changing fwupd.
+`sudo dgx-fan-control health` reports the same fact without changing fwupd.
 `ec-updates: pass (blocked)` means the EC is blocked.
 `ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)` means
 fwupd can still install 3.13.7. `ec-updates: unknown (...)` means fwupd was
@@ -733,7 +733,7 @@ result. That does not apply to the `acpi-max` safety step after the
 downgrade reboot.
 
 ```sh
-dgx-fan-control health
+sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
