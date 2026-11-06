@@ -207,7 +207,10 @@ timed out on other boots, so a timeout is a fallback case, not the only
 result for that pair. If status says the probe refused a foreign floor, do
 not write ACPI level 0. Successful `modprobe` alone is insufficient; device
 probing can still reject the firmware contract. See
-[troubleshooting](troubleshooting.md) if needed.
+[troubleshooting](troubleshooting.md) if needed. Fan-floor control needs
+EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
+back, are in
+[EC firmware pairing and downgrade](#ec-firmware-pairing-and-downgrade).
 
 ## 5. Choose your startup mode
 
@@ -504,3 +507,107 @@ modinfo dgx_ec_fan_control | grep ^version:
 ```
 
 `health` is not run with sudo. Do not write an ACPI fan level for this check.
+
+## EC firmware pairing and downgrade
+
+Fan-floor control needs **EC 3.5.8**. **EC 3.13.7** accepts the capability
+reply and then refuses floor writes. Downgrade to 3.5.8, then block EC
+updates so a later fwupd run does not install 3.13.7 again. This page does
+not flash firmware for you. `dgx-fan-control` does not change fwupd settings.
+
+fwupd lists the EC as **UEFI Device Firmware**, not as Embedded Controller.
+Two other entries use that same name. Pick the EC by GUID and version, not
+by the name. The fwupd ESRT device ID is derived from the GUID and the
+physical path, so identical boards share it. On DGX Spark the EC device ID
+is `8c948e1db381648c8893897e4d09b7b153309991`. Confirm both of the following
+before any flash:
+
+- GUID `3d13c989-e6a8-4ead-95ee-921f09868f65`
+- a version of `0x03xxxxxx` (`0x03000508` is 3.5.8, `0x03000d07` is 3.13.7)
+
+| What it is | GUID | Version |
+| --- | --- | --- |
+| Embedded controller | `3d13c989-e6a8-4ead-95ee-921f09868f65` | `0x03xxxxxx` |
+| SoC / UEFI | `b488217b-3895-4fc0-b1bf-ab7005a2d45a` | `0x02009e0f` (October SoC 2.158.15) |
+| Another UEFI device | `dd1a238a-5f8e-46bd-9401-a88da99c5a96` | `0x00000519` |
+
+Do not flash the SoC entry, or the `0x00000519` entry, when you mean the EC.
+After a successful EC update the summary can say
+`Embedded Controller (0x03000d07 → 0x03000508)`. `get-devices` itself still
+does not label that row Embedded Controller.
+
+```sh
+sudo fwupdmgr get-devices
+```
+
+The unblocked EC row looks like a generic UEFI device: summary
+`UEFI System Resource Table device (Updated via capsule-on-disk)`, current
+version `0x03000508` on 3.5.8. A blocked EC is missing from this list, from
+`fwupdmgr get-devices --show-all`, and from `fwupdmgr get-updates`.
+
+### Upgrade to 3.13.7 or downgrade to 3.5.8
+
+Confirm the GUID and the `0x03xxxxxx` version, then use the device ID:
+
+```sh
+sudo fwupdmgr get-releases 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr update 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr downgrade 8c948e1db381648c8893897e4d09b7b153309991
+```
+
+`update` moves toward the newer release (3.13.7). `downgrade` moves toward
+3.5.8. Decline the report-upload prompt. Let the machine reboot. Do not cut
+power. Check `get-devices` again after the reboot and confirm the version
+before you do anything else. Upgrading to 3.13.7 removes fan-floor control.
+
+### Block EC updates
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices 3d13c989-e6a8-4ead-95ee-921f09868f65
+sudo systemctl restart fwupd
+```
+
+That value **replaces** the whole `DisabledDevices` list. On fwupd 2.0.20
+the block is not written where a search of the usual files can see it.
+`/etc/fwupd/fwupd.conf` can contain only `[fwupd]` and `EspLocation=/boot/efi`.
+Both of these can print nothing:
+
+```sh
+grep -ri DisabledDevices /etc/fwupd /var/lib/fwupd
+sudo grep -rIl 3d13c989 /etc /var/lib/fwupd /usr/share/fwupd
+```
+
+The check that shows the block:
+
+```sh
+sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
+```
+
+A blocked EC produces a line containing
+`is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.
+
+`dgx-fan-control health` reports the same fact without changing fwupd.
+`ec-updates: pass (blocked)` means the EC is blocked.
+`ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)` means
+fwupd can still install 3.13.7. `ec-updates: unknown (...)` means fwupd was
+missing or too slow to answer. None of those lines fail health, and none
+of them set needs-intervention. `status` does not query fwupd.
+
+### Unblock, then block again
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices ""
+sudo systemctl restart fwupd
+```
+
+An empty value clears **every** `DisabledDevices` entry, not only the EC.
+To keep another device disabled, set the value to every GUID you still
+want blocked, separated by commas, instead of `""`. This fwupd version
+does not show the current list in the files above, so copy those GUIDs
+down before you replace the value. There is no `fwupd-block` command here,
+because a helper cannot read the list it would overwrite.
+
+After a downgrade to 3.5.8, block the EC GUID again with the command in
+the previous section. Confirm with the `fwupdtool` line, not with
+`fwupd.conf`.
+

@@ -3,8 +3,10 @@
 
 import errno
 import io
+import json
 import logging
 import math
+import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from threading import Event
 import tempfile
@@ -1885,6 +1887,126 @@ class UserlandFailureTests(unittest.TestCase):
         ), 1)
         self.assertNotIn("Traceback", combined)
         self.assertNotIn("cleanup busy", stdout)
+
+    def test_ec_update_block_is_informational_and_never_fails(self):
+        guid = CONTROL.EC_FWUPD_GUID
+        soc = "b488217b-3895-4fc0-b1bf-ab7005a2d45a"
+        other = "dd1a238a-5f8e-46bd-9401-a88da99c5a96"
+        devices = {
+            "Devices": [
+                {
+                    "Name": "UEFI Device Firmware",
+                    "Guid": [soc],
+                    "Version": "0x02009e0f",
+                },
+                {
+                    "Name": "UEFI Device Firmware",
+                    "Guid": [guid],
+                    "Version": "0x03000508",
+                    "Summary": (
+                        "UEFI System Resource Table device "
+                        "(Updated via capsule-on-disk)"
+                    ),
+                },
+                {
+                    "Name": "UEFI Device Firmware",
+                    "Guid": [other],
+                    "Version": "0x00000519",
+                },
+            ]
+        }
+        text = json.dumps(devices)
+        self.assertEqual(CONTROL.ec_release_name("0x03000508"), "3.5.8")
+        self.assertEqual(CONTROL.ec_release_name("0x03000d07"), "3.13.7")
+        self.assertEqual(CONTROL.ec_version_in_devices(text), "3.5.8")
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=text, devices_ok=True, verbose_text=None, log_text="",
+        )
+        self.assertEqual(status, "warn")
+        self.assertIn("not blocked", detail)
+        self.assertIn("3.5.8", detail)
+        self.assertNotEqual(status, "fail")
+
+        devices["Devices"][1]["Version"] = "0x03000d07"
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=json.dumps(devices), devices_ok=True,
+            verbose_text=None, log_text="pinned EC 3.5.8 capabilities\n",
+        )
+        self.assertEqual((status, detail), ("pass", "not blocked (EC 3.13.7)"))
+
+        soc_only = json.dumps({"Devices": [devices["Devices"][0], devices["Devices"][2]]})
+        verbose = (
+            "FuEngine device 8c948e1db381648c8893897e4d09b7b153309991 "
+            "[UEFI Device Firmware] is disabled "
+            f"[{guid}], ignoring from uefi_capsule\n"
+        )
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=soc_only, devices_ok=True, verbose_text=verbose,
+            log_text="",
+        )
+        self.assertEqual((status, detail), ("pass", "blocked"))
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=soc_only, devices_ok=True, verbose_text="",
+            log_text="pinned EC 3.5.8 capabilities fan0=1260..9000\n",
+        )
+        self.assertEqual(status, "pass")
+        self.assertIn("likely blocked", detail)
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=soc_only, devices_ok=True, verbose_text="", log_text="",
+        )
+        self.assertEqual(status, "note")
+        self.assertTrue(detail.startswith("unknown"))
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=None, devices_ok=False, verbose_text=None, log_text="",
+            timed_out=True,
+        )
+        self.assertEqual(detail, "unknown (fwupd timed out)")
+        status, detail = CONTROL.classify_ec_update_block(
+            devices_text=None, devices_ok=False, verbose_text=None, log_text="",
+            fwupd_missing=True,
+        )
+        self.assertEqual(detail, "unknown (fwupd not installed)")
+
+        calls = []
+
+        def timed_out(argv):
+            calls.append(argv)
+            raise subprocess.TimeoutExpired(argv, 5)
+
+        status, detail = CONTROL.read_ec_update_block("", run=timed_out)
+        self.assertEqual(calls, [["fwupdmgr", "get-devices", "--json"]])
+        self.assertEqual((status, detail), ("note", "unknown (fwupd timed out)"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            lines = []
+            problems = CONTROL.collect_health_checks(
+                root / "thermal", root / "hwmon",
+                module_loaded=True, service_active="inactive",
+                service_enabled="disabled", exec_status=None,
+                watchdog_active="active", soc_celsius=85, log_text="",
+                ready="not configured", emit=lines.append,
+                ec_block=("warn", "not blocked; EC 3.5.8 can be replaced by 3.13.7"),
+            )
+            self.assertEqual(problems, [])
+            self.assertIn(
+                "ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)",
+                lines,
+            )
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {},
+                    self._healthy_snapshot(ec_updates=(
+                        "warn",
+                        "not blocked; EC 3.5.8 can be replaced by 3.13.7",
+                    )),
+                    record=True,
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("ec-updates: warn", stdout.getvalue())
+            self.assertFalse((root / "state" / CONTROL.INTERVENTION_NAME).exists())
 
     def test_watchdog_alert_is_logged_once_and_not_printed(self):
         stop = Event()

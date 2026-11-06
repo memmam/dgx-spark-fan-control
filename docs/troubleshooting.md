@@ -57,6 +57,76 @@ be readable. Do not register a second fan driver or send raw mailbox commands
 to work around the rejection. The ACPI `Fan` cooling device does not change
 fan speed on this EC either.
 
+## Block or allow EC firmware updates
+
+fwupd can install EC 3.13.7 over 3.5.8 and remove fan-floor control. The
+steps below match
+[EC firmware pairing and downgrade](installation.md#ec-firmware-pairing-and-downgrade).
+
+The EC is a **UEFI Device Firmware** entry. It is not labeled Embedded
+Controller in `get-devices`. The same name is used for the SoC
+(`b488217b-3895-4fc0-b1bf-ab7005a2d45a`, version `0x02009e0f`) and another
+device (`dd1a238a-5f8e-46bd-9401-a88da99c5a96`, version `0x00000519`). Do
+not flash those when you mean the EC.
+
+The fwupd ESRT device ID comes from the GUID and the physical path, so
+identical boards share it. On DGX Spark the EC device ID is
+`8c948e1db381648c8893897e4d09b7b153309991`. Before any flash, confirm GUID
+`3d13c989-e6a8-4ead-95ee-921f09868f65` and a version of `0x03xxxxxx`
+(`0x03000508` is 3.5.8, `0x03000d07` is 3.13.7).
+
+A blocked EC is absent from `fwupdmgr get-devices`,
+`fwupdmgr get-devices --show-all`, and `fwupdmgr get-updates`. On fwupd
+2.0.20 the block is not in `/etc/fwupd/fwupd.conf`. That file can contain
+only `[fwupd]` and `EspLocation=/boot/efi`. These searches can find nothing:
+
+```sh
+grep -ri DisabledDevices /etc/fwupd /var/lib/fwupd
+sudo grep -rIl 3d13c989 /etc /var/lib/fwupd /usr/share/fwupd
+```
+
+The line that shows the block:
+
+```sh
+sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i disabled
+```
+
+Expect `is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.
+`dgx-fan-control health` prints `ec-updates: pass (blocked)`,
+`ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)`, or
+`ec-updates: unknown (...)`. That line does not fail health and does not
+set needs-intervention.
+
+Block the EC. This replaces the whole `DisabledDevices` list. To keep
+another device disabled, include every GUID in this one value, separated
+by commas:
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices 3d13c989-e6a8-4ead-95ee-921f09868f65
+sudo systemctl restart fwupd
+```
+
+Unblock. An empty value clears every `DisabledDevices` entry:
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices ""
+sudo systemctl restart fwupd
+```
+
+Upgrade or downgrade only after the GUID and `0x03xxxxxx` version match.
+Decline the report-upload prompt. Let the machine reboot. Do not cut power.
+
+```sh
+sudo fwupdmgr get-releases 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr update 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr downgrade 8c948e1db381648c8893897e4d09b7b153309991
+```
+
+`update` moves toward 3.13.7 and removes fan-floor control. `downgrade`
+moves toward 3.5.8. After that downgrade, set `DisabledDevices` to the EC
+GUID again. There is no helper command: this fwupd version does not show
+the current list, so a helper would overwrite entries it cannot read.
+
 ## Mailbox timeout and the ACPI fan devices
 
 A failed **first** query is a different failure from a later wedge. EC 3.5.8

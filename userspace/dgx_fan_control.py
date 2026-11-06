@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import logging
 import math
 import os
@@ -50,6 +51,10 @@ WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
 CHECK_TIMEOUT_SECONDS = 5.0
+# fwupd ESRT GUID for the DGX Spark embedded controller. The device name is
+# "UEFI Device Firmware", shared with the SoC and other entries. This GUID
+# and a 0x03xxxxxx version identify the EC.
+EC_FWUPD_GUID = "3d13c989-e6a8-4ead-95ee-921f09868f65"
 NEEDS_ROOT = "unknown (needs root)"
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 WATCHDOG_REBOOT_ACTION = "systemctl reboot"
@@ -1330,7 +1335,8 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
                           record: tuple[int, int | None] | None = None,
                           etc: Path | None = None,
                           state_dir: Path | None = None,
-                          job_watch: dict[str, str] | None = None) -> list[str]:
+                          job_watch: dict[str, str] | None = None,
+                          ec_block: tuple[str, str] | None = None) -> list[str]:
     """Run every check, emitting each line before the next external call.
 
     ``log_text`` None means read the kernel log only if a missing cooling
@@ -1485,6 +1491,15 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
             "job", "warn",
             f"job may be stuck: no progress {seconds}s, via {progress_source}",
         )
+    if ec_block is None:
+        try:
+            ec_block = read_ec_update_block(log_text or "")
+        except (OSError, subprocess.TimeoutExpired):
+            ec_block = ("note", "unknown (fwupd failed)")
+    ec_status, ec_detail = ec_block
+    if ec_status not in {"pass", "warn", "note"}:
+        ec_status, ec_detail = "note", "unknown (fwupd failed)"
+    keep("ec-updates", ec_status, ec_detail)
 
     if watchdog_active == NEEDS_ROOT:
         keep("watchdog", "unknown")
@@ -1642,6 +1657,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             etc=etc,
             state_dir=state_dir,
             job_watch=snapshot.get("job_watch"),
+            ec_block=snapshot.get("ec_updates"),
         )
 
     while True:
@@ -2888,6 +2904,167 @@ def write_acpi_fan_level(device: Path, level: int) -> None:
 def pinned_ec_name(log_text: str) -> str | None:
     match = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
     return match.group(1) if match else None
+
+
+def ec_release_name(version: str) -> str | None:
+    """Turn an fwupd version into major.minor.patch.
+
+    0x03000508 is EC 3.5.8 and 0x03000d07 is EC 3.13.7. The second byte is
+    skipped; that is the encoding these versions use.
+    """
+    text = version.strip()
+    if re.fullmatch(r"\d+\.\d+\.\d+", text):
+        return text
+    hex_text = text.lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{8}", hex_text):
+        return None
+    major = int(hex_text[0:2], 16)
+    minor = int(hex_text[4:6], 16)
+    patch = int(hex_text[6:8], 16)
+    return f"{major}.{minor}.{patch}"
+
+
+def _device_guids(device: dict) -> list[str]:
+    guids = device.get("Guid", device.get("Guids", device.get("guid", [])))
+    if isinstance(guids, str):
+        return [guids.strip().lower()]
+    if isinstance(guids, list):
+        return [str(item).strip().lower() for item in guids]
+    return []
+
+
+def find_ec_fwupd_device(payload: object) -> dict | None:
+    """The device object whose own Guid list contains the EC GUID."""
+    if isinstance(payload, dict):
+        if EC_FWUPD_GUID in _device_guids(payload):
+            return payload
+        for value in payload.values():
+            found = find_ec_fwupd_device(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_ec_fwupd_device(item)
+            if found is not None:
+                return found
+    return None
+
+
+def ec_version_in_devices(text: str) -> str | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    device = find_ec_fwupd_device(payload)
+    if device is None:
+        return None
+    version = device.get("Version", device.get("version", ""))
+    return ec_release_name(str(version))
+
+
+def verbose_says_ec_disabled(text: str) -> bool:
+    return f"is disabled [{EC_FWUPD_GUID}]" in text.lower()
+
+
+def ec_probe_succeeded(log_text: str) -> bool:
+    if pinned_ec_name(log_text):
+        return True
+    return "registering hwmon telemetry only" in log_text
+
+
+def classify_ec_update_block(*, devices_text: str | None, devices_ok: bool,
+                             verbose_text: str | None, log_text: str,
+                             fwupd_missing: bool = False,
+                             timed_out: bool = False) -> tuple[str, str]:
+    """pass, warn, or note. Never fail. A note detail starts with unknown.
+
+    Present in get-devices means not blocked. The verbose 'is disabled'
+    line is the positive block signal. Absence plus a successful EC probe
+    is only 'likely blocked'. A missing or slow fwupd is unknown.
+    """
+    if devices_ok and devices_text and EC_FWUPD_GUID in devices_text.lower():
+        version = ec_version_in_devices(devices_text)
+        on_358 = version == "3.5.8" or (
+            version is None and pinned_ec_name(log_text) == "EC 3.5.8"
+        )
+        if on_358:
+            return (
+                "warn",
+                "not blocked; EC 3.5.8 can be replaced by 3.13.7",
+            )
+        if version:
+            return "pass", f"not blocked (EC {version})"
+        return "pass", "not blocked"
+    if verbose_text and verbose_says_ec_disabled(verbose_text):
+        return "pass", "blocked"
+    if timed_out:
+        return "note", "unknown (fwupd timed out)"
+    if fwupd_missing:
+        return "note", "unknown (fwupd not installed)"
+    if devices_ok:
+        if ec_probe_succeeded(log_text):
+            return (
+                "pass",
+                "likely blocked; absent from get-devices while the EC probe succeeded",
+            )
+        return "note", "unknown (EC not in get-devices)"
+    return "note", "unknown (fwupd failed)"
+
+
+def _run_fwupd(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv, check=False, capture_output=True, text=True,
+        timeout=CHECK_TIMEOUT_SECONDS,
+    )
+
+
+def read_ec_update_block(log_text: str, run=None) -> tuple[str, str]:
+    """Read-only. Does not change fwupd config or restart the daemon."""
+    if run is None:
+        run = _run_fwupd
+    devices_text = None
+    devices_ok = False
+    verbose_text = None
+    fwupd_missing = False
+    timed_out = False
+    saw_fwupd = False
+    try:
+        completed = run(["fwupdmgr", "get-devices", "--json"])
+        saw_fwupd = True
+    except FileNotFoundError:
+        completed = None
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        completed = None
+    except OSError:
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        devices_ok = True
+        devices_text = completed.stdout or ""
+    visible = (
+        devices_ok and devices_text is not None
+        and EC_FWUPD_GUID in devices_text.lower()
+    )
+    if not visible and not timed_out:
+        try:
+            verbose = run(["fwupdtool", "get-devices", "--show-all", "--verbose"])
+            saw_fwupd = True
+        except FileNotFoundError:
+            verbose = None
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            verbose = None
+        except OSError:
+            verbose = None
+        if verbose is not None:
+            verbose_text = (verbose.stdout or "") + (verbose.stderr or "")
+    if not saw_fwupd and not timed_out:
+        fwupd_missing = True
+    return classify_ec_update_block(
+        devices_text=devices_text, devices_ok=devices_ok,
+        verbose_text=verbose_text, log_text=log_text,
+        fwupd_missing=fwupd_missing, timed_out=timed_out,
+    )
 
 
 def classify_fan_binding(thermal_root: Path, hwmon_root: Path) -> str:

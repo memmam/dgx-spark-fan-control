@@ -222,6 +222,9 @@ stopped. tenhkspark's notes and NVIDIA forum topic 386805 post 21 also
 describe a mailbox timeout and 0/0 tachometers on that mix. Both outcomes
 are real. If probe times out, `acpi-max` is the fallback, and only while
 this module is not loaded. The two writers share one lower-floor register.
+Downgrading EC 3.13.7 to 3.5.8, and blocking fwupd from putting 3.13.7
+back, are in
+[EC firmware pairing and downgrade](docs/installation.md#ec-firmware-pairing-and-downgrade).
 
 ## ACPI-only mode
 

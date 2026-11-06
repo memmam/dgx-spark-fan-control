@@ -474,10 +474,11 @@ from early boot. The health check is the "login and SSH are up" result.
 `dgx-fan-control health` does not need root. It does one pass and prints
 each check as it finishes, with `pass`, `fail (reason)`, or
 `unknown (needs root)`. A check that cannot be read is `unknown (needs root)`,
-not an error. The command exits nonzero when any check fails or is unknown.
+not an error. The command exits nonzero when any check fails or is
+`unknown (needs root)`. An `ec-updates: unknown` line does not.
 It also prints a needs-intervention flag or health file it can read.
-`systemctl`, `READY_CHECK`, `PROGRESS_CHECK`, `nvidia-smi`, and the kernel
-log read each time out after 5 seconds.
+`systemctl`, `READY_CHECK`, `PROGRESS_CHECK`, `nvidia-smi`, `fwupdmgr`,
+`fwupdtool`, and the kernel log read each time out after 5 seconds.
 
 The core checks are fan and thermal only:
 
@@ -493,6 +494,10 @@ The core checks are fan and thermal only:
   `job: warn (job may be stuck: ...)`, which does not fail the check and
   does not set needs-intervention
 - `dgx-fan-watchdog.service` is active
+- `ec-updates:` is `pass (blocked)`, `warn (not blocked; EC 3.5.8 can be
+  replaced by 3.13.7)`, or `unknown` when fwupd is missing or slow. The
+  warn and the unknown do not fail the check and do not set
+  needs-intervention. `status` does not query fwupd
 
 `READY_CHECK` runs in the same pass. Empty means not configured, and the
 fan checks alone decide. A command succeeds on exit 0. A URL succeeds on
