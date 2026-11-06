@@ -158,19 +158,25 @@ Anyone running external airflow should read `fan1_input` after every boot.
 `dgx-fan-watchdog.service` runs `dgx-fan-control watchdog` at boot. It does
 not depend on the performance daemon or this kernel module, so disabling
 `dgx-fan-control.service` leaves it running. `sudo ./scripts/install-userland`
-enables it; `--no-watchdog` skips that. The same `install` commands, for both
-unit files, are written out in
+enables it; `--no-watchdog` skips that. The same `install` commands, including
+the health check and the motd snippet, are written out in
 [startup modes](docs/installation.md#5-choose-your-startup-mode). Copying only
 the performance unit leaves `status` at `watchdog-enabled: not-found`. The
 watchdog reads `acpi_fan` and the hottest thermal zone. If every fan stays
 at 0 RPM for 15 seconds it alerts and tries one repair: ACPI level 100 if
 the module is unloaded, or the module's maximum state if it is loaded. It
-never writes level 0. About 60 seconds after the zeros began, with no GPU
-compute process listed, it reboots once. A second boot that is still at 0
-RPM powers off. A running GPU job waits, and powers off if the hottest zone
-reaches 85°C first. 85°C is a margin under the kernel critical trip near
-104°C, using a reported rise of about 4°C/s, not a published EC cutoff. See
-[usage](docs/usage.md#watch-for-stopped-fans). The same command also logs and broadcasts
+never writes level 0. About 60 seconds after the zeros began, with no work
+in progress, it reboots once. The default signal is an `nvidia-smi` compute
+process, and only when `BUSY_CHECK` is unset. A persistent server keeps that
+default busy, so the reboot stays deferred and only the 85°C poweroff
+protects the machine. A second boot that is still at 0 RPM powers off. Work
+in progress waits, and the hottest zone at 85°C powers off. A foreign floor
+reboots once the same way, without the repair; the next boot records
+needs-intervention instead of powering off. `dgx-fan-health.service` checks
+fans and thermals after boot. 85°C is a margin under the kernel critical
+trip near 104°C, using a reported rise of about 4°C/s, not a published EC
+cutoff. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
+also logs and broadcasts
 when `dgx-fan-control.service` is not `active`, before it looks at
 temperature. That alert does not power the machine off. The cold alert and
 the level-100 write have not been run on hardware yet.

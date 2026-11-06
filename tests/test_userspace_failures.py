@@ -531,7 +531,9 @@ class UserlandFailureTests(unittest.TestCase):
             )
 
     def _drive_watchdog(self, root, *, rpm, celsius, gpu, stop_after, boot="boot-a",
-                        marker=None, module=False, soc=85.0, reboot_seconds=60):
+                        marker=None, module=False, soc=85.0, reboot_seconds=60,
+                        max_defer_seconds=None, defaults=None,
+                        alert_repeat_seconds=1800, unit_state="active"):
         self._stopped_acpi_fans(root, rpm, celsius)
         if module:
             device = root / "thermal" / "cooling_device2"
@@ -568,12 +570,17 @@ class UserlandFailureTests(unittest.TestCase):
                 monotonic=lambda: clock[0],
                 wall_time=lambda: clock[0],
                 runner=lambda action: actions.append(action) or 0,
-                unit_state=lambda: "active",
+                unit_state=lambda: unit_state,
                 notifier=alerts.append,
                 gpu_jobs=gpu,
                 marker_path=marker,
                 boot_id=boot,
                 nonzero_clear_seconds=30,
+                defaults={} if defaults is None else defaults,
+                alert_repeat_seconds=alert_repeat_seconds,
+                **({} if max_defer_seconds is None else {
+                    "max_defer_seconds": max_defer_seconds,
+                }),
             )
         return status, actions, alerts, logs.output, marker
 
@@ -633,6 +640,7 @@ class UserlandFailureTests(unittest.TestCase):
                     runner=lambda action: actions.append(action) or 0,
                     unit_state=lambda: "active", notifier=lambda message: None,
                     gpu_jobs=gpu, marker_path=root / "marker", boot_id="boot-a",
+                    defaults={},
                 )
             self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
             text = "\n".join(logs.output)
@@ -725,7 +733,7 @@ class UserlandFailureTests(unittest.TestCase):
         warnings = [line for line in logs.output if "is not active" in line]
         self.assertGreaterEqual(len(warnings), 6)
 
-    def test_foreign_floor_is_one_broadcast_and_does_not_reboot(self):
+    def test_foreign_floor_alerts_once_before_the_reboot_hold(self):
         clock = [0.0]
         stop = Event()
         alerts = []
@@ -736,7 +744,8 @@ class UserlandFailureTests(unittest.TestCase):
             if clock[0] > 10:
                 stop.set()
 
-        with patch.object(CONTROL, "Event", return_value=stop), \
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(CONTROL, "Event", return_value=stop), \
              patch.object(CONTROL.signal, "signal"), \
              patch.object(stop, "wait", side_effect=wait), \
              self.assertLogs(CONTROL.LOG, level="INFO") as logs:
@@ -748,13 +757,16 @@ class UserlandFailureTests(unittest.TestCase):
                 notifier=alerts.append,
                 runner=lambda action: actions.append(action) or 0,
                 gpu_jobs=lambda: False,
+                marker_path=Path(directory) / "true-zero-reboot",
+                boot_id="boot-a",
+                defaults={},
             )
         self.assertEqual(status, 0)
         self.assertEqual(actions, [])
         self.assertEqual(len(alerts), 1)
         text = "\n".join(logs.output)
         self.assertGreater(text.count("a reboot clears the ACPI floor"), 1)
-        self.assertIn("not rebooting", text)
+        self.assertNotIn("not rebooting again", text)
 
     def test_foreign_floor_daemon_exits_78(self):
         message = (
@@ -767,6 +779,297 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertEqual(code, CONTROL.FOREIGN_FLOOR_EXIT)
         self.assertEqual(combined.count("a reboot clears the ACPI floor"), 1)
         self.assertNotIn("Traceback", combined)
+
+    def test_foreign_floor_reboots_once_then_needs_intervention(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ("inactive", "enabled", CONTROL.FOREIGN_FLOOR_EXIT)
+            _status, actions, _alerts, logs, marker = self._drive_watchdog(
+                root, rpm=(2700, 4050), celsius=40, gpu=lambda: False,
+                stop_after=80, unit_state=state,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            self.assertIn("reason=foreign-floor", marker.read_text(encoding="ascii"))
+            self.assertIn("no GPU job", "\n".join(logs))
+            self.assertEqual(
+                (root / "thermal" / "cooling_device0" / "cur_state").read_text(),
+                "40\n",
+            )
+
+            root2 = root / "next"
+            root2.mkdir()
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root2, rpm=(2700, 4050), celsius=40, gpu=lambda: False,
+                stop_after=80, boot="boot-b", marker=marker, unit_state=state,
+            )
+            self.assertEqual(actions, [])
+            text = "\n".join(logs)
+            self.assertIn("not rebooting again", text)
+            self.assertNotIn("running systemctl poweroff", text)
+            flag = marker.parent / CONTROL.INTERVENTION_NAME
+            self.assertIn("not rebooting again", flag.read_text(encoding="ascii"))
+            self.assertEqual(flag.stat().st_mode & 0o777, 0o644)
+
+    def test_foreign_floor_defers_for_work_and_powers_off_when_hot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = ("inactive", "enabled", CONTROL.FOREIGN_FLOOR_EXIT)
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(2700, 4050), celsius=40, gpu=lambda: True,
+                stop_after=80, unit_state=state,
+            )
+            self.assertEqual(actions, [])
+            self.assertIn("deferring reboot", "\n".join(logs))
+
+            root2 = root / "hot"
+            root2.mkdir()
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root2, rpm=(2700, 4050), celsius=86, gpu=lambda: True,
+                stop_after=20, unit_state=state,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
+            self.assertIn("hottest zone", "\n".join(logs))
+
+    def test_busy_check_defers_reboots_and_treats_failure_as_busy(self):
+        def refuse_nvidia():
+            raise AssertionError("nvidia-smi must not run when BUSY_CHECK is set")
+
+        def drive(result, stop_after=80, max_defer_seconds=None, defaults=None):
+            seen = []
+
+            def succeeded(command, timeout=CONTROL.CHECK_TIMEOUT_SECONDS):
+                seen.append(command)
+                return result
+
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(CONTROL, "command_succeeded", side_effect=succeeded):
+                root = Path(directory)
+                settings = {"BUSY_CHECK": "in-flight"}
+                if defaults:
+                    settings.update(defaults)
+                status, actions, alerts, logs, _marker = self._drive_watchdog(
+                    root, rpm=(0, 0), celsius=40, gpu=refuse_nvidia,
+                    stop_after=stop_after, max_defer_seconds=max_defer_seconds,
+                    defaults=settings,
+                )
+            return status, actions, alerts, logs, seen
+
+        _status, actions, _alerts, logs, seen = drive(True)
+        self.assertEqual(actions, [])
+        self.assertIn("BUSY_CHECK reports work in progress", "\n".join(logs))
+        self.assertEqual(seen[0], "in-flight")
+
+        _status, actions, _alerts, logs, _seen = drive(False)
+        self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+        self.assertIn("no work in progress", "\n".join(logs))
+
+        _status, actions, _alerts, logs, _seen = drive(None)
+        self.assertEqual(actions, [])
+        self.assertIn("BUSY_CHECK failed; treating work as in progress", "\n".join(logs))
+
+        _status, actions, alerts, logs, _seen = drive(True, max_defer_seconds=10)
+        self.assertEqual(actions, [])
+        self.assertTrue(any("not rebooting through work" in item for item in alerts))
+        self.assertIn("not rebooting through work", "\n".join(logs))
+
+    def test_max_defer_seconds_in_defaults_overrides_the_flag(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(CONTROL, "command_succeeded", return_value=True):
+            root = Path(directory)
+            _status, actions, alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                defaults={"BUSY_CHECK": "in-flight", "MAX_DEFER_SECONDS": "10"},
+            )
+        self.assertEqual(actions, [])
+        self.assertTrue(any("deferral limit of 10s" in item for item in alerts))
+        self.assertIn("not rebooting through work", "\n".join(logs))
+
+    def _healthy_tree(self, root: Path) -> None:
+        self._stopped_acpi_fans(root, (2700, 4050), 40.0)
+        device = root / "thermal" / "cooling_device2"
+        device.mkdir()
+        (device / "type").write_text(CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii")
+        (device / "cur_state").write_text("0\n", encoding="ascii")
+        (device / "max_state").write_text("12\n", encoding="ascii")
+
+    def _health(self, root: Path, defaults, snapshot, *, settle=0.0, boot="boot-b",
+                clock=None, sleeper=None):
+        alerts = []
+        notices = []
+        if clock is None:
+            monotonic = lambda: 0.0
+        else:
+            monotonic = lambda: clock[0]
+        code = CONTROL.run_health(
+            root / "thermal",
+            root / "hwmon",
+            settle_seconds=settle,
+            poll_seconds=2,
+            state_dir=root / "state",
+            defaults=defaults,
+            monotonic=monotonic,
+            wall_time=lambda: 5.0,
+            sleeper=sleeper or (lambda delay: None),
+            observer=lambda: snapshot,
+            notifier=alerts.append,
+            boot_id=boot,
+            notify=lambda _defaults, summary: notices.append(summary),
+        )
+        return code, alerts, notices
+
+    def _healthy_snapshot(self, **overrides):
+        snapshot = {
+            "module_loaded": True,
+            "service_active": "inactive",
+            "service_enabled": "disabled",
+            "exec_status": None,
+            "watchdog_active": "active",
+            "log_text": "",
+        }
+        snapshot.update(overrides)
+        return snapshot
+
+    def test_ready_check_pass_fail_and_unset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            snapshot = self._healthy_snapshot()
+            with patch.object(CONTROL, "command_succeeded", side_effect=AssertionError("unset")):
+                code, _alerts, notices = self._health(root, {}, snapshot)
+            self.assertEqual(code, 0)
+            self.assertEqual(notices, [])
+            health = (root / "state" / CONTROL.HEALTH_NAME).read_text(encoding="ascii")
+            self.assertIn("result=healthy", health)
+            self.assertIn("ready=not configured", health)
+            self.assertFalse((root / "state" / CONTROL.INTERVENTION_NAME).exists())
+
+            with patch.object(CONTROL, "command_succeeded", return_value=True):
+                code, _alerts, notices = self._health(
+                    root, {"READY_CHECK": "probe"}, snapshot,
+                )
+            self.assertEqual(code, 0)
+            self.assertIn(
+                "ready=pass",
+                (root / "state" / CONTROL.HEALTH_NAME).read_text(encoding="ascii"),
+            )
+            self.assertEqual(notices, [])
+
+            CONTROL.write_stall_marker(
+                root / "state" / CONTROL.STALL_MARKER_NAME, "boot-a", 1.0,
+            )
+            CONTROL.write_intervention(
+                root / "state" / CONTROL.INTERVENTION_NAME, "old", "boot-a", 1.0,
+            )
+            with patch.object(CONTROL, "command_succeeded", return_value=False):
+                code, _alerts, notices = self._health(
+                    root, {"READY_CHECK": "probe", "DGX_FAN_NOTIFY": "hook"}, snapshot,
+                )
+            self.assertEqual(code, 1)
+            flag = (root / "state" / CONTROL.INTERVENTION_NAME).read_text(encoding="ascii")
+            self.assertIn("reason=workload not ready\n", flag)
+            self.assertIn(
+                "ready=fail",
+                (root / "state" / CONTROL.HEALTH_NAME).read_text(encoding="ascii"),
+            )
+            self.assertTrue((root / "state" / CONTROL.STALL_MARKER_NAME).exists())
+            self.assertEqual(notices, ["dgx-fan-control: needs intervention: workload not ready\n"])
+
+    def test_ready_check_is_retried_and_a_url_is_a_get(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            calls = {"n": 0}
+
+            def succeeded(command, timeout=CONTROL.CHECK_TIMEOUT_SECONDS):
+                calls["n"] += 1
+                return calls["n"] >= 2
+
+            clock = [0.0]
+
+            def sleep(delay):
+                clock[0] += delay
+
+            with patch.object(CONTROL, "command_succeeded", side_effect=succeeded):
+                code, _alerts, _notices = self._health(
+                    root, {"READY_CHECK": "probe"}, self._healthy_snapshot(),
+                    settle=10, clock=clock, sleeper=sleep,
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(calls["n"], 2)
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(CONTROL.urllib.request, "urlopen", return_value=Response()) as opened:
+            self.assertEqual(
+                CONTROL.ready_for_work({"READY_CHECK": "https://example.invalid/ready"}),
+                "pass",
+            )
+        opened.assert_called_once()
+        with patch.object(
+            CONTROL.urllib.request, "urlopen",
+            side_effect=CONTROL.urllib.error.URLError("down"),
+        ):
+            self.assertEqual(
+                CONTROL.ready_for_work({"READY_CHECK": "https://example.invalid/ready"}),
+                "fail",
+            )
+
+    def test_health_pass_clears_markers_and_announces_recovery_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            CONTROL.write_stall_marker(
+                state / CONTROL.STALL_MARKER_NAME, "boot-a", 1.0, reason="foreign-floor",
+            )
+            CONTROL.write_intervention(
+                state / CONTROL.INTERVENTION_NAME, "old", "boot-a", 1.0,
+            )
+            code, alerts, notices = self._health(root, {}, self._healthy_snapshot())
+            self.assertEqual(code, 0)
+            self.assertEqual(alerts, ["dgx-fan-control: recovered after watchdog reboot"])
+            self.assertEqual(notices, ["dgx-fan-control: recovered after watchdog reboot\n"])
+            self.assertFalse((state / CONTROL.STALL_MARKER_NAME).exists())
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
+            code, alerts, notices = self._health(root, {}, self._healthy_snapshot())
+            self.assertEqual(code, 0)
+            self.assertEqual(alerts, [])
+            self.assertEqual(notices, [])
+
+    def test_health_fail_keeps_the_reboot_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._healthy_tree(root)
+            state = root / "state"
+            CONTROL.write_stall_marker(state / CONTROL.STALL_MARKER_NAME, "boot-a", 1.0)
+            code, alerts, notices = self._health(
+                root, {}, self._healthy_snapshot(module_loaded=False),
+            )
+            self.assertEqual(code, 1)
+            self.assertEqual(alerts, [])
+            text = (state / CONTROL.INTERVENTION_NAME).read_text(encoding="ascii")
+            self.assertIn("kernel module dgx_ec_fan_control is not loaded", text)
+            self.assertTrue((state / CONTROL.STALL_MARKER_NAME).exists())
+            self.assertTrue(notices and "needs intervention" in notices[0])
+
+    def test_health_clear_removes_the_flag(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            CONTROL.write_intervention(
+                state / CONTROL.INTERVENTION_NAME, "workload not ready", "boot-b", 1.0,
+            )
+            with patch.object(CONTROL, "STALL_MARKER_DIR", state):
+                code, stdout, _stderr = run_cli(["health", "--clear"])
+            self.assertEqual(code, 0)
+            self.assertIn("cleared the needs-intervention flag", stdout)
+            self.assertFalse((state / CONTROL.INTERVENTION_NAME).exists())
 
     def test_one_spinning_fan_or_one_input_does_not_alert(self):
         with tempfile.TemporaryDirectory() as directory:

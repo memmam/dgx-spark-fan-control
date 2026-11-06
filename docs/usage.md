@@ -264,20 +264,34 @@ The repair never writes ACPI level 0 or any level below 40. With
 loaded, it requests that cooling device's maximum state and does not write
 ACPI, because both paths use the same EC register.
 
-About 60 seconds after the zeros began (`--reboot-seconds`), if
-`nvidia-smi --query-compute-apps=pid --format=csv,noheader` lists no compute
-process, it runs `systemctl reboot` (`--reboot-action`). A failed or missing
-`nvidia-smi` counts as a job, so the machine is not rebooted on a guess. At
-most one reboot is requested per stall. A file under
-`/var/lib/dgx-fan-control` records the boot id. If the next boot is still at
-0 RPM on every fan, it runs `systemctl poweroff` (`--action`) instead of
-rebooting again. The marker is removed after the fans have read nonzero for
-30 seconds.
+About 60 seconds after the zeros began (`--reboot-seconds`), if no work is
+in progress, it runs `systemctl reboot` (`--reboot-action`). At most one
+reboot is requested per stall. A file under `/var/lib/dgx-fan-control`
+records the boot id and the reason (`true-zero` or `foreign-floor`). If the
+next boot is still at 0 RPM on every fan, it runs `systemctl poweroff`
+(`--action`) instead of rebooting again. The marker is removed after the
+fans have read nonzero for 30 seconds. A passing health check removes it too.
 
-If a GPU job is running, it alerts, attempts the repair, and waits. It
-reboots when the job exits and the fans are still at 0 RPM. If the hottest
-thermal zone, the maximum across every zone, reaches `--soc-celsius` first,
-it powers off instead. The default is **85°C**.
+Work in progress defers that reboot. When `BUSY_CHECK` in
+`/etc/default/dgx-fan-control` is unset, the signal is
+`nvidia-smi --query-compute-apps=pid --format=csv,noheader`. A failed or
+missing `nvidia-smi` counts as a job, so the machine is not rebooted on a
+guess. A persistent model server always shows a compute process, so with
+that default the reboot stays deferred for as long as that process is
+present, and only the 85°C poweroff protects the machine. Set `BUSY_CHECK`
+to a command whose exit 0 means a request is still in flight. A failure or
+a timeout of that command counts as busy. Prefer a check of in-flight
+requests over the compute-process list.
+
+Deferral has a limit. `MAX_DEFER_SECONDS` defaults to 1800 (30 minutes).
+The same number is `--max-defer-seconds`; a value in the defaults file
+overrides the flag. When the limit runs out and the fans are still at 0
+RPM, or the floor is still foreign, the watchdog broadcasts a critical
+alert and keeps deferring. It does not reboot through work.
+
+If work is in progress and the hottest thermal zone, the maximum across
+every zone, reaches `--soc-celsius` first, it powers off. The default is
+**85°C**.
 
 85°C is a margin, not a measured EC limit. The kernel's critical trip is
 about 104°C (104.8 in
@@ -296,9 +310,16 @@ poweroff.
 A `wall` broadcast for a daemon that is enabled but not running is sent when
 that state changes, and again at most every 30 minutes
 (`--alert-repeat-seconds`) while it lasts. The journal records the condition
-on every poll. A foreign-floor exit (78) is one broadcast, then journal
-only. The watchdog does not reboot for a foreign floor: those fans are held
-high, and a reboot clears the ACPI floor.
+on every poll.
+
+Exit 78, a foreign floor, uses that same reboot path without the repair.
+The fans are already held high. One broadcast says a reboot clears the ACPI
+floor, then the journal repeats it. After `--reboot-seconds`, with no work
+in progress, it reboots once. If the next boot still has that floor, it
+writes `/var/lib/dgx-fan-control/needs-intervention` and does not reboot
+again and does not power off. The hottest zone at or above 85°C is still a
+poweroff, including while a reboot is deferred. The true-zero and 85°C
+poweroff paths stay armed whether or not the health check has failed.
 
 Install starts this as `dgx-fan-watchdog.service`, either with
 `scripts/install-userland` or the manual commands in
@@ -328,13 +349,68 @@ Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
 path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
 `--stall-seconds`, `--reboot-seconds`, `--soc-celsius`, `--action`,
-`--reboot-action`, and `--alert-repeat-seconds` change the alert hold, the
-reboot hold, the hottest-zone poweroff temperature, the poweroff command,
-the reboot command, and how often a standing alert is broadcast again. Each
-command is one program plus arguments, not a shell pipeline. See
-the [known issues](../README.md#known-issues) before enabling this on a
-machine that uses external fans. The cold alert and the level-100 write have
-not been run on hardware yet.
+`--reboot-action`, `--alert-repeat-seconds`, and `--max-defer-seconds`
+change the alert hold, the reboot hold, the hottest-zone poweroff
+temperature, the poweroff command, the reboot command, how often a standing
+alert is broadcast again, and how long a reboot may be deferred. Each
+watchdog command is one program plus arguments, not a shell pipeline.
+`BUSY_CHECK`, `READY_CHECK`, and `DGX_FAN_NOTIFY` are shell commands from
+the root-owned defaults file; an `http://` or `https://` value for
+`READY_CHECK` is a GET instead. See the [known
+issues](../README.md#known-issues) before enabling this on a machine that
+uses external fans. The cold alert and the level-100 write have not been
+run on hardware yet.
+
+## Check health after boot
+
+`dgx-fan-health.service` is a oneshot that starts after `multi-user.target`.
+It does not depend on the watchdog. The watchdog keeps its own safety loop
+from early boot. The health check is the "login and SSH are up" result.
+
+`dgx-fan-control health` polls for up to 45 seconds (`--settle-seconds`, or
+`HEALTH_SETTLE_SECONDS` in the defaults file). The core checks are fan and
+thermal only:
+
+- `dgx_ec_fan_control` is loaded
+- `dgx_ec_fan_floor` is present and the probe did not refuse a foreign floor
+- `dgx-fan-control.service` is active when it is enabled, and it did not
+  exit 78
+- both ACPI fans read nonzero RPM
+- the hottest zone is readable and under 85°C
+- `dgx-fan-watchdog.service` is active
+
+`READY_CHECK` runs only after those pass. Empty means not configured, and
+the fan checks alone decide. A command succeeds on exit 0. A URL succeeds
+on an HTTP status from 200 through 299. Each try times out after 5 seconds,
+and a slow load is retried until the settle window ends. Failure sets
+`needs-intervention` with the reason `workload not ready`.
+
+On pass it logs healthy, clears the reboot marker and the intervention
+flag, and writes `/var/lib/dgx-fan-control/health` with the result,
+`ready=pass`, `ready=fail`, or `ready=not configured`, the time, and the
+boot id. If this boot followed a watchdog reboot, it logs and broadcasts
+`recovered after watchdog reboot` once. On failure it writes the flag, logs
+critical, and does not reboot. `status` and `module status` print
+`NEEDS INTERVENTION:` while the flag is present.
+`dgx-fan-control health --clear` removes the flag. A later pass removes it
+too. `/etc/update-motd.d/95-dgx-fan-control` prints the reason on a later
+SSH login.
+
+`DGX_FAN_NOTIFY` is empty by default. When set, the summary is written to
+that command's standard input on failure and on recovery.
+
+## After a watchdog reboot
+
+The watchdog reboots only the local node. A few things that were running
+before that reboot do not come back by themselves:
+
+- A user-level systemd service does not start at boot unless that user has
+  a lingering session: `loginctl enable-linger <user>`.
+- An `nvidia-smi -lgc` clock lock does not persist across a reboot. A
+  oneshot unit can apply it again if you need the lock.
+- A multi-node workload can lose the pair when one node reboots. The fan
+  watchdog still reboots only the machine whose fans stopped or whose floor
+  is foreign.
 
 ## Set the ACPI fan level
 

@@ -1,0 +1,34 @@
+# /etc/default/dgx-fan-control
+# Optional settings for the fan watchdog and the post-boot health check.
+# Both checks stay fan and thermal unless you set a command here.
+# This file is root configuration. The commands run as root.
+
+# Command whose standard input is the health summary. Empty disables it.
+# Example: curl -fsS --data-binary @- https://example.invalid/hook
+DGX_FAN_NOTIFY=
+
+# Command, or an http(s) URL to GET. Success means this machine is ready
+# for work. The health check runs it only after the fan and thermal checks
+# pass, retrying through the settle window (default 45 seconds, each try
+# times out after 5 seconds). Empty means not configured: fan checks alone
+# decide. A failure sets needs-intervention with the reason "workload not ready".
+READY_CHECK=
+
+# Command whose exit 0 means work is in progress, so do not reboot.
+# A failure or timeout counts as busy. Empty uses nvidia-smi compute apps.
+# A persistent model server always shows a compute process, so with that
+# default a stalled-fan reboot stays deferred and only the 85 C poweroff
+# protects the machine. The deferral limit below raises an alert; it still
+# does not reboot through work. Prefer a command that measures in-flight
+# requests.
+BUSY_CHECK=
+
+# Seconds to defer a reboot while work is in progress. When this runs out
+# and the fans are still at a true zero, or the floor is still foreign, the
+# watchdog alerts and keeps deferring. It does not reboot through work.
+# Overrides dgx-fan-control watchdog --max-defer-seconds when set.
+MAX_DEFER_SECONDS=1800
+
+# Optional. Empty keeps the health check's 45 second settle window.
+# Keep this under the health unit's TimeoutStartSec of 120 seconds.
+HEALTH_SETTLE_SECONDS=

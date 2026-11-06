@@ -211,8 +211,9 @@ probing can still reject the firmware contract. See
 
 ## 5. Choose your startup mode
 
-Install the boot-load entry, both unit files, and the command. This enables
-and starts **only** `dgx-fan-watchdog.service`. It does **not** enable
+Install the boot-load entry, the unit files, the health check, and the
+command. This enables and starts `dgx-fan-watchdog.service`, and enables
+`dgx-fan-health.service` for the next boot. It does **not** enable
 `dgx-fan-control.service`.
 
 ```sh
@@ -222,9 +223,11 @@ sudo ./scripts/install-userland
 ```
 
 The same commands by hand, without the script. Run them from the checkout.
-This installs the command, both unit files, and the modules-load entry, then
-reloads systemd and enables the watchdog. It does **not** enable
-`dgx-fan-control.service`.
+This installs the command, the three unit files, the motd snippet, the
+defaults file when it is absent, and the modules-load entry, then reloads
+systemd, enables the health check, and enables the watchdog. It does **not**
+enable `dgx-fan-control.service`. The defaults file is not overwritten when
+it already exists.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
@@ -234,31 +237,50 @@ sudo install -D -m 0644 systemd/dgx-fan-control.service \
   /etc/systemd/system/dgx-fan-control.service
 sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
+sudo install -D -m 0644 systemd/dgx-fan-health.service \
+  /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0755 systemd/95-dgx-fan-control \
+  /etc/update-motd.d/95-dgx-fan-control
+if [ ! -f /etc/default/dgx-fan-control ]; then
+  sudo install -D -m 0644 systemd/dgx-fan-control.default \
+    /etc/default/dgx-fan-control
+fi
 sudo systemctl daemon-reload
+sudo systemctl enable dgx-fan-health.service
 sudo systemctl enable --now dgx-fan-watchdog.service
 ```
 
 To install those files and leave the watchdog disabled, stop before the
 `enable --now` line, or run `sudo ./scripts/install-userland --no-watchdog`.
+The health check still expects the watchdog to be active, so that opt-out
+makes the next health check record needs-intervention.
 
-Manual removal of the command and both units, the same steps as
-`scripts/uninstall-userland`. This does not unload the kernel module. Restore
-the factory curve first, as in [maintenance](maintenance.md#uninstall).
+Manual removal of the command, the units, the motd snippet, and the defaults
+file, the same steps as `scripts/uninstall-userland`. This does not unload
+the kernel module. Restore the factory curve first, as in
+[maintenance](maintenance.md#uninstall).
 
 ```sh
 sudo systemctl disable --now dgx-fan-watchdog.service
+sudo systemctl disable --now dgx-fan-health.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
+sudo rm -f /etc/systemd/system/dgx-fan-health.service
 sudo rm -f /etc/systemd/system/dgx-fan-control.service
+sudo rm -f /etc/update-motd.d/95-dgx-fan-control
+sudo rm -f /etc/default/dgx-fan-control
 sudo rm -f /usr/local/sbin/dgx-fan-control
 sudo systemctl daemon-reload
 ```
 
 ### Updating an existing install
 
-After `git pull`, reinstall the command and **both** unit files. Copying only
-`dgx-fan-control.service` leaves the watchdog unit missing, and `status`
-then shows `watchdog-enabled: not-found`.
+After `git pull`, reinstall the command, the three unit files, and the motd
+snippet. Copying only `dgx-fan-control.service` leaves the watchdog unit
+missing, and `status` then shows `watchdog-enabled: not-found`. Leave an
+existing `/etc/default/dgx-fan-control` in place so a `BUSY_CHECK` or
+`READY_CHECK` you already set is kept. Install the template only when the
+file is absent.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
@@ -266,7 +288,16 @@ sudo install -D -m 0644 systemd/dgx-fan-control.service \
   /etc/systemd/system/dgx-fan-control.service
 sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
+sudo install -D -m 0644 systemd/dgx-fan-health.service \
+  /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0755 systemd/95-dgx-fan-control \
+  /etc/update-motd.d/95-dgx-fan-control
+if [ ! -f /etc/default/dgx-fan-control ]; then
+  sudo install -D -m 0644 systemd/dgx-fan-control.default \
+    /etc/default/dgx-fan-control
+fi
 sudo systemctl daemon-reload
+sudo systemctl enable dgx-fan-health.service
 if systemctl is-active --quiet dgx-fan-watchdog.service; then
   sudo systemctl restart dgx-fan-watchdog.service
 fi
@@ -309,16 +340,21 @@ The watchdog is a separate unit. It reads the ACPI fans and `thermal_zone0`
 directly. `systemctl disable --now dgx-fan-control.service` and
 `module disable` do not stop it.
 
-After a reboot, check the watchdog only. Do not write an ACPI fan level for
-this check.
+After a reboot, check the watchdog and the health oneshot. Do not write an
+ACPI fan level for this check.
 
 ```sh
 systemctl is-active dgx-fan-watchdog.service
+systemctl is-active dgx-fan-health.service
 sudo journalctl -u dgx-fan-watchdog.service -b --no-pager | head
+sudo journalctl -u dgx-fan-health.service -b --no-pager
 ```
 
-`is-active` should print `active`. The journal should contain
-`fan-stall watchdog watching`. If you have explicitly enabled the performance
+Both `is-active` commands should print `active`. The watchdog journal should
+contain `fan-stall watchdog watching`. The health journal should contain
+`dgx-fan-control: healthy`, or a needs-intervention line when a check failed.
+`dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
+If you have explicitly enabled the performance
 service, stop it without disabling it, confirm the watchdog journal then
 shows the daemon-not-active alert, and start it again:
 

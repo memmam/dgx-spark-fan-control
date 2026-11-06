@@ -97,8 +97,9 @@ Then follow the route you originally installed:
   DKMS does not update `/usr/local/sbin/dgx-fan-control`. Install that command
   in the next step or the previous CLI remains.
 
-Refresh the command and **both** unit files, then load and check the new module.
-The full update steps, including when to restart each service, are in
+Refresh the command, the three unit files, and the motd snippet, then load
+and check the new module. The full update steps, including when to restart
+each service, are in
 [Updating an existing install](installation.md#updating-an-existing-install).
 
 ```sh
@@ -107,7 +108,12 @@ sudo install -D -m 0644 systemd/dgx-fan-control.service \
   /etc/systemd/system/dgx-fan-control.service
 sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
   /etc/systemd/system/dgx-fan-watchdog.service
+sudo install -D -m 0644 systemd/dgx-fan-health.service \
+  /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0755 systemd/95-dgx-fan-control \
+  /etc/update-motd.d/95-dgx-fan-control
 sudo systemctl daemon-reload
+sudo systemctl enable dgx-fan-health.service
 sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
@@ -116,7 +122,8 @@ Restart `dgx-fan-watchdog.service` if it is active. Restart
 `dgx-fan-control.service` only if it is active. Do not enable the performance
 daemon from an update. If status says `watchdog-enabled: not-found`, install
 and enable the watchdog unit as in
-[startup modes](installation.md#5-choose-your-startup-mode).
+[startup modes](installation.md#5-choose-your-startup-mode). Leave an
+existing `/etc/default/dgx-fan-control` alone.
 
 ## Switch from manual installation to DKMS
 
@@ -141,15 +148,17 @@ comes out. Then stop the performance daemon and restore the factory curve.
 
 ```sh
 sudo systemctl disable --now dgx-fan-watchdog.service
+sudo systemctl disable --now dgx-fan-health.service
 sudo systemctl disable --now dgx-fan-control.service
 sudo dgx-fan-control automatic
 dgx-fan-control status                    # require state=0/12 (no floor; EC curve)
 sudo modprobe -r dgx_ec_fan_control
 ```
 
-`sudo ./scripts/uninstall-userland` stops and disables both units and removes
-their files and the command. Run it only after the factory curve is restored.
-It does not unload the kernel module.
+`sudo ./scripts/uninstall-userland` stops and disables the watchdog, the
+health check, and the performance daemon, and removes their files, the motd
+snippet, the defaults file, and the command. Run it only after the factory
+curve is restored. It does not unload the kernel module.
 
 If restoration, readback, or unload fails, stop here and consult
 [troubleshooting](troubleshooting.md). Do not discard the tools needed to
@@ -181,6 +190,9 @@ registered version uses it.
 sudo rm -f /etc/modules-load.d/dgx_ec_fan_control.conf
 sudo rm -f /etc/systemd/system/dgx-fan-control.service
 sudo rm -f /etc/systemd/system/dgx-fan-watchdog.service
+sudo rm -f /etc/systemd/system/dgx-fan-health.service
+sudo rm -f /etc/update-motd.d/95-dgx-fan-control
+sudo rm -f /etc/default/dgx-fan-control
 sudo rm -f /usr/local/sbin/dgx-fan-control
 sudo systemctl daemon-reload
 ```

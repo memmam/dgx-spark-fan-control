@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Stop and disable the watchdog and the performance daemon, then remove
-# their unit files and the command. Does not unload the kernel module and
-# does not run dkms remove. Do that from the maintenance guide after the
-# factory curve is restored.
+# Stop and disable the watchdog, the health check, and the performance
+# daemon, then remove their unit files, the motd snippet, the defaults
+# file, and the command. Does not unload the kernel module and does not
+# run dkms remove. Do that from the maintenance guide after the factory
+# curve is restored.
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -12,8 +13,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 systemctl disable --now dgx-fan-watchdog.service
+systemctl disable --now dgx-fan-health.service
 systemctl disable --now dgx-fan-control.service
 rm -f /etc/systemd/system/dgx-fan-watchdog.service
+rm -f /etc/systemd/system/dgx-fan-health.service
 rm -f /etc/systemd/system/dgx-fan-control.service
+rm -f /etc/update-motd.d/95-dgx-fan-control
+rm -f /etc/default/dgx-fan-control
 rm -f /usr/local/sbin/dgx-fan-control
 systemctl daemon-reload

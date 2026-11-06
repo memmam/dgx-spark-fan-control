@@ -14,6 +14,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from threading import Event
 from pathlib import Path
 
@@ -35,6 +37,8 @@ WATCHDOG_REBOOT_SECONDS = 60.0
 WATCHDOG_SOC_CELSIUS = 85.0
 WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
 WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
+WATCHDOG_MAX_DEFER_SECONDS = 1800.0
+CHECK_TIMEOUT_SECONDS = 5.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
 WATCHDOG_REBOOT_ACTION = "systemctl reboot"
 DAEMON_UNIT = "dgx-fan-control.service"
@@ -392,8 +396,11 @@ def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str | 
     return text or None
 
 
-def read_stall_marker(path: Path) -> tuple[str, str] | None:
-    """boot id and timestamp text, or None when no reboot has been recorded."""
+def read_stall_marker(path: Path) -> tuple[str, str, str] | None:
+    """boot id, timestamp, and reason, or None when no reboot was recorded.
+
+    A marker written before reasons existed is treated as a true-zero reboot.
+    """
     try:
         lines = path.read_text(encoding="ascii").splitlines()
     except OSError:
@@ -407,15 +414,66 @@ def read_stall_marker(path: Path) -> tuple[str, str] | None:
     timestamp = found.get("time")
     if not boot_id or not timestamp:
         return None
-    return boot_id, timestamp
+    return boot_id, timestamp, found.get("reason") or "true-zero"
 
 
-def write_stall_marker(path: Path, boot_id: str, when: float) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_stall_marker(path: Path, boot_id: str, when: float, reason: str = "true-zero") -> None:
+    ensure_state_dir(path.parent)
     path.write_text(
-        f"boot_id={boot_id}\ntime={when:.3f}\n",
+        f"boot_id={boot_id}\ntime={when:.3f}\nreason={reason}\n",
         encoding="ascii",
     )
+
+
+INTERVENTION_NAME = "needs-intervention"
+HEALTH_NAME = "health"
+NOTIFY_DEFAULT = Path("/etc/default/dgx-fan-control")
+
+
+def ensure_state_dir(path: Path) -> None:
+    """Create the state directory and keep it traversable by later SSH logins."""
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        return
+
+
+def write_state_text(path: Path, text: str) -> None:
+    """Write a state file as mode 0644 so a login can read the flag."""
+    ensure_state_dir(path.parent)
+    path.write_text(text, encoding="ascii")
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        return
+
+
+def write_intervention(path: Path, reason: str, boot_id: str | None, when: float) -> None:
+    write_state_text(
+        path,
+        f"reason={reason}\nboot_id={boot_id or ''}\ntime={when:.3f}\n",
+    )
+
+
+def read_intervention_reason(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="ascii")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "reason" and value.strip():
+            return value.strip()
+    stripped = text.strip()
+    return stripped or None
+
+
+def intervention_banner(path: Path) -> str:
+    reason = read_intervention_reason(path)
+    if not reason:
+        return ""
+    return f"NEEDS INTERVENTION: {reason}\n"
 
 
 def clear_stall_marker(path: Path) -> None:
@@ -423,6 +481,322 @@ def clear_stall_marker(path: Path) -> None:
         path.unlink()
     except OSError:
         return
+
+
+PREVIOUS_REBOOT_NAME = "previous-watchdog-reboot"
+RECOVERY_ANNOUNCED_NAME = "recovery-announced"
+HEALTH_SETTLE_SECONDS = 45.0
+HEALTH_POLL_SECONDS = 2.0
+
+
+def remember_previous_reboot(directory: Path, boot_id: str | None,
+                             marker: tuple[str, str, str] | None) -> None:
+    """Keep a note when this boot follows a watchdog reboot.
+
+    The stall marker itself is removed once the fans are nonzero. The health
+    check still needs to know that this boot came after that reboot.
+    """
+    if not boot_id or marker is None or marker[0] == boot_id:
+        return
+    path = directory / PREVIOUS_REBOOT_NAME
+    try:
+        existing = path.read_text(encoding="ascii")
+    except OSError:
+        existing = ""
+    if f"boot_id={boot_id}\n" in existing:
+        return
+    write_state_text(path, f"boot_id={boot_id}\nreason={marker[2]}\n")
+
+
+def pending_watchdog_reboot(state_dir: Path, boot_id: str | None) -> str | None:
+    """Reason text when this boot follows a watchdog reboot, else None."""
+    marker = read_stall_marker(state_dir / STALL_MARKER_NAME)
+    if marker is not None and boot_id and marker[0] != boot_id:
+        return marker[2]
+    path = state_dir / PREVIOUS_REBOOT_NAME
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    found = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    if boot_id and found.get("boot_id") == boot_id:
+        return found.get("reason") or "true-zero"
+    return None
+
+
+def recovery_already_announced(state_dir: Path, boot_id: str | None) -> bool:
+    if not boot_id:
+        return False
+    path = state_dir / RECOVERY_ANNOUNCED_NAME
+    try:
+        text = path.read_text(encoding="ascii")
+    except OSError:
+        return False
+    return f"boot_id={boot_id}" in text
+
+
+def read_defaults(path: Path = NOTIFY_DEFAULT) -> dict[str, str]:
+    """KEY=VALUE lines from /etc/default/dgx-fan-control. Missing file is empty."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    found = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        found[key.strip()] = value.strip().strip("'\"")
+    return found
+
+
+def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> bool | None:
+    """True on success, False on a clean non-zero exit, None if it cannot be run.
+
+    An http or https URL is a GET. None covers timeouts and other failures.
+    """
+    command = command.strip()
+    if not command:
+        return None
+    if command.startswith("http://") or command.startswith("https://"):
+        try:
+            with urllib.request.urlopen(command, timeout=timeout) as response:
+                return 200 <= getattr(response, "status", 200) < 300
+        except (OSError, urllib.error.URLError, TimeoutError, ValueError):
+            return None
+    try:
+        completed = subprocess.run(
+            command, shell=True, check=False, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return completed.returncode == 0
+
+
+def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
+    """Whether a reboot should wait.
+
+    BUSY_CHECK exit 0 means work is in progress. A failure or timeout counts
+    as busy. When BUSY_CHECK is unset, nvidia-smi compute apps are the default.
+    """
+    command = defaults.get("BUSY_CHECK", "").strip()
+    if command:
+        result = command_succeeded(command)
+        if result is None:
+            return True, "busy-check-failed"
+        return result, "busy-check"
+    state = gpu_jobs()
+    if state is None:
+        return True, "nvidia-smi-failed"
+    return bool(state), "nvidia-smi"
+
+
+def ready_for_work(defaults: dict[str, str]) -> str:
+    """pass, fail, or not configured. A URL or command failure is fail."""
+    command = defaults.get("READY_CHECK", "").strip()
+    if not command:
+        return "not configured"
+    result = command_succeeded(command)
+    if result is True:
+        return "pass"
+    return "fail"
+
+
+def configured_float(defaults: dict[str, str], key: str, fallback: float) -> float:
+    raw = defaults.get(key, "").strip()
+    if not raw:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        LOG.warning("%s is not a number; using %s", key, fallback)
+        return fallback
+    if not math.isfinite(value) or value < 0:
+        LOG.warning("%s must be finite and non-negative; using %s", key, fallback)
+        return fallback
+    return value
+
+
+def fan_health_reasons(thermal_root: Path, hwmon_root: Path, *,
+                       module_loaded: bool, service_active: str,
+                       service_enabled: str, exec_status: int | None,
+                       watchdog_active: str, soc_celsius: float,
+                       log_text: str = "") -> list[str]:
+    """Fan and thermal checks only. Empty means those checks passed.
+
+    The performance daemon is required only when it is enabled. Exit 78, a
+    missing cooling device, a stopped fan, an unreadable or hot zone, and a
+    stopped watchdog are failures.
+    """
+    reasons = []
+    if not module_loaded:
+        reasons.append("kernel module dgx_ec_fan_control is not loaded")
+    devices = cooling_devices(thermal_root)
+    foreign = (
+        exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
+    ) or (
+        len(devices) != 1 and "refusing to replace existing lower floor" in log_text
+    )
+    if foreign:
+        reasons.append("probe refused a foreign lower floor")
+    elif len(devices) != 1:
+        reasons.append("dgx_ec_fan_floor cooling device is missing")
+    if service_enabled == "enabled" and service_active != "active":
+        reasons.append(f"{DAEMON_UNIT} is not active ({service_active})")
+    try:
+        rpms = read_named_fan_rpms(hwmon_root)
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        reasons.append("ACPI fan inputs are unreadable")
+    else:
+        if len(rpms) < 2 or any(rpm == 0 for rpm in rpms):
+            reasons.append("ACPI fans are not all nonzero")
+    try:
+        hottest = read_hottest_temperature_c(thermal_root)
+    except (OSError, RuntimeError, ValueError):
+        reasons.append("hottest zone is not readable")
+    else:
+        if hottest >= soc_celsius:
+            reasons.append(f"hottest zone is {hottest:.1f}C")
+    if watchdog_active != "active":
+        reasons.append(f"{WATCHDOG_UNIT} is not active ({watchdog_active})")
+    return reasons
+
+
+def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
+                        boot_id: str | None, when: float) -> None:
+    lines = [
+        f"result={result}",
+        f"ready={ready}",
+        f"boot_id={boot_id or ''}",
+        f"time={when:.3f}",
+    ]
+    if reasons:
+        lines.append("reason=" + "; ".join(reasons))
+    write_state_text(path, "\n".join(lines) + "\n")
+
+
+def run_notify(defaults: dict[str, str], summary: str) -> None:
+    """Run DGX_FAN_NOTIFY with the summary on stdin. Empty means off."""
+    command = defaults.get("DGX_FAN_NOTIFY", "").strip()
+    if not command:
+        return
+    try:
+        subprocess.run(
+            command, shell=True, input=summary, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOG.warning("notify hook failed: %s", exc)
+
+
+def run_health(thermal_root: Path, hwmon_root: Path, *,
+               settle_seconds: float = HEALTH_SETTLE_SECONDS,
+               poll_seconds: float = HEALTH_POLL_SECONDS,
+               soc_celsius: float = WATCHDOG_SOC_CELSIUS,
+               state_dir: Path | None = None,
+               defaults: dict[str, str] | None = None,
+               monotonic=None, wall_time=None, sleeper=None,
+               observer=None, notifier=None, boot_id: str | None = None,
+               notify=None) -> int:
+    """Check fans and thermals, then the optional READY_CHECK.
+
+    Polls until the settle window ends so a slow module load can still pass.
+    READY_CHECK runs only after the fan checks pass. Its failure is the
+    reason 'workload not ready'. A pass clears the reboot and intervention
+    markers. A failure records the flag and does not reboot.
+    """
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    if defaults is None:
+        defaults = read_defaults()
+    settle_seconds = configured_float(
+        defaults, "HEALTH_SETTLE_SECONDS", settle_seconds,
+    )
+    if not math.isfinite(settle_seconds) or settle_seconds < 0:
+        raise ValueError("health settle interval must be finite and non-negative")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("health poll interval must be finite and positive")
+    if monotonic is None:
+        monotonic = time.monotonic
+    if wall_time is None:
+        wall_time = time.time
+    if sleeper is None:
+        sleeper = time.sleep
+    if notifier is None:
+        notifier = broadcast_alert
+    if notify is None:
+        notify = run_notify
+    if boot_id is None:
+        boot_id = read_boot_id()
+    deadline = monotonic() + settle_seconds
+    ready = "not configured"
+    reasons = ["health check did not run"]
+    while True:
+        if observer is None:
+            active, enabled, exec_status = read_daemon_unit()
+            watchdog_active, _watchdog_enabled = watchdog_unit_state()
+            snapshot = {
+                "module_loaded": module_is_loaded(),
+                "service_active": active,
+                "service_enabled": enabled,
+                "exec_status": exec_status,
+                "watchdog_active": watchdog_active,
+                "log_text": read_kernel_log(),
+            }
+        else:
+            snapshot = observer()
+        reasons = fan_health_reasons(
+            thermal_root, hwmon_root, soc_celsius=soc_celsius, **snapshot,
+        )
+        if not reasons:
+            ready = ready_for_work(defaults)
+            if ready == "fail":
+                reasons = ["workload not ready"]
+            else:
+                break
+        if monotonic() >= deadline:
+            break
+        sleeper(poll_seconds)
+    when = wall_time()
+    health_path = state_dir / HEALTH_NAME
+    intervention_path = state_dir / INTERVENTION_NAME
+    if not reasons:
+        previous = pending_watchdog_reboot(state_dir, boot_id)
+        clear_stall_marker(state_dir / STALL_MARKER_NAME)
+        clear_stall_marker(intervention_path)
+        clear_stall_marker(state_dir / PREVIOUS_REBOOT_NAME)
+        write_health_record(health_path, "healthy", ready, [], boot_id, when)
+        if previous and not recovery_already_announced(state_dir, boot_id):
+            message = "dgx-fan-control: recovered after watchdog reboot"
+            LOG.info(message)
+            _wall(notifier, message, "recovery notice")
+            write_state_text(
+                state_dir / RECOVERY_ANNOUNCED_NAME,
+                f"boot_id={boot_id or ''}\n",
+            )
+            notify(defaults, message + "\n")
+        else:
+            LOG.info("dgx-fan-control: healthy")
+        return 0
+    reason = "; ".join(reasons)
+    write_intervention(intervention_path, reason, boot_id, when)
+    write_health_record(
+        health_path, "needs-intervention", ready, reasons, boot_id, when,
+    )
+    message = f"dgx-fan-control: needs intervention: {reason}"
+    LOG.critical(message)
+    notify(defaults, message + "\n")
+    return 1
+
+
+def show_intervention() -> None:
+    banner = intervention_banner(STALL_MARKER_DIR / INTERVENTION_NAME)
+    if banner:
+        print(banner, end="")
 
 
 def gpu_job_running() -> bool | None:
@@ -484,6 +858,30 @@ def recover_fan_stall(thermal_root: Path, *, module_loaded: bool) -> None:
     )
 
 
+def note_deferred_reboot(kind: str, detail: str, now: float, since: float | None,
+                         wall_at: float | None, max_defer: float, repeat: float,
+                         notifier, announced: bool) -> tuple[float, float | None, bool]:
+    """Journal the deferral. After max_defer, wall as well and keep waiting."""
+    if since is None:
+        since = now
+    if now - since >= max_defer:
+        message = (
+            f"{kind}: deferral limit of {max_defer:.0f}s reached; "
+            "work is still in progress; not rebooting through work"
+        )
+        due = wall_at is None or now - wall_at >= repeat
+        if due:
+            LOG.critical(message)
+            _wall(notifier, message, "deferral-limit alert")
+            wall_at = now
+        else:
+            LOG.warning(message)
+        return since, wall_at, True
+    if not announced:
+        LOG.warning("%s: deferring reboot; %s", kind, detail)
+    return since, wall_at, True
+
+
 def _wall(notifier, message: str, what: str) -> None:
     try:
         notifier(message)
@@ -501,14 +899,19 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  nonzero_clear_seconds: float = WATCHDOG_NONZERO_CLEAR_SECONDS,
                  action: str = WATCHDOG_DEFAULT_ACTION,
                  reboot_action: str = WATCHDOG_REBOOT_ACTION,
+                 max_defer_seconds: float = WATCHDOG_MAX_DEFER_SECONDS,
                  monotonic=None, wall_time=None, runner=None, unit_state=None,
                  notifier=None, gpu_jobs=None, module_loaded=None,
                  marker_path: Path | None = None,
-                 boot_id: str | None = None) -> int:
-    """Watch ACPI fans. A true zero can reboot; a hot stalled job powers off.
+                 boot_id: str | None = None,
+                 defaults: dict[str, str] | None = None) -> int:
+    """Watch ACPI fans. A true zero or a foreign floor can reboot once.
 
-    A foreign floor is not a reason to reboot: those fans are held high.
-    ``zero_seconds`` remains accepted so older invocations still parse.
+    A foreign floor skips the repair because those fans are already high.
+    The next boot with the same floor records needs-intervention and does
+    not reboot or power off. ``zero_seconds`` remains accepted so older
+    invocations still parse. MAX_DEFER_SECONDS in the defaults file, when
+    set, overrides ``max_defer_seconds``.
     """
     del zero_seconds  # Hot shutdown now follows the hottest zone, not a second hold.
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
@@ -521,6 +924,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         raise ValueError("SoC threshold must be finite")
     if not math.isfinite(alert_repeat_seconds) or alert_repeat_seconds < 0:
         raise ValueError("alert repeat interval must be finite and non-negative")
+    if not math.isfinite(max_defer_seconds) or max_defer_seconds < 0:
+        raise ValueError("maximum deferral must be finite and non-negative")
     if monotonic is None:
         monotonic = time.monotonic
     if wall_time is None:
@@ -533,6 +938,11 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         notifier = broadcast_alert
     if gpu_jobs is None:
         gpu_jobs = gpu_job_running
+    if defaults is None:
+        defaults = read_defaults()
+    max_defer_seconds = configured_float(
+        defaults, "MAX_DEFER_SECONDS", max_defer_seconds,
+    )
     if marker_path is None:
         marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
     if boot_id is None:
@@ -563,12 +973,23 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     smi_warned = False
     reported_unsupported = False
     foreign_walled = False
+    foreign_since: float | None = None
+    foreign_deferred = False
+    foreign_intervened = False
+    foreign_defer_since: float | None = None
+    foreign_defer_wall: float | None = None
+    zero_defer_since: float | None = None
+    zero_defer_wall: float | None = None
     while not stop_requested.is_set():
         active_state, enabled_state, exec_status = split_unit_state(unit_state())
         if exec_status == FOREIGN_FLOOR_EXIT:
+            now = monotonic()
+            if foreign_since is None:
+                foreign_since = now
+            held = now - foreign_since
             message = (
                 "dgx-fan-control: probe refused a foreign lower floor; "
-                "a reboot clears the ACPI floor; fans are held high; not rebooting"
+                "a reboot clears the ACPI floor"
             )
             if not foreign_walled:
                 LOG.critical(message)
@@ -576,7 +997,94 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 foreign_walled = True
             else:
                 LOG.info(message)
-        elif daemon_needs_alarm(active_state, enabled_state, exec_status):
+            try:
+                hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                hottest = None
+            busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
+            if busy_how == "nvidia-smi-failed" and not smi_warned:
+                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                smi_warned = True
+            if busy_how == "busy-check-failed" and not smi_warned:
+                LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                smi_warned = True
+            hot = hottest is not None and hottest >= soc_celsius
+            if hot:
+                LOG.critical(
+                    "foreign floor: hottest zone is %.1fC; running %s",
+                    hottest, action,
+                )
+                status = runner(action)
+                if status != 0:
+                    LOG.critical("fan-stall action exited %s", status)
+                    return status if isinstance(status, int) else 1
+                return 0
+            if held >= reboot_seconds:
+                marker = read_stall_marker(marker_path)
+                previous_boot = (
+                    marker is not None and boot_id is not None and marker[0] != boot_id
+                )
+                if busy:
+                    detail = (
+                        "a GPU job is running"
+                        if busy_how.startswith("nvidia-smi")
+                        else "BUSY_CHECK reports work in progress"
+                    )
+                    foreign_defer_since, foreign_defer_wall, foreign_deferred = (
+                        note_deferred_reboot(
+                            "foreign floor", detail, now, foreign_defer_since,
+                            foreign_defer_wall, max_defer_seconds,
+                            alert_repeat_seconds, notifier, foreign_deferred,
+                        )
+                    )
+                elif previous_boot or boot_id is None:
+                    reason = (
+                        "foreign floor remains after a watchdog reboot; "
+                        "fans are held high; not rebooting again"
+                    )
+                    if previous_boot:
+                        remember_previous_reboot(marker_path.parent, boot_id, marker)
+                    if not foreign_intervened:
+                        write_intervention(
+                            marker_path.parent / INTERVENTION_NAME,
+                            reason, boot_id, wall_time(),
+                        )
+                        LOG.critical("dgx-fan-control: needs intervention: %s", reason)
+                        foreign_intervened = True
+                    else:
+                        LOG.info("dgx-fan-control: needs intervention: %s", reason)
+                elif reboot_requested or (
+                    marker is not None and boot_id is not None and marker[0] == boot_id
+                ):
+                    LOG.info(
+                        "foreign floor: reboot already requested this boot; "
+                        "not requesting another",
+                    )
+                else:
+                    write_stall_marker(
+                        marker_path, boot_id, wall_time(), reason="foreign-floor",
+                    )
+                    reboot_requested = True
+                    idle = (
+                        "no GPU job" if busy_how.startswith("nvidia-smi")
+                        else "no work in progress"
+                    )
+                    LOG.critical(
+                        "foreign floor: %s; a reboot clears the ACPI floor; "
+                        "running %s",
+                        idle, reboot_action,
+                    )
+                    status = runner(reboot_action)
+                    if status != 0:
+                        LOG.critical("fan-stall action exited %s", status)
+                        return status if isinstance(status, int) else 1
+                    return 0
+            if stop_requested.is_set():
+                break
+            stop_requested.wait(poll_seconds)
+            continue
+        foreign_since = None
+        if daemon_needs_alarm(active_state, enabled_state, exec_status):
             now = monotonic()
             state_key = (active_state, enabled_state, exec_status)
             changed = state_key != last_daemon_state
@@ -628,7 +1136,9 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             if nonzero_since is None:
                 nonzero_since = now
             elif now - nonzero_since >= nonzero_clear_seconds:
-                if read_stall_marker(marker_path) is not None:
+                marker = read_stall_marker(marker_path)
+                if marker is not None:
+                    remember_previous_reboot(marker_path.parent, boot_id, marker)
                     clear_stall_marker(marker_path)
                     LOG.info(
                         "fan stall: fans have been nonzero for %.0fs; "
@@ -681,18 +1191,15 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                         loaded,
                     )
                     recover_fan_stall(thermal_root, module_loaded=loaded)
-            job_state = gpu_jobs()
-            if job_state is None:
-                job = True
-                if not smi_warned:
-                    LOG.warning(
-                        "nvidia-smi failed; treating a GPU job as running",
-                    )
-                    smi_warned = True
-            else:
-                job = bool(job_state)
+            busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
+            if busy_how == "nvidia-smi-failed" and not smi_warned:
+                LOG.warning("nvidia-smi failed; treating a GPU job as running")
+                smi_warned = True
+            if busy_how == "busy-check-failed" and not smi_warned:
+                LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                smi_warned = True
             hot = hottest is not None and hottest >= soc_celsius
-            if job and hot and held > stall_seconds:
+            if busy and hot and held > stall_seconds:
                 LOG.critical(
                     "fan stall: GPU job is running and the hottest zone is "
                     "%.1fC; running %s",
@@ -704,13 +1211,19 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                     return status if isinstance(status, int) else 1
                 return 0
             if held >= reboot_seconds:
-                if job:
-                    if not deferred_logged:
-                        LOG.warning(
-                            "fan stall: deferring reboot; a GPU job is running "
-                            "and the fans are still at 0 RPM",
+                if busy:
+                    detail = (
+                        "a GPU job is running and the fans are still at 0 RPM"
+                        if busy_how.startswith("nvidia-smi")
+                        else "BUSY_CHECK reports work in progress"
+                    )
+                    zero_defer_since, zero_defer_wall, deferred_logged = (
+                        note_deferred_reboot(
+                            "fan stall", detail, now, zero_defer_since,
+                            zero_defer_wall, max_defer_seconds,
+                            alert_repeat_seconds, notifier, deferred_logged,
                         )
-                        deferred_logged = True
+                    )
                 else:
                     marker = read_stall_marker(marker_path)
                     if marker is not None and boot_id is not None and marker[0] != boot_id:
@@ -743,12 +1256,18 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                                 LOG.critical("fan-stall action exited %s", status)
                                 return status if isinstance(status, int) else 1
                             return 0
-                        write_stall_marker(marker_path, boot_id, wall_time())
+                        write_stall_marker(
+                            marker_path, boot_id, wall_time(), reason="true-zero",
+                        )
                         reboot_requested = True
+                        idle = (
+                            "no GPU job" if busy_how.startswith("nvidia-smi")
+                            else "no work in progress"
+                        )
                         LOG.critical(
-                            "fan stall: no GPU job and fans still at 0 RPM "
+                            "fan stall: %s and fans still at 0 RPM "
                             "after %.1fs; running %s",
-                            held, reboot_action,
+                            idle, held, reboot_action,
                         )
                         status = runner(reboot_action)
                         if status != 0:
@@ -1574,6 +2093,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=WATCHDOG_ALERT_REPEAT_SECONDS,
         help="minimum time between repeated wall broadcasts for one ongoing condition",
     )
+    watchdog.add_argument(
+        "--max-defer-seconds",
+        type=float,
+        default=WATCHDOG_MAX_DEFER_SECONDS,
+        help="after this long deferred, alert and keep waiting; never reboot through work",
+    )
     acpi_max = subparsers.add_parser(
         "acpi-max",
         help="set ACPI Fan cooling devices without this kernel module",
@@ -1603,6 +2128,22 @@ def build_parser() -> argparse.ArgumentParser:
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
     subparsers.add_parser("automatic", help="restore firmware-automatic policy")
     subparsers.add_parser("status", help="show the cooling state and hottest sensor")
+    health = subparsers.add_parser(
+        "health",
+        help="check fans and thermals after boot, then the optional READY_CHECK",
+    )
+    health.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the needs-intervention flag",
+    )
+    health.add_argument(
+        "--settle-seconds",
+        type=float,
+        default=HEALTH_SETTLE_SECONDS,
+        help="keep polling this long so a slow boot can still pass",
+    )
+    health.add_argument("--poll-seconds", type=float, default=HEALTH_POLL_SECONDS)
     return parser
 
 
@@ -1626,6 +2167,7 @@ def main(argv: list[str] | None = None) -> int:
                 alert_repeat_seconds=args.alert_repeat_seconds,
                 action=args.action,
                 reboot_action=args.reboot_action,
+                max_defer_seconds=args.max_defer_seconds,
             )
         if args.command == "acpi-max":
             set_acpi_fans(
@@ -1661,6 +2203,7 @@ def main(argv: list[str] | None = None) -> int:
                 profile = None
             exec_status, exit_timestamp, start_us, exit_us = read_exec_main()
             watchdog_active, watchdog_enabled = watchdog_unit_state()
+            show_intervention()
             print(module_status(
                 etc,
                 loaded=loaded,
@@ -1675,6 +2218,17 @@ def main(argv: list[str] | None = None) -> int:
                 watchdog_enabled=watchdog_enabled,
             ), end="")
             return 0
+        if args.command == "health":
+            if args.clear:
+                clear_stall_marker(STALL_MARKER_DIR / INTERVENTION_NAME)
+                print("cleared the needs-intervention flag")
+                return 0
+            return run_health(
+                args.thermal_root,
+                args.hwmon_root,
+                settle_seconds=args.settle_seconds,
+                poll_seconds=args.poll_seconds,
+            )
         cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
@@ -1687,10 +2241,12 @@ def main(argv: list[str] | None = None) -> int:
                 state = read_state(cooling_device)
             except RuntimeError as exc:
                 if "floor was changed outside this driver" in str(exc):
+                    show_intervention()
                     print(exc)
                     return 1
                 raise
             active, enabled = watchdog_unit_state()
+            show_intervention()
             print(format_cooling_status(
                 state, read_hottest_temperature_c(args.thermal_root),
             ))
@@ -1703,6 +2259,7 @@ def main(argv: list[str] | None = None) -> int:
         # line. Exit 69 is only the daemon's startup check.
         if args.command == "status":
             active, enabled = watchdog_unit_state()
+            show_intervention()
             print(CONTROL_UNSUPPORTED)
             print(format_watchdog_status(active, enabled), end="")
             return 0
@@ -1715,6 +2272,7 @@ def main(argv: list[str] | None = None) -> int:
         # clear a floor the probe refused. A reboot clears the ACPI floor.
         if args.command == "status":
             active, enabled = watchdog_unit_state()
+            show_intervention()
             print(exc)
             print(format_watchdog_status(active, enabled), end="")
             return 1
@@ -1728,6 +2286,7 @@ def main(argv: list[str] | None = None) -> int:
             or "floor was changed outside this driver" in str(exc)
         ):
             active, enabled = watchdog_unit_state()
+            show_intervention()
             print(exc)
             print(format_watchdog_status(active, enabled), end="")
             return 1

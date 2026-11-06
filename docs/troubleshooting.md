@@ -194,17 +194,23 @@ logging `no dgx_ec_fan_floor cooling device: probe did not register one`.
 `status` on that machine said the probe had refused a foreign lower floor,
 left by an earlier ACPI `cur_state` write. Starting the service again cannot
 clear that floor. The daemon now exits 78 and systemd does not restart it.
-The journal line says a reboot clears the ACPI floor. Reboot. Do not toggle
-the service, and do not write ACPI level 0. The fans are held high, so the
-watchdog does not reboot for this by itself. It broadcasts that once, then
-keeps the reminder in the journal.
+The journal line says a reboot clears the ACPI floor. Do not toggle the
+service, and do not write ACPI level 0. The fans are held high, so this is
+not a true-zero stall and the watchdog does not run the repair. It does
+reboot once, after the same hold and the same deferral as a true zero. If
+the next boot still has the foreign floor, it writes
+`/var/lib/dgx-fan-control/needs-intervention` and does not reboot again and
+does not power off. `dgx-fan-control health` reports the same failure, and
+the motd snippet shows it on a later login. `dgx-fan-control health --clear`
+removes the flag after you have dealt with it. A later passing check
+removes it as well.
 
 `dgx-fan-control watchdog` does not alarm when the last exit is 69. Exit 78
-is one broadcast and then journal only. It still logs on every poll, and
-broadcasts when the state changes or every 30 minutes, when the unit is
-`failed` or enabled but inactive for another reason, before it applies the
-temperature rule. SIGTERM lets the
-daemon perform its own cleanup, without a competing `ExecStop` writer.
+is one broadcast and then journal lines, and then that one reboot. It still
+logs on every poll, and broadcasts when the state changes or every 30
+minutes, when the unit is `failed` or enabled but inactive for another
+reason, before it applies the temperature rule. SIGTERM lets the daemon
+perform its own cleanup, without a competing `ExecStop` writer.
 
 On 2026-09-07, both machines had an **idle physical mailbox with a stale pending
 flag**. A guarded, one-shot read-lower-floor retry recovered communication on

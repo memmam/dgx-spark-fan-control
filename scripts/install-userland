@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Install the command and both systemd units.
+# Install the command, the watchdog, the performance unit, and the health check.
 # Enables and starts the fan-stall watchdog unless --no-watchdog.
+# Enables dgx-fan-health.service for the next boot. Does not start it now.
 # Does not enable dgx-fan-control.service. That remains an explicit choice
 # (systemctl enable, or: dgx-fan-control module enable --start-service).
 set -euo pipefail
@@ -32,7 +33,16 @@ install -D -m 0644 "${root}/systemd/dgx-fan-control.service" \
   /etc/systemd/system/dgx-fan-control.service
 install -D -m 0644 "${root}/systemd/dgx-fan-watchdog.service" \
   /etc/systemd/system/dgx-fan-watchdog.service
+install -D -m 0644 "${root}/systemd/dgx-fan-health.service" \
+  /etc/systemd/system/dgx-fan-health.service
+install -D -m 0755 "${root}/systemd/95-dgx-fan-control" \
+  /etc/update-motd.d/95-dgx-fan-control
+if [[ ! -f /etc/default/dgx-fan-control ]]; then
+  install -D -m 0644 "${root}/systemd/dgx-fan-control.default" \
+    /etc/default/dgx-fan-control
+fi
 systemctl daemon-reload
+systemctl enable dgx-fan-health.service
 
 if [[ "${watchdog}" -eq 1 ]]; then
   systemctl enable --now dgx-fan-watchdog.service
