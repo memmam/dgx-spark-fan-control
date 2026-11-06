@@ -573,8 +573,10 @@ class UserlandFailureTests(unittest.TestCase):
                 order.append(("action", action))
                 return 0
 
+            slept = []
             with patch.object(CONTROL, "read_hottest_temperature_c", side_effect=read_temp), \
                  patch.object(CONTROL, "run_nvidia_smi", side_effect=hanging_smi), \
+                 patch.object(CONTROL.time, "sleep", side_effect=slept.append), \
                  patch.object(CONTROL, "Event", return_value=Event()), \
                  patch.object(CONTROL.signal, "signal"), \
                  self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
@@ -591,6 +593,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(order[0][1], 91.0)
             self.assertEqual(order[1], ("action", CONTROL.WATCHDOG_DEFAULT_ACTION))
             self.assertNotIn("nvidia-smi", order)
+            self.assertEqual(slept, [])
             text = "\n".join(logs.output)
             self.assertIn(
                 "fan stall: hottest zone is 91.0C; running "
@@ -3049,10 +3052,10 @@ class UserlandFailureTests(unittest.TestCase):
             root_code, root_out, root_err = run(0)
             self.assertEqual(user_code, 0, user_out + user_err)
             self.assertEqual(root_code, 0, root_out + root_err)
-            self.assertIn("progress: built-in (GPU utilization; recorded ", user_out)
-            self.assertIn("progress: built-in (GPU utilization; recorded ", root_out)
-            self.assertIn(" UTC)", user_out)
-            self.assertIn(" UTC)", root_out)
+            self.assertIn("progress: built-in (GPU utilization)", user_out)
+            self.assertIn("progress: built-in (GPU utilization)", root_out)
+            self.assertNotIn("progress: built-in (GPU utilization; recorded", user_out)
+            self.assertNotIn("progress: built-in (GPU utilization; recorded", root_out)
             self.assertNotIn("job: warn", user_out)
             self.assertNotIn("job: warn", root_out)
             self.assertEqual(
@@ -3070,10 +3073,10 @@ class UserlandFailureTests(unittest.TestCase):
             root_code, root_out, root_err = run(0)
             self.assertEqual(user_code, 0, user_out + user_err)
             self.assertEqual(root_code, 0, root_out + root_err)
-            self.assertIn("progress: off (no job running; recorded ", user_out)
-            self.assertIn("progress: off (no job running; recorded ", root_out)
-            self.assertIn(" UTC)", user_out)
-            self.assertIn(" UTC)", root_out)
+            self.assertIn("progress: off (no job running)", user_out)
+            self.assertIn("progress: off (no job running)", root_out)
+            self.assertNotIn("progress: off (no job running; recorded", user_out)
+            self.assertNotIn("progress: off (no job running; recorded", root_out)
 
             real_read = Path.read_text
 
@@ -3090,6 +3093,111 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn("progress: built-in", stdout)
             self.assertIn("health: healthy", stdout)
 
+    def _two_acpi_fan_devices(self, root: Path, second: str | None):
+        self._healthy_tree(root)
+        first = root / "hwmon" / "hwmon0"
+        (first / "fan2_input").unlink()
+        (first / "fan1_input").write_text("2066\n", encoding="ascii")
+        other = root / "hwmon" / "hwmon1"
+        other.mkdir()
+        (other / "name").write_text("acpi_fan\n", encoding="ascii")
+        if second is not None:
+            (other / "fan1_input").write_text(second, encoding="ascii")
+        return other
+
+    def test_health_rechecks_a_transient_zero_tachometer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            other = self._two_acpi_fan_devices(root, "0\n")
+            sleeps = []
+
+            def sleeper(delay):
+                sleeps.append(delay)
+                (other / "fan1_input").write_text("2148\n", encoding="ascii")
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(), record=False, sleeper=sleeper,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn("health: healthy", text)
+            self.assertIn("fans: pass (", text)
+            self.assertIn("hwmon1:fan1=2148", text)
+            self.assertIn(
+                "hwmon1:fan1 read 0 RPM once, recovered to 2148 RPM "
+                "on recheck (transient)",
+                text,
+            )
+            self.assertEqual(sleeps, [CONTROL.HEALTH_FAN_RECHECK_SECONDS])
+            self.assertFalse((root / "state" / CONTROL.HEALTH_NAME).exists())
+
+    def test_health_fails_a_zero_tachometer_that_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._two_acpi_fan_devices(root, "0\n")
+            sleeps = []
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(), record=False,
+                    sleeper=sleeps.append,
+                )
+            text = stdout.getvalue()
+            self.assertNotEqual(code, 0, text)
+            self.assertIn("health: fail", text)
+            self.assertIn("fans: fail (", text)
+            self.assertIn("hwmon1:fan1=0", text)
+            self.assertNotIn("recovered", text)
+            self.assertNotIn("transient", text)
+            self.assertEqual(
+                sleeps, [CONTROL.HEALTH_FAN_RECHECK_SECONDS] * CONTROL.HEALTH_FAN_RECHECK_LIMIT,
+            )
+            self.assertLessEqual(sum(sleeps), 3.0)
+            self.assertFalse((root / "state" / CONTROL.HEALTH_NAME).exists())
+
+    def test_health_rechecks_a_missing_tachometer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            other = self._two_acpi_fan_devices(root, None)
+            sleeps = []
+
+            def sleeper(delay):
+                sleeps.append(delay)
+                (other / "fan1_input").write_text("2148\n", encoding="ascii")
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(), record=False, sleeper=sleeper,
+                )
+            text = stdout.getvalue()
+            self.assertEqual(code, 0, text)
+            self.assertIn(
+                "hwmon1:fan1 missing once, recovered to 2148 RPM "
+                "on recheck (transient)",
+                text,
+            )
+            self.assertIn("fans: pass (", text)
+            self.assertEqual(sleeps, [1.0])
+
+            (other / "fan1_input").unlink()
+            sleeps.clear()
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code, _alerts, _notices = self._health(
+                    root, {}, self._healthy_snapshot(), record=False,
+                    sleeper=sleeps.append,
+                )
+            text = stdout.getvalue()
+            self.assertNotEqual(code, 0, text)
+            self.assertIn("fans: fail (", text)
+            self.assertIn("hwmon0:fan1=2066", text)
+            self.assertNotIn("hwmon1:fan1=", text)
+            self.assertNotIn("recovered", text)
+            self.assertEqual(sleeps, [1.0, 1.0, 1.0])
+
     def test_legacy_nvidia_smi_failed_after_restart_uses_the_gap_wording(self):
         stamp = 1793949945.0
         shown = CONTROL.format_utc_stamp(stamp)
@@ -3099,15 +3207,17 @@ class UserlandFailureTests(unittest.TestCase):
             self._healthy_tree(root)
             state = root / "state"
             watch = state / CONTROL.JOB_WATCH_NAME
+            mtime = stamp + 10000.0
             CONTROL.write_state_text(
                 watch,
                 "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
-                "no_progress_seconds=0\n",
+                "no_progress_seconds=0\n"
+                f"recorded={stamp:.3f}\n",
             )
-            os.utime(watch, (stamp, stamp))
+            os.utime(watch, (mtime, mtime))
             CONTROL.write_state_text(
                 state / CONTROL.WATCHDOG_STARTED_NAME,
-                f"time={stamp + 30:.3f}\n",
+                f"time={stamp + 20000:.3f}\n",
             )
 
             def run():
@@ -3136,19 +3246,28 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertIn("health: healthy", stdout)
             self.assertIn("progress: waiting for first watchdog sample ", stdout)
             self.assertIn(f"previous sample at {shown}: {gap}", stdout)
+            self.assertNotIn(CONTROL.format_utc_stamp(mtime), stdout)
             self.assertEqual(
                 watch.read_text(encoding="ascii"),
                 "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
-                "no_progress_seconds=0\n",
+                "no_progress_seconds=0\n"
+                f"recorded={stamp:.3f}\n",
             )
 
-            (state / CONTROL.WATCHDOG_STARTED_NAME).unlink()
-            with patch.object(CONTROL, "watchdog_active_since", return_value=None):
-                code, stdout, stderr = run()
+            CONTROL.write_state_text(
+                watch,
+                "source=off\ndetail=nvidia-smi failed\nstuck=no\n"
+                "no_progress_seconds=0\n",
+            )
+            os.utime(watch, (mtime, mtime))
+            code, stdout, stderr = run()
             self.assertEqual(code, 0, stdout + stderr)
             self.assertNotIn("nvidia-smi failed", stdout)
-            self.assertNotIn("waiting for first watchdog sample", stdout)
-            self.assertIn(f"progress: unknown ({gap}; recorded {shown})", stdout)
+            self.assertIn(
+                "previous sample, time unknown: " + gap, stdout,
+            )
+            self.assertNotIn(CONTROL.format_utc_stamp(mtime), stdout)
+            self.assertNotIn(shown, stdout)
 
     def test_first_gpu_sample_waits_until_the_startup_grace(self):
         with tempfile.TemporaryDirectory() as directory:

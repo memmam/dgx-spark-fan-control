@@ -499,9 +499,15 @@ The core checks are fan and thermal only:
   `cur_state`. One device with two inputs prints `fan1=… fan2=… RPM`.
   These Sparks have one `fan1_input` on each of two `acpi_fan` devices, so
   the line is `hwmon0:fan1=… hwmon1:fan1=… RPM`. Fewer than two readings,
-  or any 0, fails. That tachometer is not the `dgx_ec_fan` mailbox
-  telemetry. On EC 3.13.7 a `cur_state` write does not change RPM, so a
-  nonzero level next to a 0 RPM reading is still a tachometer failure
+  or any 0, fails. Health alone rereads a 0 or a missing input up to three
+  times, one second apart, before that failure. A value that returns is a
+  pass and the line names it, for example
+  `hwmon1:fan1 read 0 RPM once, recovered to 2148 RPM on recheck (transient)`.
+  A miss that is still missing is not confirmed, and still fails. The
+  watchdog does not do this recheck. That tachometer is not the
+  `dgx_ec_fan` mailbox telemetry. On EC 3.13.7 a `cur_state` write does not
+  change RPM, so a nonzero level next to a 0 RPM reading is still a
+  tachometer failure
 - the hottest zone is readable. At or above 85°C with the fans spinning
   the line is `warn (hot under load)`, which does not fail the check and
   does not set needs-intervention
@@ -520,6 +526,9 @@ The core checks are fan and thermal only:
   The next successful sample replaces the line. A file written before the
   current watchdog start is
   `waiting for first watchdog sample (previous sample at YYYY-MM-DD HH:MM:SS UTC: ...)`.
+  That clock is the sample's stored `recorded=` time, the same absolute UTC
+  form as `; recorded`. It is not the file's modification time. A file with
+  no stored stamp says `time unknown`.
   The first GPU sample waits 5 seconds after the watchdog starts, so a
   restart does not record a miss while NVML is still settling. Health does not
   run `nvidia-smi` or `PROGRESS_CHECK` itself, so a normal user and root

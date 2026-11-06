@@ -685,6 +685,10 @@ PREVIOUS_REBOOT_NAME = "previous-watchdog-reboot"
 RECOVERY_ANNOUNCED_NAME = "recovery-announced"
 HEALTH_SETTLE_SECONDS = 45.0
 HEALTH_POLL_SECONDS = 2.0
+# Health only. A restart can show one tachometer as 0 for a moment.
+# Three 1s rereads, and no more than that, before the check fails.
+HEALTH_FAN_RECHECK_SECONDS = 1.0
+HEALTH_FAN_RECHECK_LIMIT = 3
 
 
 def remember_previous_reboot(directory: Path, boot_id: str | None,
@@ -1132,24 +1136,18 @@ def _recorded_work_fields(state: dict, state_dir: Path) -> dict[str, str] | None
     return found
 
 
-def job_watch_sample_time(state_dir: Path | None,
-                          fields: dict[str, str]) -> float | None:
-    """Unix time of the stored sample. ``recorded=`` wins; otherwise the mtime."""
+def job_watch_recorded_time(fields: dict[str, str]) -> float | None:
+    """Unix time stored with the sample. File mtime is not a sample time."""
     raw = fields.get("recorded", "").strip()
-    if raw:
-        try:
-            stamp = float(raw)
-        except ValueError:
-            stamp = None
-        else:
-            if math.isfinite(stamp):
-                return stamp
-    if state_dir is None:
+    if not raw:
         return None
     try:
-        return (state_dir / JOB_WATCH_NAME).stat().st_mtime
-    except OSError:
+        stamp = float(raw)
+    except ValueError:
         return None
+    if not math.isfinite(stamp):
+        return None
+    return stamp
 
 
 def parse_systemctl_timestamp(raw: str) -> float | None:
@@ -1211,11 +1209,19 @@ def watchdog_active_since(state_dir: Path | None) -> float | None:
     return parse_systemctl_timestamp(properties.get("ActiveEnterTimestamp", ""))
 
 
-def job_watch_predates(sample_time: float | None, started: float | None) -> bool:
-    """True when the file was written before this watchdog process started."""
-    if sample_time is None or started is None:
+def job_watch_predates(sample_time: float | None, started: float | None, *,
+                       present: bool, stamped: bool) -> bool:
+    """True when this file is from before the current watchdog process.
+
+    A missing file is not a previous sample. A file with no ``recorded=``
+    stamp cannot be dated, so it is previous once this process has started,
+    and the display says the time is unknown.
+    """
+    if not present or started is None:
         return False
-    return sample_time < started
+    if not stamped:
+        return True
+    return sample_time is not None and sample_time < started
 
 
 def _waiting_for_sample(fields: dict[str, str], sample_time: float | None) -> str:
@@ -1231,10 +1237,13 @@ def _waiting_for_sample(fields: dict[str, str], sample_time: float | None) -> st
             f"(previous sample at {shown}: {detail})"
         )
     if gap and detail:
-        return f"waiting for first watchdog sample (previous sample: {detail})"
+        return (
+            "waiting for first watchdog sample "
+            f"(previous sample, time unknown: {detail})"
+        )
     if shown:
         return f"waiting for first watchdog sample (previous sample at {shown})"
-    return "waiting for first watchdog sample"
+    return "waiting for first watchdog sample (previous sample, time unknown)"
 
 
 def format_progress(job_watch: dict[str, str], *,
@@ -1249,13 +1258,13 @@ def format_progress(job_watch: dict[str, str], *,
     if job_watch.get("unreadable") == "yes":
         return NEEDS_ROOT
     fields = translate_legacy_job_watch(job_watch)
-    if sample_time is None:
-        sample_time = job_watch_sample_time(None, fields)
-    elif "recorded" not in fields and sample_time is not None:
-        fields = dict(fields)
-        fields["recorded"] = f"{sample_time:.3f}"
-    if job_watch_predates(sample_time, watchdog_started):
-        return _waiting_for_sample(fields, sample_time)
+    recorded = job_watch_recorded_time(fields)
+    del sample_time  # A file mtime is not the sample time.
+    present = bool(job_watch)
+    if job_watch_predates(
+        recorded, watchdog_started, present=present, stamped=recorded is not None,
+    ):
+        return _waiting_for_sample(fields, recorded)
     source = fields.get("source", "")
     if source == "unknown":
         # A sampling gap is not a health failure. The next good sample
@@ -1782,16 +1791,17 @@ def _acpi_fan_cur_states(thermal_root: Path) -> str:
     return " ".join(states) if states else "none"
 
 
-def _fan_status(hwmon_root: Path, thermal_root: Path) -> tuple[str, str]:
-    """ACPI tachometers under hwmon name acpi_fan, plus Fan cur_state.
+def _acpi_fan_points(hwmon_root: Path) -> tuple[str, dict[tuple[str, str], int | None]]:
+    """One pass over acpi_fan tachometers.
 
-    This is not the dgx_ec_fan mailbox telemetry. A 0 RPM input still fails
-    even when cur_state is nonzero, including on EC 3.13.7. The numbers are
-    included on pass and fail so a one-sample 0 can be told from a stall.
+    ``unknown`` means the directory was not readable. ``unreadable`` means a
+    present input could not be parsed. Otherwise ``ok``. A missing
+    ``fan1_input`` on a present device is ``None``. Each Spark fan is its
+    own ``acpi_fan`` device and that device has only ``fan1_input``.
     """
     names = scandir_names(hwmon_root)
     if names is None:
-        return "unknown", ""
+        return "unknown", {}
     devices = []
     for name in names:
         device = hwmon_root / name
@@ -1799,39 +1809,158 @@ def _fan_status(hwmon_root: Path, thermal_root: Path) -> tuple[str, str]:
             kind = (device / "name").read_text(encoding="ascii").strip()
         except OSError as exc:
             if access_denied(exc):
-                return "unknown", ""
+                return "unknown", {}
             continue
         if kind == ACPI_FAN_NAME:
             devices.append(name)
-    readings: list[tuple[str, int]] = []
+    points: dict[tuple[str, str], int | None] = {}
+    unreadable = False
     for name in devices:
         device = hwmon_root / name
         fan_names = scandir_names(device)
         if fan_names is None:
-            return "unknown", ""
-        prefix = f"{name}:" if len(devices) > 1 else ""
+            return "unknown", {}
+        found = False
         for fan in fan_names:
             if not (fan.startswith("fan") and fan.endswith("_input")):
                 continue
-            label = prefix + fan[: -len("_input")]
+            found = True
+            stem = fan[: -len("_input")]
             try:
                 rpm = int((device / fan).read_text(encoding="ascii").strip())
             except OSError as exc:
                 if access_denied(exc):
-                    return "unknown", ""
-                return "fail", "ACPI fan inputs are unreadable"
+                    return "unknown", {}
+                unreadable = True
+                points[(name, stem)] = None
             except (UnicodeError, ValueError):
-                return "fail", "ACPI fan inputs are unreadable"
-            readings.append((label, rpm))
+                unreadable = True
+                points[(name, stem)] = None
+            else:
+                points[(name, stem)] = rpm
+        if not found:
+            points[(name, "fan1")] = None
+    if unreadable:
+        return "unreadable", points
+    return "ok", points
+
+
+def _fan_label(device: str, stem: str, device_count: int) -> str:
+    if device_count > 1:
+        return f"{device}:{stem}"
+    return stem
+
+
+def _format_fan_status(points: dict[tuple[str, str], int | None],
+                       thermal_root: Path, notes: list[str]) -> tuple[str, str]:
+    device_count = len({device for device, _stem in points})
+    readings = []
+    for (device, stem), rpm in points.items():
+        if not isinstance(rpm, int):
+            continue
+        readings.append((_fan_label(device, stem, device_count), rpm))
     rpm_text = " ".join(f"{label}={rpm}" for label, rpm in readings)
     if rpm_text:
         rpm_text += " RPM"
     else:
         rpm_text = "no ACPI tachometer"
-    detail = f"{rpm_text}; acpi cur_state={_acpi_fan_cur_states(thermal_root)}"
+    parts = [rpm_text]
+    parts.extend(notes)
+    parts.append(f"acpi cur_state={_acpi_fan_cur_states(thermal_root)}")
+    detail = "; ".join(parts)
     if len(readings) < 2 or any(rpm == 0 for _label, rpm in readings):
         return "fail", detail
     return "pass", detail
+
+
+def _fan_reading_suspect(kind: str, points: dict[tuple[str, str], int | None]) -> bool:
+    if kind == "unknown":
+        return False
+    if kind != "ok":
+        return True
+    numeric = [rpm for rpm in points.values() if isinstance(rpm, int)]
+    if len(numeric) < 2 or any(rpm == 0 for rpm in numeric):
+        return True
+    return any(rpm is None for rpm in points.values())
+
+
+def _fan_recovery_notes(history: list[tuple[str, dict[tuple[str, str], int | None]]]) -> list[str]:
+    final_kind, final_points = history[-1]
+    if final_kind != "ok":
+        return []
+    device_count = len({device for device, _stem in final_points})
+    notes = []
+    for key, rpm in final_points.items():
+        if not isinstance(rpm, int) or rpm <= 0:
+            continue
+        zeros = 0
+        missing = 0
+        for kind, points in history[:-1]:
+            earlier = points.get(key)
+            if kind != "ok" or earlier is None or key not in points:
+                missing += 1
+            elif earlier == 0:
+                zeros += 1
+        if zeros == 0 and missing == 0:
+            continue
+        device, stem = key
+        label = _fan_label(device, stem, device_count)
+        if zeros:
+            times = "once" if zeros == 1 else f"{zeros} times"
+            notes.append(
+                f"{label} read 0 RPM {times}, recovered to {rpm} RPM "
+                "on recheck (transient)"
+            )
+        else:
+            times = "once" if missing == 1 else f"{missing} times"
+            notes.append(
+                f"{label} missing {times}, recovered to {rpm} RPM "
+                "on recheck (transient)"
+            )
+    return notes
+
+
+def _fan_status(hwmon_root: Path, thermal_root: Path) -> tuple[str, str]:
+    """ACPI tachometers under hwmon name acpi_fan, plus Fan cur_state.
+
+    This is not the dgx_ec_fan mailbox telemetry. A 0 RPM input still fails
+    even when cur_state is nonzero, including on EC 3.13.7. The numbers are
+    included on pass and fail so a one-sample 0 can be told from a stall.
+    This single pass is what the direct check uses. Health confirms a 0 or
+    a missing input before it fails; the watchdog does not.
+    """
+    kind, points = _acpi_fan_points(hwmon_root)
+    if kind == "unknown":
+        return "unknown", ""
+    if kind == "unreadable":
+        return "fail", "ACPI fan inputs are unreadable"
+    return _format_fan_status(points, thermal_root, [])
+
+
+def _fan_status_for_health(hwmon_root: Path, thermal_root: Path,
+                           sleeper) -> tuple[str, str]:
+    """Health's tachometer check. Recheck a 0 or a missing input before failing.
+
+    Up to three waits of one second. A value that comes back is a pass, with
+    a note that the first read did not hold. A miss that is still there
+    fails the same way as a single pass. This is not the watchdog path.
+    """
+    kind, points = _acpi_fan_points(hwmon_root)
+    if kind == "unknown":
+        return "unknown", ""
+    history = [(kind, points)]
+    while (
+        _fan_reading_suspect(kind, points)
+        and len(history) <= HEALTH_FAN_RECHECK_LIMIT
+    ):
+        sleeper(HEALTH_FAN_RECHECK_SECONDS)
+        kind, points = _acpi_fan_points(hwmon_root)
+        if kind == "unknown":
+            return "unknown", ""
+        history.append((kind, points))
+    if kind == "unreadable":
+        return "fail", "ACPI fan inputs are unreadable"
+    return _format_fan_status(points, thermal_root, _fan_recovery_notes(history))
 
 
 def _temperature_status(thermal_root: Path, zero_fan_celsius: float,
@@ -1864,7 +1993,8 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
                           etc: Path | None = None,
                           state_dir: Path | None = None,
                           job_watch: dict[str, str] | None = None,
-                          ec_block: tuple[str, str] | None = None) -> list[str]:
+                          ec_block: tuple[str, str] | None = None,
+                          sleeper=None) -> list[str]:
     """Run every check, emitting each line before the next external call.
 
     ``log_text`` None means read the kernel log only if a missing cooling
@@ -2026,7 +2156,11 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     else:
         keep("mode", "note", "not configured")
 
-    fan_status, fan_detail = _fan_status(hwmon_root, thermal_root)
+    if sleeper is None:
+        sleeper = time.sleep
+    fan_status, fan_detail = _fan_status_for_health(
+        hwmon_root, thermal_root, sleeper,
+    )
     keep("fans", fan_status, fan_detail)
     keep(
         "temperature",
@@ -2036,15 +2170,13 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     )
     if job_watch is None:
         job_watch = read_job_watch(state_dir) if state_dir is not None else {}
-    sample_time = job_watch_sample_time(state_dir, job_watch)
+    recorded = job_watch_recorded_time(job_watch)
     watchdog_started = (
         watchdog_active_since(state_dir) if watchdog_active == "active" else None
     )
     keep(
         "progress", "note",
-        format_progress(
-            job_watch, sample_time=sample_time, watchdog_started=watchdog_started,
-        ),
+        format_progress(job_watch, watchdog_started=watchdog_started),
     )
     progress_source = job_watch.get("source", "off")
     if progress_source not in {"hook", "built-in", "off"}:
@@ -2052,7 +2184,10 @@ def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
     if (
         job_watch.get("stuck") == "yes"
         and job_watch.get("unreadable") != "yes"
-        and not job_watch_predates(sample_time, watchdog_started)
+        and not job_watch_predates(
+            recorded, watchdog_started,
+            present=bool(job_watch), stamped=recorded is not None,
+        )
     ):
         seconds = job_watch.get("no_progress_seconds", "0")
         keep(
@@ -2358,6 +2493,7 @@ def run_health(thermal_root: Path, hwmon_root: Path, *,
             state_dir=state_dir,
             job_watch=snapshot.get("job_watch"),
             ec_block=snapshot.get("ec_updates"),
+            sleeper=sleeper,
         )
 
     while True:

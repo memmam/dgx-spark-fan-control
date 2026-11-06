@@ -82,6 +82,12 @@ the file is left for `sudo dgx-fan-control health --record` to replace.
 The stored `ready=` matches the live `ready:` line, so telemetry-only
 records `ready=n/a`.
 
+A single `acpi_fan` reading of 0 RPM, or a missing `fan1_input`, is reread
+by `health` up to three times, one second apart. The check fails only when
+that 0 or miss is still there. A recovery is a pass and names the transient,
+for example `hwmon1:fan1 read 0 RPM once, recovered to 2148 RPM on recheck (transient)`.
+The watchdog does not recheck; a true zero there is still immediate.
+
 `progress:` repeats the watchdog sample and names the reason, for example
 `off (no job running; recorded 2026-11-06 09:41:12 UTC)` or
 `built-in (GPU utilization; recorded 2026-11-06 09:41:12 UTC)`. The clock
@@ -90,8 +96,9 @@ means a short retry still could not run nvidia-smi. It is not a fault:
 health stays healthy, and the next good sample replaces it. A file left by
 an older watchdog that says `nvidia-smi failed` is printed with that same
 sentence. If the file is older than the current watchdog start, the line is
-`waiting for first watchdog sample` and names that previous sample with its
-UTC time. The watchdog waits 5 seconds before the first GPU sample so the
+`waiting for first watchdog sample` and names that previous sample with the
+UTC time stored in the file (`recorded=`), not the file's modification time.
+A file with no stored stamp says `time unknown`. The watchdog waits 5 seconds before the first GPU sample so the
 restart itself is not recorded as a miss. The watchdog
 still defers a reboot on a real sampling gap. A true-zero poweroff at 85°C logs
 the hottest zone and the last job-watch sample with a UTC timestamp, or
