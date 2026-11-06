@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import errno
 import hashlib
 import json
@@ -19,6 +20,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from threading import Event
 from pathlib import Path
 
@@ -54,11 +56,17 @@ WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_MAX_DEFER_SECONDS = 1800.0
 CHECK_TIMEOUT_SECONDS = 5.0
 # Built-in GPU sample. A restart can make nvidia-smi fail once and then
-# succeed, so try twice more before calling the sample a gap. The bound is
-# 2s per try plus 0.5s and 1s of backoff, not three full check timeouts.
+# succeed, so try twice more before calling the sample a gap. Outside the
+# watchdog poll this is 2s per try plus 0.5s and 1s of backoff. Inside one
+# poll the shared budget below stops the probes at 3s so the next fan read
+# is not stretched by a hang.
 NVIDIA_SMI_ATTEMPTS = 3
 NVIDIA_SMI_BACKOFF_SECONDS = (0.5, 1.0)
 NVIDIA_SMI_TIMEOUT_SECONDS = 2.0
+PROBE_BUDGET_SECONDS = 3.0
+_probe_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "dgx_probe_deadline", default=None,
+)
 # fwupd ESRT GUID for the DGX Spark embedded controller. The device name is
 # "UEFI Device Firmware", shared with the SoC and other entries. This GUID
 # and a 0x03xxxxxx version identify the EC.
@@ -751,6 +759,10 @@ def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> b
     command = command.strip()
     if not command:
         return None
+    allowed = _budgeted_timeout(timeout)
+    if allowed is None:
+        return "timeout"
+    timeout = allowed
     if command.startswith("http://") or command.startswith("https://"):
         try:
             with urllib.request.urlopen(command, timeout=timeout) as response:
@@ -790,10 +802,13 @@ def read_progress_value(command: str) -> float | None:
     command = command.strip()
     if not command:
         return None
+    timeout = _budgeted_timeout(CHECK_TIMEOUT_SECONDS)
+    if timeout is None:
+        return None
     try:
         completed = subprocess.run(
             command, shell=True, check=False, capture_output=True, text=True,
-            timeout=CHECK_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -834,22 +849,52 @@ def _nvidia_smi_snippet(text: str) -> str:
     return cleaned.encode("ascii", "replace").decode("ascii")[:80]
 
 
+def _budgeted_timeout(requested: float) -> float | None:
+    """Requested seconds, clipped to the watchdog probe budget.
+
+    None means the budget is already spent and the caller must not block.
+    """
+    deadline = _probe_deadline.get()
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(requested, remaining)
+
+
+@contextmanager
+def probe_budget(seconds: float = PROBE_BUDGET_SECONDS):
+    """Cap GPU and progress probes for one watchdog iteration."""
+    token = _probe_deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _probe_deadline.reset(token)
+
+
 def run_nvidia_smi(args: list[str], *, sleeper=None,
                    timeout: float = NVIDIA_SMI_TIMEOUT_SECONDS):
     """Run nvidia-smi, retrying a transient failure twice.
 
     Returns (completed, None) on exit 0. Otherwise (None, (exit label, stderr
     snippet)). A missing binary is not retried. The caller still treats a
-    remaining failure as a running job so a reboot is deferred.
+    remaining failure as a running job so a reboot is deferred. A watchdog
+    probe budget stops further tries without sleeping past the cap.
     """
     if sleeper is None:
         sleeper = time.sleep
     code = "unknown"
     stderr = ""
     for attempt in range(NVIDIA_SMI_ATTEMPTS):
+        allowed = _budgeted_timeout(timeout)
+        if allowed is None:
+            if not stderr and code == "unknown":
+                code = "budget"
+            break
         try:
             completed = subprocess.run(
-                args, check=False, capture_output=True, text=True, timeout=timeout,
+                args, check=False, capture_output=True, text=True, timeout=allowed,
             )
         except subprocess.TimeoutExpired:
             code, stderr = "timeout", ""
@@ -863,7 +908,10 @@ def run_nvidia_smi(args: list[str], *, sleeper=None,
             code = str(completed.returncode)
             stderr = _nvidia_smi_snippet(completed.stderr or "")
         if attempt + 1 < NVIDIA_SMI_ATTEMPTS:
-            sleeper(NVIDIA_SMI_BACKOFF_SECONDS[attempt])
+            pause = _budgeted_timeout(NVIDIA_SMI_BACKOFF_SECONDS[attempt])
+            if pause is None:
+                break
+            sleeper(pause)
     return None, (code, stderr)
 
 
@@ -2621,27 +2669,30 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             except (OSError, RuntimeError, ValueError):
                 hottest = None
             note_observed_rise(hottest, now)
-            busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
-            if busy_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning(
-                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+            # Reboot can wait on this sample. The budget keeps it from
+            # stretching the next iteration.
+            with probe_budget():
+                busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
+                if busy_how == "nvidia-smi-failed" and not smi_warned:
+                    LOG.warning(
+                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                    )
+                    smi_warned = True
+                if busy_how == "busy-check-failed" and not smi_warned:
+                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                    smi_warned = True
+                try:
+                    foreign_rpms = read_named_fan_rpms(hwmon_root)
+                except (OSError, UnicodeError, ValueError, RuntimeError):
+                    foreign_rpms = None
+                observe_hot_job(
+                    now=now, fan_rpms=foreign_rpms, hottest=hottest, busy=busy,
+                    defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                    stuck_seconds=stuck_seconds, state=job_state,
+                    progress_reader=progress_reader, builtin_reader=builtin_reader,
+                    busy_how=busy_how,
                 )
-                smi_warned = True
-            if busy_how == "busy-check-failed" and not smi_warned:
-                LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                smi_warned = True
-            try:
-                foreign_rpms = read_named_fan_rpms(hwmon_root)
-            except (OSError, UnicodeError, ValueError, RuntimeError):
-                foreign_rpms = None
-            observe_hot_job(
-                now=now, fan_rpms=foreign_rpms, hottest=hottest, busy=busy,
-                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
-                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                stuck_seconds=stuck_seconds, state=job_state,
-                progress_reader=progress_reader, builtin_reader=builtin_reader,
-                busy_how=busy_how,
-            )
             if held >= reboot_seconds:
                 marker = read_stall_marker(marker_path)
                 previous_boot = (
@@ -2814,24 +2865,27 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
             except (OSError, RuntimeError, ValueError):
                 spinning_hottest = None
             note_observed_rise(spinning_hottest, now)
-            spinning_busy, spinning_how = work_is_in_progress(defaults, gpu_jobs)
-            if spinning_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning(
-                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+            # Fans are spinning, so this sample is not on the poweroff path.
+            # The budget is what keeps it from delaying the next fan read.
+            with probe_budget():
+                spinning_busy, spinning_how = work_is_in_progress(defaults, gpu_jobs)
+                if spinning_how == "nvidia-smi-failed" and not smi_warned:
+                    LOG.warning(
+                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                    )
+                    smi_warned = True
+                if spinning_how == "busy-check-failed" and not smi_warned:
+                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                    smi_warned = True
+                observe_hot_job(
+                    now=now, fan_rpms=fan_rpms, hottest=spinning_hottest,
+                    busy=spinning_busy, defaults=defaults,
+                    state_dir=marker_path.parent, notifier=notifier,
+                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                    stuck_seconds=stuck_seconds, state=job_state,
+                    progress_reader=progress_reader, builtin_reader=builtin_reader,
+                    busy_how=spinning_how,
                 )
-                smi_warned = True
-            if spinning_how == "busy-check-failed" and not smi_warned:
-                LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                smi_warned = True
-            observe_hot_job(
-                now=now, fan_rpms=fan_rpms, hottest=spinning_hottest,
-                busy=spinning_busy, defaults=defaults,
-                state_dir=marker_path.parent, notifier=notifier,
-                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                stuck_seconds=stuck_seconds, state=job_state,
-                progress_reader=progress_reader, builtin_reader=builtin_reader,
-                busy_how=spinning_how,
-            )
         else:
             announced_shortage = False
             nonzero_since = None
@@ -2850,6 +2904,22 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 LOG.error(
                     "fan stall: hottest zone unreadable; not using temperature",
                 )
+            note_observed_rise(hottest, now)
+            # Poweroff does not depend on whether work is running. Sample
+            # the GPU only after this decision so a hung nvidia-smi cannot
+            # delay it, and so the temperature is not stale from before
+            # that delay.
+            if hottest is not None and hottest >= zero_fan_celsius:
+                LOG.critical(
+                    "fan stall: work state not sampled and the hottest zone is "
+                    "%.1fC; running %s",
+                    hottest, action,
+                )
+                status = runner(action)
+                if status != 0:
+                    LOG.critical("fan-stall action exited %s", status)
+                    return status if isinstance(status, int) else 1
+                return 0
             if held > stall_seconds:
                 repeat_due = (
                     last_stall_wall is None
@@ -2873,43 +2943,24 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                         loaded,
                     )
                     recover_fan_stall(thermal_root, module_loaded=loaded)
-            busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
-            if busy_how == "nvidia-smi-failed" and not smi_warned:
-                LOG.warning(
-                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+            with probe_budget():
+                busy, busy_how = work_is_in_progress(defaults, gpu_jobs)
+                if busy_how == "nvidia-smi-failed" and not smi_warned:
+                    LOG.warning(
+                        "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                    )
+                    smi_warned = True
+                if busy_how == "busy-check-failed" and not smi_warned:
+                    LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                    smi_warned = True
+                observe_hot_job(
+                    now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
+                    defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                    alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                    stuck_seconds=stuck_seconds, state=job_state,
+                    progress_reader=progress_reader, builtin_reader=builtin_reader,
+                    busy_how=busy_how,
                 )
-                smi_warned = True
-            if busy_how == "busy-check-failed" and not smi_warned:
-                LOG.warning("BUSY_CHECK failed; treating work as in progress")
-                smi_warned = True
-            note_observed_rise(hottest, now)
-            observe_hot_job(
-                now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
-                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
-                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
-                stuck_seconds=stuck_seconds, state=job_state,
-                progress_reader=progress_reader, builtin_reader=builtin_reader,
-                busy_how=busy_how,
-            )
-            hot = hottest is not None and hottest >= zero_fan_celsius
-            if hot:
-                if busy:
-                    LOG.critical(
-                        "fan stall: work is in progress and the hottest zone is "
-                        "%.1fC; running %s",
-                        hottest, action,
-                    )
-                else:
-                    LOG.critical(
-                        "fan stall: no work is in progress and the hottest zone "
-                        "is %.1fC; running %s",
-                        hottest, action,
-                    )
-                status = runner(action)
-                if status != 0:
-                    LOG.critical("fan-stall action exited %s", status)
-                    return status if isinstance(status, int) else 1
-                return 0
             if held >= reboot_seconds:
                 if busy:
                     detail = (

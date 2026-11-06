@@ -544,8 +544,52 @@ class UserlandFailureTests(unittest.TestCase):
                 soc=85, reboot_seconds=60,
             )
             self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
-            self.assertIn("no work is in progress", "\n".join(logs))
+            self.assertIn("work state not sampled", "\n".join(logs))
+            self.assertIn("85.0C", "\n".join(logs))
             self.assertNotIn(CONTROL.WATCHDOG_REBOOT_ACTION, actions)
+
+    def test_true_zero_poweroff_does_not_sample_the_gpu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._stopped_acpi_fans(root, (0, 0), 40.0)
+            order = []
+
+            def read_temp(_thermal):
+                (root / "thermal" / "thermal_zone0" / "temp").write_text(
+                    "91000\n", encoding="ascii",
+                )
+                value = 91.0
+                order.append(("temp", value))
+                return value
+
+            def hanging_smi(*_args, **_kwargs):
+                order.append("nvidia-smi")
+                return None, ("timeout", "")
+
+            def runner(action):
+                order.append(("action", action))
+                return 0
+
+            with patch.object(CONTROL, "read_hottest_temperature_c", side_effect=read_temp), \
+                 patch.object(CONTROL, "run_nvidia_smi", side_effect=hanging_smi), \
+                 patch.object(CONTROL, "Event", return_value=Event()), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                status = CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, stall_seconds=15, reboot_seconds=60,
+                    soc_celsius=85, monotonic=lambda: 0.0,
+                    runner=runner, unit_state=lambda: "active",
+                    notifier=lambda _message: None,
+                )
+            self.assertEqual(status, 0)
+            self.assertEqual(order[0][0], "temp")
+            self.assertEqual(order[0][1], 91.0)
+            self.assertEqual(order[1], ("action", CONTROL.WATCHDOG_DEFAULT_ACTION))
+            self.assertNotIn("nvidia-smi", order)
+            text = "\n".join(logs.output)
+            self.assertIn("work state not sampled", text)
+            self.assertIn("91.0C", text)
 
     def test_watchdog_reads_acpi_fans_without_the_kernel_module(self):
         with tempfile.TemporaryDirectory() as directory:
