@@ -224,19 +224,6 @@ def read_named_fan_rpms(hwmon_root: Path, device_name: str = ACPI_FAN_NAME) -> l
     return readings
 
 
-def fans_stalled(fan_rpms: list[int], soc_c: float, held_seconds: float, *,
-                 soc_limit_c: float = WATCHDOG_SOC_CELSIUS,
-                 zero_seconds: float = WATCHDOG_ZERO_SECONDS) -> bool:
-    """True only after every fan has read 0 RPM for longer than zero_seconds."""
-    if len(fan_rpms) < 2 or any(rpm != 0 for rpm in fan_rpms):
-        return False
-    if not math.isfinite(soc_c) or soc_c < soc_limit_c:
-        return False
-    if not math.isfinite(held_seconds) or not math.isfinite(zero_seconds):
-        return False
-    return held_seconds > zero_seconds
-
-
 def systemctl_query(verb: str, unit: str = DAEMON_UNIT) -> str:
     try:
         completed = subprocess.run(
@@ -1725,8 +1712,8 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     LOG.critical(
         "fan-stall watchdog watching ACPI fans and the hottest thermal zone; "
         "0 RPM on every fan for more than %.0fs alerts and attempts a repair; "
-        "still stopped after %.0fs reboots when no GPU job is running; "
-        "a running job is powered off if the hottest zone reaches %.0fC",
+        "still stopped after %.0fs reboots when no work is in progress; "
+        "the hottest zone at %.0fC powers off immediately, with or without work",
         stall_seconds, reboot_seconds, soc_celsius,
     )
     zero_since: float | None = None
@@ -1998,12 +1985,19 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 LOG.warning("BUSY_CHECK failed; treating work as in progress")
                 smi_warned = True
             hot = hottest is not None and hottest >= soc_celsius
-            if busy and hot and held > stall_seconds:
-                LOG.critical(
-                    "fan stall: GPU job is running and the hottest zone is "
-                    "%.1fC; running %s",
-                    hottest, action,
-                )
+            if hot:
+                if busy:
+                    LOG.critical(
+                        "fan stall: work is in progress and the hottest zone is "
+                        "%.1fC; running %s",
+                        hottest, action,
+                    )
+                else:
+                    LOG.critical(
+                        "fan stall: no work is in progress and the hottest zone "
+                        "is %.1fC; running %s",
+                        hottest, action,
+                    )
                 status = runner(action)
                 if status != 0:
                     LOG.critical("fan-stall action exited %s", status)

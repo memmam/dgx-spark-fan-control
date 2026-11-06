@@ -279,47 +279,6 @@ sudo rm -f /usr/local/sbin/dgx-fan-control
 sudo systemctl daemon-reload
 ```
 
-### Updating an existing install
-
-After `git pull`, reinstall the command, the three unit files, and the motd
-snippet. Copying only `dgx-fan-control.service` leaves the watchdog unit
-missing, and `status` then shows `watchdog-enabled: not-found`. Leave an
-existing `/etc/default/dgx-fan-control` in place so a `BUSY_CHECK` or
-`READY_CHECK` you already set is kept. Install the template only when the
-file is absent.
-
-```sh
-sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
-  /etc/systemd/system/dgx-fan-watchdog.service
-sudo install -D -m 0644 systemd/dgx-fan-health.service \
-  /etc/systemd/system/dgx-fan-health.service
-sudo install -D -m 0644 systemd/dgx-fan-manual.service \
-  /etc/systemd/system/dgx-fan-manual.service
-sudo install -D -m 0755 systemd/95-dgx-fan-control \
-  /etc/update-motd.d/95-dgx-fan-control
-if [ ! -f /etc/default/dgx-fan-control ]; then
-  sudo install -D -m 0644 systemd/dgx-fan-control.default \
-    /etc/default/dgx-fan-control
-fi
-sudo systemctl daemon-reload
-sudo systemctl enable dgx-fan-health.service
-sudo systemctl enable dgx-fan-manual.service
-if systemctl is-active --quiet dgx-fan-watchdog.service; then
-  sudo systemctl restart dgx-fan-watchdog.service
-fi
-if systemctl is-active --quiet dgx-fan-control.service; then
-  sudo systemctl restart dgx-fan-control.service
-fi
-```
-
-If the watchdog unit was not installed yet, `is-active` does not enable it.
-Use the manual install above, including `systemctl enable --now
-dgx-fan-watchdog.service`. Restart the performance daemon only when it is
-already active. Do not enable it from this update.
-
 Then choose one mode:
 
 | Startup mode | Best for | Command |
@@ -389,3 +348,144 @@ sudo journalctl -u dgx-fan-control.service -n 30
 The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
 Continue to [pre-cooling and everyday usage](usage.md).
+
+## 6. Updating an existing install
+
+Do the userspace steps on every update. Update the kernel module only when
+this checkout changes files under `kernel/`, which this update does. Check
+before rebuilding:
+
+```sh
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
+(currently `0.1.5`). If they already match and `kernel/` did not change,
+stop after the userspace steps. Otherwise use the same module route you
+installed with: [6A](#6a-dkms-module-update) or
+[6B](#6b-manual-module-update).
+
+### Userspace steps
+
+After `git pull`, reinstall the command, every unit file, and the motd
+snippet. Copying only `dgx-fan-control.service` leaves the watchdog unit
+missing, and `status` then shows `watchdog-enabled: not-found`. Leave an
+existing `/etc/default/dgx-fan-control` in place so a `BUSY_CHECK`,
+`READY_CHECK`, or `MANUAL_STATE` you already set is kept. Install the
+template only when the file is absent. Do not replace
+`/etc/modprobe.d/dgx-fan-control-owned.conf` if `set-state` wrote it; that
+file is how the next load receives `owned_state` and `owned_floor`.
+
+```sh
+sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
+sudo install -D -m 0644 systemd/dgx-fan-control.service \
+  /etc/systemd/system/dgx-fan-control.service
+sudo install -D -m 0644 systemd/dgx-fan-watchdog.service \
+  /etc/systemd/system/dgx-fan-watchdog.service
+sudo install -D -m 0644 systemd/dgx-fan-health.service \
+  /etc/systemd/system/dgx-fan-health.service
+sudo install -D -m 0644 systemd/dgx-fan-manual.service \
+  /etc/systemd/system/dgx-fan-manual.service
+sudo install -D -m 0755 systemd/95-dgx-fan-control \
+  /etc/update-motd.d/95-dgx-fan-control
+if [ ! -f /etc/default/dgx-fan-control ]; then
+  sudo install -D -m 0644 systemd/dgx-fan-control.default \
+    /etc/default/dgx-fan-control
+fi
+sudo systemctl daemon-reload
+sudo systemctl enable dgx-fan-health.service
+sudo systemctl enable dgx-fan-manual.service
+if systemctl is-active --quiet dgx-fan-watchdog.service; then
+  sudo systemctl restart dgx-fan-watchdog.service
+fi
+if systemctl is-active --quiet dgx-fan-control.service; then
+  sudo systemctl restart dgx-fan-control.service
+fi
+```
+
+If the watchdog unit was not installed yet, `is-active` does not enable it.
+Use the manual install in [section 5](#5-choose-your-startup-mode), including
+`systemctl enable --now dgx-fan-watchdog.service`. Restart the performance
+daemon only when it is already active. Do not enable it from this update.
+
+## 6A. DKMS module update
+
+Use this when the original install was [3A](#3a-dkms-builds-for-kernel-updates).
+DKMS signs with the enrolled MOK already configured in
+`/etc/dkms/framework.conf`. It does not run `scripts/build-sign`. From the
+checkout, refresh the registered source and rebuild for the running kernel:
+
+```sh
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.5/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.5/dkms.conf
+sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
+  /usr/src/dgx-spark-fan-control-0.1.5/kernel/
+sudo dkms install -m dgx-spark-fan-control -v 0.1.5 -k "$(uname -r)" --force
+dkms status -m dgx-spark-fan-control
+modinfo -F signer dgx_ec_fan_control
+```
+
+Expect `installed` for `$(uname -r)` and the enrolled certificate subject
+in `signer`. Then unload and reload, and check health without sudo. The
+reload reads `owned_state` and `owned_floor` from
+`/etc/modprobe.d/dgx-fan-control-owned.conf` when that file exists.
+
+```sh
+if systemctl is-active --quiet dgx-fan-control.service; then
+  sudo systemctl stop dgx-fan-control.service
+  restart_performance=1
+else
+  restart_performance=0
+fi
+if lsmod | grep -q '^dgx_ec_fan_control '; then
+  sudo modprobe -r dgx_ec_fan_control
+fi
+sudo modprobe dgx_ec_fan_control
+if [ "$restart_performance" -eq 1 ]; then
+  sudo systemctl start dgx-fan-control.service
+fi
+dgx-fan-control health
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+`health` is not run with sudo. Do not write an ACPI fan level for this check.
+
+## 6B. Manual module update
+
+Use this when the original install was
+[3B](#3b-manual-build-and-sign). Build and sign with the enrolled MOK, then
+install for the running kernel:
+
+```sh
+./scripts/build-sign
+sudo install -D -m 0644 kernel/dgx_ec_fan_control.ko \
+  "/lib/modules/$(uname -r)/updates/dgx_ec_fan_control.ko"
+sudo depmod -a
+modinfo -F signer dgx_ec_fan_control
+```
+
+Run `./scripts/build-sign` as the user who owns the key. The script does not
+install or load the module. An unsigned module will not load while Secure
+Boot is enforced. Then the same unload, reload, and health check as [6A](#6a-dkms-module-update).
+`modprobe` applies `owned_state` and `owned_floor` from
+`/etc/modprobe.d/dgx-fan-control-owned.conf`.
+
+```sh
+if systemctl is-active --quiet dgx-fan-control.service; then
+  sudo systemctl stop dgx-fan-control.service
+  restart_performance=1
+else
+  restart_performance=0
+fi
+if lsmod | grep -q '^dgx_ec_fan_control '; then
+  sudo modprobe -r dgx_ec_fan_control
+fi
+sudo modprobe dgx_ec_fan_control
+if [ "$restart_performance" -eq 1 ]; then
+  sudo systemctl start dgx-fan-control.service
+fi
+dgx-fan-control health
+modinfo dgx_ec_fan_control | grep ^version:
+```
+
+`health` is not run with sudo. Do not write an ACPI fan level for this check.

@@ -354,14 +354,19 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertFalse(CONTROL.daemon_needs_alarm("inactive", "disabled"))
         self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled"))
 
-    def test_stall_requires_both_fans_hot_for_more_than_ten_seconds(self):
+    def test_true_zero_powers_off_at_85c_with_no_work_in_progress(self):
         self.assertEqual(CONTROL.WATCHDOG_SOC_CELSIUS, 85.0)
-        self.assertFalse(CONTROL.fans_stalled([0, 0], 85.0, 10.0))
-        self.assertTrue(CONTROL.fans_stalled([0, 0], 85.0, 10.01))
-        self.assertFalse(CONTROL.fans_stalled([0, 0], 84.9, 30.0))
-        self.assertFalse(CONTROL.fans_stalled([0, 400], 90.0, 30.0))
-        self.assertFalse(CONTROL.fans_stalled([0], 90.0, 30.0))
         self.assertEqual(CONTROL.WATCHDOG_DEFAULT_ACTION, "systemctl poweroff")
+        self.assertFalse(hasattr(CONTROL, "fans_stalled"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=86, gpu=lambda: False, stop_after=10,
+                soc=85, reboot_seconds=60,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
+            self.assertIn("no work is in progress", "\n".join(logs))
+            self.assertNotIn(CONTROL.WATCHDOG_REBOOT_ACTION, actions)
 
     def test_watchdog_reads_acpi_fans_without_the_kernel_module(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -327,9 +327,11 @@ overrides the flag. When the limit runs out and the fans are still at 0
 RPM, or the floor is still foreign, the watchdog broadcasts a critical
 alert and keeps deferring. It does not reboot through work.
 
-If work is in progress and the hottest thermal zone, the maximum across
-every zone, reaches `--soc-celsius` first, it powers off. The default is
-**85°C**.
+If the hottest thermal zone, the maximum across every zone, reaches
+`--soc-celsius` while the fans are at 0 RPM, it powers off immediately.
+That does not wait for `--reboot-seconds`, and it does not matter whether
+work is in progress. The default is **85°C**. A stall itself does not
+require a high temperature: both tachometers at 0 RPM are enough.
 
 85°C is a margin, not a measured EC limit. The kernel's critical trip is
 about 104°C (104.8 in
