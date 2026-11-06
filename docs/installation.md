@@ -224,7 +224,9 @@ Finish by refreshing the stored health record. A reinstall marks the old
 record stale. `--record` saves the current result and, on a healthy run,
 also clears the stored needs-intervention flag and the stall and
 watchdog-reboot markers. The plain command is not sudo and does not write.
-Do not write an ACPI fan level for this check.
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ```sh
 dgx-fan-control health
@@ -278,12 +280,12 @@ sudo dgx-fan-control health --record
 ```
 
 `scripts/install-userland` does not run that refresh. After the script
-with the watchdog enabled, run the same two commands. A reinstall marks
-the old record stale.
-`--record` saves the current result and, on a healthy run, also clears the
-stored needs-intervention flag and the stall and watchdog-reboot markers.
-The plain `health` is not sudo and does not write. Do not write an ACPI fan
-level for this check.
+with the watchdog enabled, run the same two commands. Why, and what
+`--record` clears, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 To install those files and leave the watchdog disabled, stop before the
 `enable --now` line, or run `sudo ./scripts/install-userland --no-watchdog`.
@@ -436,10 +438,11 @@ dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
-A reinstall marks the old record stale. `--record` saves the current result
-and, on a healthy run, also clears the stored needs-intervention flag and
-the stall and watchdog-reboot markers. The plain `health` is not sudo and
-does not write. Do not write an ACPI fan level for this check.
+Why that refresh is required, and what `--record` clears, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 Update the kernel module only when this checkout changes files under
 `kernel/`. Compare the loaded module with this checkout:
@@ -498,10 +501,11 @@ sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
 
-A reinstall marks the old record stale. `--record` saves the current result
-and, on a healthy run, also clears the stored needs-intervention flag and
-the stall and watchdog-reboot markers. The plain `health` is not sudo and
-does not write. Do not write an ACPI fan level for this check.
+Why that refresh is required, and what `--record` clears, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ## 7B. Update the module by hand
 
@@ -545,10 +549,11 @@ sudo dgx-fan-control health --record
 modinfo dgx_ec_fan_control | grep ^version:
 ```
 
-A reinstall marks the old record stale. `--record` saves the current result
-and, on a healthy run, also clears the stored needs-intervention flag and
-the stall and watchdog-reboot markers. The plain `health` is not sudo and
-does not write. Do not write an ACPI fan level for this check.
+Why that refresh is required, and what `--record` clears, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ## EC firmware pairing and downgrade
 
@@ -600,14 +605,36 @@ sudo fwupdmgr downgrade 8c948e1db381648c8893897e4d09b7b153309991
 `update` moves toward the newer release (3.13.7). `downgrade` moves toward
 3.5.8. Decline the report-upload prompt. Let the machine reboot. Do not cut
 power. Check `get-devices` again after the reboot and confirm the version
-before you do anything else. Upgrading to 3.13.7 removes fan-floor control.
+before the fan check or the health refresh. Upgrading to 3.13.7 removes
+fan-floor control.
 
-A firmware change marks the stored health record stale. `--record` saves
-the current result and, on a healthy run, also clears the stored
-needs-intervention flag and the stall and watchdog-reboot markers. The
-plain `health` is not sudo and does not write. EC 3.13.7 telemetry-only is
-a healthy result, not needs-intervention. Do not write an ACPI fan level
-for this check.
+If the version is 3.5.8, confirm both fans report nonzero RPM before that
+refresh. `dgx-fan-control status` prints the cooling state, not RPM. Health
+and the watchdog read the `acpi_fan` tachometers:
+
+```sh
+for device in /sys/class/hwmon/hwmon*; do
+  if [ "$(cat "$device/name" 2>/dev/null)" = acpi_fan ]; then
+    echo "$device fan1=$(cat "$device/fan1_input") fan2=$(cat "$device/fan2_input")"
+  fi
+done
+```
+
+Both values must be greater than 0. On EC 3.5.8 an ACPI level of 0 stops
+the fans. If either reads 0 RPM, immediately run
+`sudo dgx-fan-control acpi-max`, then read the tachometers again.
+`acpi-max` writes level 100. Never write `cur_state` 0 or any ACPI level
+below 40. If `acpi-max` refuses because the module or
+`dgx-fan-control.service` is active, stop that service, unload
+`dgx_ec_fan_control`, and run `acpi-max` again. Do not pass `--force`, and
+do not choose a level below 40.
+
+A firmware change marks the stored health record stale. What `--record`
+saves, and what it clears on a healthy run, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+EC 3.13.7 telemetry-only is a healthy result, not needs-intervention.
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to the `acpi-max` safety step above.
 
 ```sh
 dgx-fan-control health
@@ -664,9 +691,11 @@ because a helper cannot read the list it would overwrite.
 After a downgrade to 3.5.8, block the EC GUID again with the command in
 the previous section. Confirm with the `fwupdtool` line, not with
 `fwupd.conf`. Then refresh the stored health record again so it matches
-this firmware. A firmware change marks the old record stale. `--record`
-saves the current result and, on a healthy run, also clears the stored
-needs-intervention flag and the stall and watchdog-reboot markers.
+this firmware. What `--record` saves and clears is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to the `acpi-max` safety step after the
+downgrade reboot.
 
 ```sh
 dgx-fan-control health
