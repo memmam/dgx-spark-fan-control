@@ -280,9 +280,9 @@ Then choose one mode:
 
 | Startup mode | Best for | Command |
 | --- | --- | --- |
-| NVIDIA factory curve; manual boosts when needed | Pre-cooling individual jobs | `sudo systemctl disable --now dgx-fan-control.service` |
+| NVIDIA factory curve; manual boosts when needed | Pre-cooling individual jobs | `sudo systemctl disable --now dgx-fan-control.service`, then `sudo dgx-fan-control automatic` |
 | This project's performance curve | Continual temperature-based extra cooling | `sudo systemctl enable --now dgx-fan-control.service` |
-| Held manual floor | A fixed floor across boots, without the performance curve | `sudo dgx-fan-control set-state <n>` |
+| Held manual floor | A fixed floor across boots, without the performance curve | `sudo systemctl disable --now dgx-fan-control.service`, then `sudo dgx-fan-control set-state <n>` |
 
 Install enables `dgx-fan-manual.service`, which reapplies a held floor at the
 next boot. It does not start the performance curve. For that mode, stop the
