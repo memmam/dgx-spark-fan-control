@@ -28,7 +28,7 @@ COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
 ACPI_COOLING_TYPE = "Fan"
 HWMON_DEVICE_NAME = "dgx_ec_fan"
 ACPI_FAN_NAME = "acpi_fan"
-ACPI_MIN_LEVEL = 40
+ACPI_MIN_LEVEL = 35
 ACPI_MAX_LEVEL = 100
 CONTROL_UNSUPPORTED = "control unsupported on this firmware"
 TELEMETRY_ONLY_STATUS = "control unsupported on this firmware (telemetry only)"
@@ -2635,7 +2635,7 @@ def gpu_job_running(sleeper=None) -> bool | None:
 
 
 def recover_fan_stall(thermal_root: Path, *, module_loaded: bool) -> None:
-    """One repair after a true-zero stall. Never writes ACPI 0 or a level below 40.
+    """One repair after a true-zero stall. Never writes ACPI 0 or a level below 35.
 
     With the module loaded, request its maximum floor through its cooling
     device. Do not write ACPI: both paths use the same EC register.
@@ -4361,14 +4361,15 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
     """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
 
     Refuses while this module is loaded or its daemon is active, unless force
-    is set. A level below 40 is refused before any write. Level 0 stops both
+    is set. A level below 35 is refused before any write. Level 0 stops both
     fans. EC 3.13.7 accepts the ACPI write and ignores RPM.
     """
     if level < ACPI_MIN_LEVEL or level > ACPI_MAX_LEVEL:
         raise ValueError(
             f"refusing ACPI fan level {level}: this command only writes "
             f"{ACPI_MIN_LEVEL} through {ACPI_MAX_LEVEL}. "
-            "Levels below 30 are unsafe. Level 0 stops both fans immediately "
+            "Level 35 is the lowest level measured to hold. Levels below 30 "
+            "are unsafe. Level 0 stops both fans immediately "
             "and they stay stopped. Level 20 has stalled one fan. Do not write 0."
         )
     if module_loaded is None:

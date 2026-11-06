@@ -392,7 +392,7 @@ sudo journalctl -u dgx-fan-watchdog.service -n 20 --no-pager
 sudo systemctl start dgx-fan-control.service
 ```
 
-Do not write ACPI `cur_state` 0, or any level below 40, to provoke a stall.
+Do not write ACPI `cur_state` 0, or any level below 35, to provoke a stall.
 
 For the performance service, verify startup:
 
@@ -665,10 +665,10 @@ confirmed. If any reading is missing or 0 RPM, immediately run
 `sudo dgx-fan-control acpi-max`, then read the tachometers again.
 On EC 3.5.8 an ACPI level of 0 stops the fans.
 `acpi-max` writes level 100. Never write `cur_state` 0 or any ACPI level
-below 40. If `acpi-max` refuses because the module or
+below 35. If `acpi-max` refuses because the module or
 `dgx-fan-control.service` is active, stop that service, unload
 `dgx_ec_fan_control`, and run `acpi-max` again. Do not pass `--force`, and
-do not choose a level below 40.
+do not choose a level below 35.
 
 A firmware change marks the stored health record stale. What `--record`
 saves, and what it clears on a healthy run, is in

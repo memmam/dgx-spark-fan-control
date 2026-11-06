@@ -313,7 +313,7 @@ logs a critical line, broadcasts it with `wall`, and tries one repair.
 `--stall-seconds` changes that hold. Fifteen seconds is several 2-second
 polls, so one missed tachometer sample does not alert.
 
-The repair never writes ACPI level 0 or any level below 40. With
+The repair never writes ACPI level 0 or any level below 35. With
 `dgx_ec_fan_control` unloaded, it writes ACPI Fan level 100. With the module
 loaded, it requests that cooling device's maximum state and does not write
 ACPI, because both paths use the same EC register.
@@ -468,7 +468,7 @@ sudo journalctl -u dgx-fan-watchdog.service -n 20 --no-pager
 sudo systemctl start dgx-fan-control.service
 ```
 
-Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
+Do not write ACPI `cur_state` 0, or any level below 35, to test the stall
 path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
 `--stall-seconds`, `--reboot-seconds`, `--zero-fan-celsius`, `--action`,
@@ -674,7 +674,7 @@ loaded, or the fan service is active.
 
 The module and ACPI `cur_state` write the same EC lower floor. `acpi-max`
 refuses in that case. `--force` overrides the refusal and logs a warning.
-`--level` below 40 is refused and does not write. **Never write a level
+`--level` below 35 is refused and does not write. **Never write a level
 below 30. Level 0 stops both fans and is not a recovery step.** Level 20 has
 stalled one fan. Level 100 is about 4320 RPM, quieter than module state 12
 on EC 3.5.8. The level resets on reboot. If a level below 100 fails partway,

@@ -73,9 +73,12 @@ Docker. Restore any held floor afterward.
 
 ## Measuring a lower ACPI floor
 
-The ACPI command refuses levels below 40. Level 30 comes from forum
-measurements (about 1940 RPM, with level 20 stalling one fan), and 40 is a
-margin above it, not a measured limit. To measure it on your own machine, run
+The ACPI command refuses levels below 35. Level 30 comes from forum
+measurements (about 1940 RPM, with level 20 stalling one fan). Level 35 is
+the lowest level measured to hold here: on EC 3.5.8 at idle, with the module
+unloaded, a 30-minute hold at 35 kept the fans at 2070/2025 RPM, and the
+hottest zone peaked at 53.7 C and settled at 52.8 C. In an earlier run at 35,
+fan1 read 2160, one EC step higher. To measure it on your own machine, run
 `scripts/acpi-floor-sweep` as root on EC 3.5.8, at idle, with the module
 unloaded and `dgx-fan-control.service` stopped:
 

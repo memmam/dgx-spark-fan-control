@@ -95,7 +95,7 @@ Forum measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
 about 1620 with the second fan stalling, and level 0 stops both fans. **Never
 write an ACPI level below 30. Level 0 stops both fans immediately and they
 stay stopped; it also does not clear a foreign floor.** This command refuses
-levels below 40. `acpi-max` refuses while `dgx_ec_fan_control` is loaded or
+levels below 35. `acpi-max` refuses while `dgx_ec_fan_control` is loaded or
 `dgx-fan-control.service` is active, unless `--force` is passed. On EC 3.13.7
 the same ACPI write is accepted and does not change fan speed. An ACPI level
 does not survive reboot: these machines returned to about 2700/4050 RPM
@@ -287,7 +287,7 @@ alerts when the unit is `failed`, or enabled but inactive after another exit.
 
 `acpi-max` refuses while `dgx_ec_fan_control` is loaded or the fan service is
 active, because both write the same EC lower floor. `--force` writes anyway
-and logs a warning. It refuses levels below 40. Level 0 stops both fans; do
+and logs a warning. It refuses levels below 35. Level 0 stops both fans; do
 not use it as a recovery step. On success it prints each Fan device's
 `cur_state/max_state` (for example `cooling_device0 (Fan): 100/100`). On EC
 3.13.7, or when the EC is unknown, it adds that firmware may accept the write

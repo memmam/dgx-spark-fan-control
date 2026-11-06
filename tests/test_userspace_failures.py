@@ -2410,7 +2410,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout + stderr)
             self.assertNotIn("cooling_device", stdout)
 
-    def test_acpi_level_refuses_below_forty_and_fail_hot_rewrites_one_hundred(self):
+    def test_acpi_level_refuses_below_floor_and_fail_hot_rewrites_one_hundred(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, second = self._acpi_tree(Path(directory))
             code, stdout, stderr = run_cli([
@@ -2445,6 +2445,25 @@ class UserlandFailureTests(unittest.TestCase):
                     CONTROL.set_acpi_fans(thermal, 60)
             self.assertEqual((first / "cur_state").read_text(), "100\n")
             self.assertEqual((second / "cur_state").read_text(), "100\n")
+
+    def test_acpi_level_floor_is_thirty_five(self):
+        self.assertEqual(CONTROL.ACPI_MIN_LEVEL, 35)
+        with tempfile.TemporaryDirectory() as directory:
+            thermal, first, second = self._acpi_tree(Path(directory))
+            code, stdout, stderr = run_cli([
+                "--thermal-root", str(thermal), "acpi-max", "--level", "34",
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual((stdout + stderr).count("refusing ACPI fan level 34"), 1)
+            self.assertIn("Level 35 is the lowest level measured to hold", stderr)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+            self.assertEqual((second / "cur_state").read_text(), "40\n")
+            code, stdout, stderr = run_cli([
+                "--thermal-root", str(thermal), "acpi-max", "--level", "35",
+            ])
+            self.assertEqual(code, 0)
+            self.assertEqual((first / "cur_state").read_text(), "35\n")
+            self.assertEqual((second / "cur_state").read_text(), "35\n")
 
     def test_supported_commands_do_not_repeat_their_output(self):
         with tempfile.TemporaryDirectory() as directory:

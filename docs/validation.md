@@ -78,7 +78,7 @@ Recheck, on each Spark, after installing this command and module:
 3. `sudo dgx-fan-control acpi-max` while the module is still loaded exits
    nonzero and does not change `cur_state`. Then `sudo dgx-fan-control module
    disable` and `sudo dgx-fan-control acpi-max` (level 100). Fans should move
-   to about 4320 RPM. Do not pass `--level` below 40.
+   to about 4320 RPM. Do not pass `--level` below 35.
 4. Reboot. Idle fans should be back near 2700/4050 RPM without another
    `acpi-max`. Only then `sudo dgx-fan-control module enable`, and only if
    status does not say the probe refused a foreign floor.
