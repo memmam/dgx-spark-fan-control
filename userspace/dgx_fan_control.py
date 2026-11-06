@@ -29,14 +29,19 @@ WATCHDOG_ZERO_SECONDS = 10.0
 # Any-temperature alert. Idle fans on EC 3.5.8 with the October SoC run near
 # 2700/4050 RPM, so 0/0 is not a normal state. Fifteen seconds is several
 # 2-second polls, long enough to ignore one missed tach sample, and short
-# enough to announce a stop at 39°C well before the chip reaches 70°C.
-# The hot poweroff hold stays at 10 seconds.
+# enough to announce a stop at 39°C well before a clean shutdown at 85°C.
 WATCHDOG_STALL_SECONDS = 15.0
-WATCHDOG_SOC_CELSIUS = 70.0
+WATCHDOG_REBOOT_SECONDS = 60.0
+WATCHDOG_SOC_CELSIUS = 85.0
+WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
+WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
 WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
+WATCHDOG_REBOOT_ACTION = "systemctl reboot"
 DAEMON_UNIT = "dgx-fan-control.service"
 WATCHDOG_UNIT = "dgx-fan-watchdog.service"
 DAEMON_ALERT_INTERVAL_SECONDS = 60.0
+STALL_MARKER_DIR = Path("/var/lib/dgx-fan-control")
+STALL_MARKER_NAME = "true-zero-reboot"
 MODULE_NAME = "dgx_ec_fan_control"
 MANAGED_BLACKLIST_NAME = "dgx-spark-fan-control-disable.conf"
 MODULES_LOAD_NAME = "dgx_ec_fan_control.conf"
@@ -70,6 +75,8 @@ RETRY_INITIAL_SECONDS = 2.0
 RECOVERY_COOLDOWN_SECONDS = 31.0
 CONTROLLER_UNAVAILABLE_EXIT = 69
 UNSUPPORTED_FIRMWARE_EXIT = 69
+# Probe refused a floor this driver does not own. Restarting cannot fix it.
+FOREIGN_FLOOR_EXIT = 78
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
     errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
@@ -129,6 +136,10 @@ def was_reported(exc: BaseException) -> bool:
 
 class ControlUnsupported(RuntimeError):
     """Hwmon telemetry is bound and the EC is not accepting a floor."""
+
+
+class ForeignFloor(RuntimeError):
+    """Probe refused a lower floor written from outside this driver."""
 
 
 def cooling_devices(thermal_root: Path) -> list[Path]:
@@ -345,7 +356,7 @@ def daemon_needs_alarm(active: str, enabled: str = "enabled",
         return False
     if active == "failed":
         return True
-    if exec_status == UNSUPPORTED_FIRMWARE_EXIT:
+    if exec_status in (UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT):
         return False
     if enabled == "disabled" and active == "inactive":
         return False
@@ -373,17 +384,90 @@ def run_watchdog_action(action: str) -> int:
     return completed.returncode
 
 
-def recover_cold_fan_stall(thermal_root: Path) -> None:
-    """One ACPI level-100 write when every fan is stopped and the chip is cool.
+def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str | None:
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return text or None
 
-    Skipped while this kernel module is loaded: ACPI cur_state and the module
-    write the same EC lower floor. Never writes 0 or any level below 40.
+
+def read_stall_marker(path: Path) -> tuple[str, str] | None:
+    """boot id and timestamp text, or None when no reboot has been recorded."""
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    found = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    boot_id = found.get("boot_id")
+    timestamp = found.get("time")
+    if not boot_id or not timestamp:
+        return None
+    return boot_id, timestamp
+
+
+def write_stall_marker(path: Path, boot_id: str, when: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"boot_id={boot_id}\ntime={when:.3f}\n",
+        encoding="ascii",
+    )
+
+
+def clear_stall_marker(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        return
+
+
+def gpu_job_running() -> bool | None:
+    """True when nvidia-smi lists a compute pid. None when the query fails.
+
+    None is treated as a running job so a missed query cannot reboot the machine.
     """
-    if module_is_loaded():
-        LOG.error(
-            "fan stall: not writing ACPI level %d because %s is loaded and "
-            "shares the EC lower-floor register",
-            ACPI_MAX_LEVEL, MODULE_NAME,
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return any(line.strip() for line in (completed.stdout or "").splitlines())
+
+
+def recover_fan_stall(thermal_root: Path, *, module_loaded: bool) -> None:
+    """One repair after a true-zero stall. Never writes ACPI 0 or a level below 40.
+
+    With the module loaded, request its maximum floor through its cooling
+    device. Do not write ACPI: both paths use the same EC register.
+    """
+    if module_loaded:
+        devices = cooling_devices(thermal_root)
+        if len(devices) != 1:
+            LOG.error(
+                "fan stall: %s is loaded but there is no single cooling device; "
+                "not writing ACPI",
+                MODULE_NAME,
+            )
+            return
+        try:
+            write_state(devices[0], MAX_STATE)
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOG.error(
+                "fan stall: module state %d write failed: %s", MAX_STATE, exc,
+            )
+            return
+        LOG.critical(
+            "fan stall: requested module state %d because every fan read 0 RPM; "
+            "did not write ACPI",
+            MAX_STATE,
         )
         return
     try:
@@ -400,35 +484,59 @@ def recover_cold_fan_stall(thermal_root: Path) -> None:
     )
 
 
+def _wall(notifier, message: str, what: str) -> None:
+    try:
+        notifier(message)
+    except OSError:
+        LOG.warning("could not broadcast the %s", what)
+
+
 def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                  poll_seconds: float = WATCHDOG_POLL_SECONDS,
                  zero_seconds: float = WATCHDOG_ZERO_SECONDS,
                  stall_seconds: float = WATCHDOG_STALL_SECONDS,
+                 reboot_seconds: float = WATCHDOG_REBOOT_SECONDS,
                  soc_celsius: float = WATCHDOG_SOC_CELSIUS,
+                 alert_repeat_seconds: float = WATCHDOG_ALERT_REPEAT_SECONDS,
+                 nonzero_clear_seconds: float = WATCHDOG_NONZERO_CLEAR_SECONDS,
                  action: str = WATCHDOG_DEFAULT_ACTION,
-                 monotonic=None, runner=None, unit_state=None, notifier=None) -> int:
-    """Read ACPI fan tachometers and thermal_zone0.
+                 reboot_action: str = WATCHDOG_REBOOT_ACTION,
+                 monotonic=None, wall_time=None, runner=None, unit_state=None,
+                 notifier=None, gpu_jobs=None, module_loaded=None,
+                 marker_path: Path | None = None,
+                 boot_id: str | None = None) -> int:
+    """Watch ACPI fans. A true zero can reboot; a hot stalled job powers off.
 
-    A cold stop is logged and broadcast. It does not run the poweroff action.
-    While the kernel module is unloaded, that cold stop also tries one ACPI
-    level of 100. Poweroff stays tied to a hot stop.
+    A foreign floor is not a reason to reboot: those fans are held high.
+    ``zero_seconds`` remains accepted so older invocations still parse.
     """
+    del zero_seconds  # Hot shutdown now follows the hottest zone, not a second hold.
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
-    if not math.isfinite(zero_seconds) or zero_seconds < 0:
-        raise ValueError("zero interval must be finite and non-negative")
     if not math.isfinite(stall_seconds) or stall_seconds < 0:
         raise ValueError("stall interval must be finite and non-negative")
+    if not math.isfinite(reboot_seconds) or reboot_seconds < 0:
+        raise ValueError("reboot interval must be finite and non-negative")
     if not math.isfinite(soc_celsius):
         raise ValueError("SoC threshold must be finite")
+    if not math.isfinite(alert_repeat_seconds) or alert_repeat_seconds < 0:
+        raise ValueError("alert repeat interval must be finite and non-negative")
     if monotonic is None:
         monotonic = time.monotonic
+    if wall_time is None:
+        wall_time = time.time
     if runner is None:
         runner = run_watchdog_action
     if unit_state is None:
         unit_state = read_daemon_unit
     if notifier is None:
         notifier = broadcast_alert
+    if gpu_jobs is None:
+        gpu_jobs = gpu_job_running
+    if marker_path is None:
+        marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
+    if boot_id is None:
+        boot_id = read_boot_id()
     stop_requested = Event()
 
     def request_stop(signum: int, frame: object) -> None:
@@ -437,40 +545,57 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     LOG.critical(
-        "fan-stall watchdog watching ACPI fans and thermal_zone0; "
-        "0 RPM on every fan for more than %.0fs alerts without powering off; "
-        "the same reading for more than %.0fs at >=%.0fC runs %s",
-        stall_seconds, zero_seconds, soc_celsius, action,
+        "fan-stall watchdog watching ACPI fans and the hottest thermal zone; "
+        "0 RPM on every fan for more than %.0fs alerts and attempts a repair; "
+        "still stopped after %.0fs reboots when no GPU job is running; "
+        "a running job is powered off if the hottest zone reaches %.0fC",
+        stall_seconds, reboot_seconds, soc_celsius,
     )
     zero_since: float | None = None
-    hot_since: float | None = None
+    nonzero_since: float | None = None
     announced_shortage = False
-    last_daemon_alert: float | None = None
-    last_stall_alert: float | None = None
+    last_daemon_wall: float | None = None
+    last_daemon_state: tuple | None = None
+    last_stall_wall: float | None = None
     stall_repair_done = False
+    reboot_requested = False
+    deferred_logged = False
+    smi_warned = False
     reported_unsupported = False
+    foreign_walled = False
     while not stop_requested.is_set():
-        # A dead daemon can leave a low floor while temperatures stay under
-        # every stall threshold. Check it before those thresholds.
         active_state, enabled_state, exec_status = split_unit_state(unit_state())
-        if daemon_needs_alarm(active_state, enabled_state, exec_status):
-            now = monotonic()
-            if (last_daemon_alert is None or
-                    now - last_daemon_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
-                message = (
-                    f"dgx-fan-control: {DAEMON_UNIT} is not active "
-                    f"({active_state}, {enabled_state})"
-                )
-                # One journal line. wall is a separate tty broadcast for
-                # logged-in users, not a second copy on stdout or stderr.
+        if exec_status == FOREIGN_FLOOR_EXIT:
+            message = (
+                "dgx-fan-control: probe refused a foreign lower floor; "
+                "a reboot clears the ACPI floor; fans are held high; not rebooting"
+            )
+            if not foreign_walled:
                 LOG.critical(message)
-                try:
-                    notifier(message)
-                except OSError:
-                    LOG.warning("could not broadcast the fan-daemon alert")
-                last_daemon_alert = now
+                _wall(notifier, message, "foreign-floor alert")
+                foreign_walled = True
+            else:
+                LOG.info(message)
+        elif daemon_needs_alarm(active_state, enabled_state, exec_status):
+            now = monotonic()
+            state_key = (active_state, enabled_state, exec_status)
+            changed = state_key != last_daemon_state
+            message = (
+                f"dgx-fan-control: {DAEMON_UNIT} is not active "
+                f"({active_state}, {enabled_state})"
+            )
+            LOG.warning(message)
+            repeat_due = (
+                last_daemon_wall is None
+                or now - last_daemon_wall >= alert_repeat_seconds
+            )
+            if changed or repeat_due:
+                _wall(notifier, message, "fan-daemon alert")
+                last_daemon_wall = now
+            last_daemon_state = state_key
         else:
-            last_daemon_alert = None
+            last_daemon_wall = None
+            last_daemon_state = None
             if (exec_status == UNSUPPORTED_FIRMWARE_EXIT and
                     not reported_unsupported):
                 LOG.warning(
@@ -481,76 +606,155 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
                 reported_unsupported = True
         try:
             fan_rpms = read_named_fan_rpms(hwmon_root)
-            soc_c = read_thermal_zone_c(thermal_root)
         except (OSError, UnicodeError, ValueError, RuntimeError):
             LOG.error("fan-stall observation failed; not treating it as a stall")
+            fan_rpms = None
+        if fan_rpms is None or len(fan_rpms) < 2:
+            if fan_rpms is not None and not announced_shortage:
+                LOG.warning(
+                    "fan-stall watchdog sees %d ACPI fan input(s); "
+                    "it will not trip until two are present",
+                    len(fan_rpms),
+                )
+                announced_shortage = True
             zero_since = None
-            hot_since = None
-            last_stall_alert = None
+            nonzero_since = None
+            last_stall_wall = None
             stall_repair_done = False
+            deferred_logged = False
+        elif any(rpm != 0 for rpm in fan_rpms):
+            announced_shortage = False
+            now = monotonic()
+            if nonzero_since is None:
+                nonzero_since = now
+            elif now - nonzero_since >= nonzero_clear_seconds:
+                if read_stall_marker(marker_path) is not None:
+                    clear_stall_marker(marker_path)
+                    LOG.info(
+                        "fan stall: fans have been nonzero for %.0fs; "
+                        "cleared the true-zero reboot marker",
+                        nonzero_clear_seconds,
+                    )
+            zero_since = None
+            last_stall_wall = None
+            stall_repair_done = False
+            reboot_requested = False
+            deferred_logged = False
         else:
-            if len(fan_rpms) < 2:
-                if not announced_shortage:
+            announced_shortage = False
+            nonzero_since = None
+            now = monotonic()
+            if zero_since is None:
+                zero_since = now
+            held = now - zero_since
+            LOG.warning(
+                "fan stall: ACPI fans still read %s RPM for %.1fs",
+                fan_rpms, held,
+            )
+            try:
+                hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                hottest = None
+                LOG.error(
+                    "fan stall: hottest zone unreadable; not using temperature",
+                )
+            if held > stall_seconds:
+                repeat_due = (
+                    last_stall_wall is None
+                    or now - last_stall_wall >= alert_repeat_seconds
+                )
+                if last_stall_wall is None or repeat_due:
+                    message = (
+                        f"dgx-fan-control: ACPI fans read {fan_rpms} RPM "
+                        f"for {held:.1f}s"
+                        + (f" at {hottest:.1f}C" if hottest is not None else "")
+                        + "; fans are stopped"
+                    )
+                    LOG.critical(message)
+                    _wall(notifier, message, "fan-stall alert")
+                    last_stall_wall = now
+                if not stall_repair_done:
+                    stall_repair_done = True
+                    loaded = module_is_loaded() if module_loaded is None else module_loaded
+                    LOG.info(
+                        "fan stall: attempting repair; module loaded=%s",
+                        loaded,
+                    )
+                    recover_fan_stall(thermal_root, module_loaded=loaded)
+            job_state = gpu_jobs()
+            if job_state is None:
+                job = True
+                if not smi_warned:
                     LOG.warning(
-                        "fan-stall watchdog sees %d ACPI fan input(s); "
-                        "it will not trip until two are present",
-                        len(fan_rpms),
+                        "nvidia-smi failed; treating a GPU job as running",
                     )
-                    announced_shortage = True
-                zero_since = None
-                hot_since = None
-                last_stall_alert = None
-                stall_repair_done = False
-            elif all(rpm == 0 for rpm in fan_rpms):
-                announced_shortage = False
-                now = monotonic()
-                if zero_since is None:
-                    zero_since = now
-                held = now - zero_since
-                if soc_c >= soc_celsius:
-                    if hot_since is None:
-                        hot_since = now
-                    hot_held = now - hot_since
-                else:
-                    hot_since = None
-                    hot_held = 0.0
-                if held > stall_seconds:
-                    if (last_stall_alert is None or
-                            now - last_stall_alert >= DAEMON_ALERT_INTERVAL_SECONDS):
-                        message = (
-                            f"dgx-fan-control: ACPI fans read {fan_rpms} RPM "
-                            f"for {held:.1f}s at {soc_c:.1f}C; "
-                            "fans are stopped; not powering off"
-                        )
-                        LOG.critical(message)
-                        try:
-                            notifier(message)
-                        except OSError:
-                            LOG.warning("could not broadcast the fan-stall alert")
-                        last_stall_alert = now
-                    if not stall_repair_done and soc_c < soc_celsius:
-                        stall_repair_done = True
-                        recover_cold_fan_stall(thermal_root)
-                if fans_stalled(
-                    fan_rpms, soc_c, hot_held, soc_limit_c=soc_celsius,
-                    zero_seconds=zero_seconds,
-                ):
-                    LOG.critical(
-                        "fan stall: ACPI fans read %s RPM for %.1fs while "
-                        "thermal_zone0 is %.1fC; running %s",
-                        fan_rpms, hot_held, soc_c, action,
-                    )
-                    status = runner(action)
-                    if status != 0:
-                        LOG.critical("fan-stall action exited %s", status)
-                        return status if isinstance(status, int) else 1
-                    return 0
+                    smi_warned = True
             else:
-                zero_since = None
-                hot_since = None
-                last_stall_alert = None
-                stall_repair_done = False
-                announced_shortage = False
+                job = bool(job_state)
+            hot = hottest is not None and hottest >= soc_celsius
+            if job and hot and held > stall_seconds:
+                LOG.critical(
+                    "fan stall: GPU job is running and the hottest zone is "
+                    "%.1fC; running %s",
+                    hottest, action,
+                )
+                status = runner(action)
+                if status != 0:
+                    LOG.critical("fan-stall action exited %s", status)
+                    return status if isinstance(status, int) else 1
+                return 0
+            if held >= reboot_seconds:
+                if job:
+                    if not deferred_logged:
+                        LOG.warning(
+                            "fan stall: deferring reboot; a GPU job is running "
+                            "and the fans are still at 0 RPM",
+                        )
+                        deferred_logged = True
+                else:
+                    marker = read_stall_marker(marker_path)
+                    if marker is not None and boot_id is not None and marker[0] != boot_id:
+                        LOG.critical(
+                            "fan stall: already rebooted once for a true-zero "
+                            "stall; running %s",
+                            action,
+                        )
+                        status = runner(action)
+                        if status != 0:
+                            LOG.critical("fan-stall action exited %s", status)
+                            return status if isinstance(status, int) else 1
+                        return 0
+                    if reboot_requested or (
+                        marker is not None and boot_id is not None and marker[0] == boot_id
+                    ):
+                        LOG.info(
+                            "fan stall: reboot already requested this boot; "
+                            "not requesting another",
+                        )
+                    else:
+                        if boot_id is None:
+                            LOG.critical(
+                                "fan stall: boot id is unreadable, so a reboot "
+                                "cannot be limited to one; running %s",
+                                action,
+                            )
+                            status = runner(action)
+                            if status != 0:
+                                LOG.critical("fan-stall action exited %s", status)
+                                return status if isinstance(status, int) else 1
+                            return 0
+                        write_stall_marker(marker_path, boot_id, wall_time())
+                        reboot_requested = True
+                        LOG.critical(
+                            "fan stall: no GPU job and fans still at 0 RPM "
+                            "after %.1fs; running %s",
+                            held, reboot_action,
+                        )
+                        status = runner(reboot_action)
+                        if status != 0:
+                            LOG.critical("fan-stall action exited %s", status)
+                            return status if isinstance(status, int) else 1
+                        return 0
         if stop_requested.is_set():
             break
         stop_requested.wait(poll_seconds)
@@ -569,8 +773,8 @@ def missing_cooling_reason(module_loaded: bool, log_text: str) -> str:
         return (
             "no dgx_ec_fan_floor cooling device: probe refused a foreign lower floor. "
             "ACPI cur_state writes the same EC register. This driver will not clear it. "
-            "Do not write ACPI level 0; it stops both fans and does not clear the floor. "
-            "Unload the module before using ACPI."
+            "a reboot clears the ACPI floor. "
+            "Fans stay high until then; do not write ACPI level 0."
         )
     if "EC mailbox did not complete" in log_text:
         return (
@@ -597,7 +801,10 @@ def require_control(thermal_root: Path, hwmon_root: Path, *,
         module_loaded = module_is_loaded()
     if log_text is None:
         log_text = read_kernel_log()
-    raise RuntimeError(missing_cooling_reason(module_loaded, log_text))
+    reason = missing_cooling_reason(module_loaded, log_text)
+    if "probe refused a foreign lower floor" in reason:
+        raise ForeignFloor(reason)
+    raise RuntimeError(reason)
 
 
 def read_hottest_temperature_c(thermal_root: Path) -> float:
@@ -1350,6 +1557,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watchdog.add_argument("--soc-celsius", type=float, default=WATCHDOG_SOC_CELSIUS)
     watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
+    watchdog.add_argument(
+        "--reboot-seconds",
+        type=float,
+        default=WATCHDOG_REBOOT_SECONDS,
+        help="reboot when fans are still at 0 RPM this long after the stall began and no GPU job is running",
+    )
+    watchdog.add_argument(
+        "--reboot-action",
+        default=WATCHDOG_REBOOT_ACTION,
+        help="command when a true-zero stall has no GPU job; default systemctl reboot",
+    )
+    watchdog.add_argument(
+        "--alert-repeat-seconds",
+        type=float,
+        default=WATCHDOG_ALERT_REPEAT_SECONDS,
+        help="minimum time between repeated wall broadcasts for one ongoing condition",
+    )
     acpi_max = subparsers.add_parser(
         "acpi-max",
         help="set ACPI Fan cooling devices without this kernel module",
@@ -1397,8 +1621,11 @@ def main(argv: list[str] | None = None) -> int:
                 poll_seconds=args.poll_seconds,
                 zero_seconds=args.zero_seconds,
                 stall_seconds=args.stall_seconds,
+                reboot_seconds=args.reboot_seconds,
                 soc_celsius=args.soc_celsius,
+                alert_repeat_seconds=args.alert_repeat_seconds,
                 action=args.action,
+                reboot_action=args.reboot_action,
             )
         if args.command == "acpi-max":
             set_acpi_fans(
@@ -1482,6 +1709,18 @@ def main(argv: list[str] | None = None) -> int:
         LOG.error("%s", exc)
         if args.command == "daemon":
             return UNSUPPORTED_FIRMWARE_EXIT
+        return 1
+    except ForeignFloor as exc:
+        # One journal line. Exit 78 is not restarted: another start cannot
+        # clear a floor the probe refused. A reboot clears the ACPI floor.
+        if args.command == "status":
+            active, enabled = watchdog_unit_state()
+            print(exc)
+            print(format_watchdog_status(active, enabled), end="")
+            return 1
+        LOG.error("%s", exc)
+        if args.command == "daemon":
+            return FOREIGN_FLOOR_EXIT
         return 1
     except (OSError, RuntimeError, ValueError) as exc:
         if args.command == "status" and (

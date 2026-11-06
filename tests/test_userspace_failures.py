@@ -337,7 +337,7 @@ class UserlandFailureTests(unittest.TestCase):
             with patch.object(CONTROL, "Event", return_value=stop), \
                  patch.object(CONTROL.signal, "signal"), \
                  patch.object(stop, "wait", side_effect=lambda delay: stop.set()), \
-                 self.assertLogs(CONTROL.LOG, level="CRITICAL") as logs:
+                 self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
                 status = CONTROL.run_watchdog(
                     root,
                     root,
@@ -355,9 +355,10 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertTrue(CONTROL.daemon_needs_alarm("failed", "disabled"))
 
     def test_stall_requires_both_fans_hot_for_more_than_ten_seconds(self):
-        self.assertFalse(CONTROL.fans_stalled([0, 0], 70.0, 10.0))
-        self.assertTrue(CONTROL.fans_stalled([0, 0], 70.0, 10.01))
-        self.assertFalse(CONTROL.fans_stalled([0, 0], 69.9, 30.0))
+        self.assertEqual(CONTROL.WATCHDOG_SOC_CELSIUS, 85.0)
+        self.assertFalse(CONTROL.fans_stalled([0, 0], 85.0, 10.0))
+        self.assertTrue(CONTROL.fans_stalled([0, 0], 85.0, 10.01))
+        self.assertFalse(CONTROL.fans_stalled([0, 0], 84.9, 30.0))
         self.assertFalse(CONTROL.fans_stalled([0, 400], 90.0, 30.0))
         self.assertFalse(CONTROL.fans_stalled([0], 90.0, 30.0))
         self.assertEqual(CONTROL.WATCHDOG_DEFAULT_ACTION, "systemctl poweroff")
@@ -400,6 +401,7 @@ class UserlandFailureTests(unittest.TestCase):
                     runner=runner,
                     unit_state=lambda: "active",
                     notifier=lambda message: None,
+                    gpu_jobs=lambda: True,
                 )
             self.assertEqual(status, 0)
             self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
@@ -493,8 +495,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(actions, [])
             self.assertEqual(len(alerts), 1)
-            self.assertIn("not powering off", alerts[0])
-            self.assertEqual(sum("not powering off" in line for line in logs.output), 1)
+            self.assertIn("fans are stopped", alerts[0])
             self.assertEqual(sum("wrote ACPI Fan level 100" in line for line in logs.output), 1)
             for name in ("cooling_device0", "cooling_device1"):
                 self.assertEqual(
@@ -524,11 +525,248 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(status, 0)
             self.assertEqual(actions, [])
             self.assertEqual(len(alerts), 1)
-            self.assertEqual(sum("not writing ACPI level 100" in line for line in logs.output), 1)
-            self.assertIn("shares the EC lower-floor register", "\n".join(logs.output))
+            self.assertEqual(sum("not writing ACPI" in line for line in logs.output), 1)
             self.assertEqual(
                 (root / "thermal" / "cooling_device0" / "cur_state").read_text(), "40\n",
             )
+
+    def _drive_watchdog(self, root, *, rpm, celsius, gpu, stop_after, boot="boot-a",
+                        marker=None, module=False, soc=85.0, reboot_seconds=60):
+        self._stopped_acpi_fans(root, rpm, celsius)
+        if module:
+            device = root / "thermal" / "cooling_device2"
+            device.mkdir()
+            (device / "type").write_text(
+                CONTROL.COOLING_DEVICE_TYPE + "\n", encoding="ascii",
+            )
+            (device / "cur_state").write_text("1\n", encoding="ascii")
+            (device / "max_state").write_text("12\n", encoding="ascii")
+        if marker is None:
+            marker = root / "marker" / "true-zero-reboot"
+        clock = [0.0]
+        stop = Event()
+        actions = []
+        alerts = []
+
+        def wait(delay):
+            clock[0] += 2
+            if clock[0] > stop_after:
+                stop.set()
+
+        with patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(CONTROL, "module_is_loaded", return_value=module), \
+             patch.object(stop, "wait", side_effect=wait), \
+             self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+            status = CONTROL.run_watchdog(
+                root / "thermal",
+                root / "hwmon",
+                poll_seconds=2,
+                stall_seconds=15,
+                reboot_seconds=reboot_seconds,
+                soc_celsius=soc,
+                monotonic=lambda: clock[0],
+                wall_time=lambda: clock[0],
+                runner=lambda action: actions.append(action) or 0,
+                unit_state=lambda: "active",
+                notifier=alerts.append,
+                gpu_jobs=gpu,
+                marker_path=marker,
+                boot_id=boot,
+                nonzero_clear_seconds=30,
+            )
+        return status, actions, alerts, logs.output, marker
+
+    def test_true_zero_reboots_once_without_a_job_and_powers_off_next_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status, actions, _alerts, logs, marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+            )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            self.assertIn("no GPU job", "\n".join(logs))
+            self.assertIn("boot_id=boot-a", marker.read_text(encoding="ascii"))
+
+            root2 = Path(directory) / "next"
+            root2.mkdir()
+            marker.write_text("boot_id=boot-a\ntime=1.000\n", encoding="ascii")
+            status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root2, rpm=(0, 0), celsius=40, gpu=lambda: False, stop_after=80,
+                boot="boot-b", marker=marker,
+            )
+            self.assertEqual(status, 0)
+            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
+            self.assertIn("already rebooted once", "\n".join(logs))
+            self.assertNotIn(CONTROL.WATCHDOG_REBOOT_ACTION, actions)
+
+    def test_true_zero_defers_for_a_job_then_reboots_when_it_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            clock_box = {"job": True}
+
+            def gpu():
+                return clock_box["job"]
+
+            self._stopped_acpi_fans(root, (0, 0), 40)
+            clock = [0.0]
+            stop = Event()
+            actions = []
+
+            def wait(delay):
+                clock[0] += 2
+                if clock[0] >= 70:
+                    clock_box["job"] = False
+                if actions or clock[0] > 90:
+                    stop.set()
+
+            with patch.object(CONTROL, "Event", return_value=stop), \
+                 patch.object(CONTROL.signal, "signal"), \
+                 patch.object(CONTROL, "module_is_loaded", return_value=False), \
+                 patch.object(stop, "wait", side_effect=wait), \
+                 self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+                CONTROL.run_watchdog(
+                    root / "thermal", root / "hwmon",
+                    poll_seconds=2, stall_seconds=15, reboot_seconds=60,
+                    soc_celsius=85, monotonic=lambda: clock[0],
+                    wall_time=lambda: 10.0,
+                    runner=lambda action: actions.append(action) or 0,
+                    unit_state=lambda: "active", notifier=lambda message: None,
+                    gpu_jobs=gpu, marker_path=root / "marker", boot_id="boot-a",
+                )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
+            text = "\n".join(logs.output)
+            self.assertIn("deferring reboot", text)
+            self.assertLess(
+                text.index("deferring reboot"),
+                text.index("no GPU job and fans still"),
+            )
+
+    def test_true_zero_with_a_job_powers_off_at_85c(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=86, gpu=lambda: True, stop_after=40,
+                soc=85,
+            )
+            self.assertEqual(actions, [CONTROL.WATCHDOG_DEFAULT_ACTION])
+            self.assertIn("hottest zone", "\n".join(logs))
+            self.assertNotIn(CONTROL.WATCHDOG_REBOOT_ACTION, actions)
+
+    def test_nvidia_smi_failure_counts_as_a_running_job(self):
+        self.assertIsNone(self._gpu_failure())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: None, stop_after=80,
+            )
+            self.assertEqual(actions, [])
+            self.assertIn("nvidia-smi failed; treating a GPU job as running", "\n".join(logs))
+            self.assertIn("deferring reboot", "\n".join(logs))
+
+    def _gpu_failure(self):
+        with patch.object(CONTROL.subprocess, "run", side_effect=OSError("missing")):
+            return CONTROL.gpu_job_running()
+
+    def test_one_spinning_fan_does_not_reboot_or_power_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, alerts, _logs, marker = self._drive_watchdog(
+                root, rpm=(0, 2000), celsius=90, gpu=lambda: False, stop_after=80,
+                soc=85,
+            )
+            self.assertEqual(actions, [])
+            self.assertEqual(alerts, [])
+            self.assertFalse(marker.exists())
+
+    def test_loaded_module_stall_uses_the_module_floor_not_acpi(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _status, actions, _alerts, logs, _marker = self._drive_watchdog(
+                root, rpm=(0, 0), celsius=40, gpu=lambda: True, stop_after=20,
+                module=True, soc=85,
+            )
+            device = root / "thermal" / "cooling_device2"
+            self.assertEqual(actions, [])
+            self.assertEqual((device / "cur_state").read_text(encoding="ascii"), "12\n")
+            self.assertEqual(
+                (root / "thermal" / "cooling_device0" / "cur_state").read_text(),
+                "40\n",
+            )
+            self.assertIn("did not write ACPI", "\n".join(logs))
+
+    def test_daemon_down_wall_is_on_change_and_then_half_hourly(self):
+        clock = [0.0]
+        stop = Event()
+        alerts = []
+
+        def wait(delay):
+            if clock[0] < 40:
+                clock[0] += 10
+            elif clock[0] == 40:
+                clock[0] = 1800
+            else:
+                stop.set()
+
+        with patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(stop, "wait", side_effect=wait), \
+             self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
+            CONTROL.run_watchdog(
+                Path("/tmp/dgx-fan-missing"),
+                Path("/tmp/dgx-fan-missing"),
+                monotonic=lambda: clock[0],
+                unit_state=lambda: ("inactive", "enabled", 0),
+                notifier=alerts.append,
+                alert_repeat_seconds=1800,
+                gpu_jobs=lambda: False,
+            )
+        self.assertEqual(len(alerts), 2)
+        warnings = [line for line in logs.output if "is not active" in line]
+        self.assertGreaterEqual(len(warnings), 6)
+
+    def test_foreign_floor_is_one_broadcast_and_does_not_reboot(self):
+        clock = [0.0]
+        stop = Event()
+        alerts = []
+        actions = []
+
+        def wait(delay):
+            clock[0] += 2
+            if clock[0] > 10:
+                stop.set()
+
+        with patch.object(CONTROL, "Event", return_value=stop), \
+             patch.object(CONTROL.signal, "signal"), \
+             patch.object(stop, "wait", side_effect=wait), \
+             self.assertLogs(CONTROL.LOG, level="INFO") as logs:
+            status = CONTROL.run_watchdog(
+                Path("/tmp/dgx-fan-missing-floor"),
+                Path("/tmp/dgx-fan-missing-floor"),
+                monotonic=lambda: clock[0],
+                unit_state=lambda: ("inactive", "enabled", CONTROL.FOREIGN_FLOOR_EXIT),
+                notifier=alerts.append,
+                runner=lambda action: actions.append(action) or 0,
+                gpu_jobs=lambda: False,
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(actions, [])
+        self.assertEqual(len(alerts), 1)
+        text = "\n".join(logs.output)
+        self.assertGreater(text.count("a reboot clears the ACPI floor"), 1)
+        self.assertIn("not rebooting", text)
+
+    def test_foreign_floor_daemon_exits_78(self):
+        message = (
+            "no dgx_ec_fan_floor cooling device: probe refused a foreign lower floor. "
+            "a reboot clears the ACPI floor."
+        )
+        with patch.object(CONTROL, "require_control", side_effect=CONTROL.ForeignFloor(message)):
+            code, stdout, stderr = run_cli(["daemon"])
+        combined = stdout + stderr
+        self.assertEqual(code, CONTROL.FOREIGN_FLOOR_EXIT)
+        self.assertEqual(combined.count("a reboot clears the ACPI floor"), 1)
+        self.assertNotIn("Traceback", combined)
 
     def test_one_spinning_fan_or_one_input_does_not_alert(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -833,7 +1071,8 @@ class UserlandFailureTests(unittest.TestCase):
             combined = stdout + stderr
             self.assertEqual(code, 1)
             self.assertIn("probe refused a foreign lower floor", combined)
-            self.assertIn("Do not write ACPI level 0", combined)
+            self.assertIn("a reboot clears the ACPI floor", combined)
+            self.assertIn("do not write ACPI level 0", combined)
             self.assertNotIn("found 0", combined)
             self.assertEqual(combined.count("foreign lower floor"), 1)
 

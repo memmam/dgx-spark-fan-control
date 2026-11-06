@@ -38,9 +38,20 @@ The fan service was enabled and started at boot even though an earlier step
 had left it disabled. `module enable` had been enabling it whenever fan
 control was supported. It no longer does that.
 
-Not observed on these boots: the quiet curve, the watchdog trip, the
-any-temperature 0 RPM alert, the one-time ACPI level-100 repair, and a
-repeated copy of the 188-second wedge. `allow_unverified_writes` stayed off.
+Not observed on these boots: the quiet curve, a watchdog trip, the
+true-zero repair, the one-reboot-then-poweroff sequence, and a repeated
+copy of the 188-second wedge. `allow_unverified_writes` stayed off.
+
+On a later boot the performance service on one Spark restarted 196 times,
+every 30 seconds, because probe had refused a foreign floor left by ACPI.
+Exit 78 stops that loop. The recovery is a reboot, which clears the ACPI
+floor. Do not write ACPI level 0, and do not toggle the service to clear it.
+The watchdog's 85°C poweroff, the GPU-job deferral, and the reboot marker
+have not been run on hardware. 85°C is a margin under the kernel critical
+trip near 104°C (104.8 in the tonyd2wild notes). Those notes show a hotspot
+rising about 4°C/s, fast enough to pass that trip before the next sample is
+logged. 85°C, polled every 2 seconds, leaves time for a clean poweroff. It
+is not a sourced EC cutoff.
 No step in the notes below writes ACPI level 0.
 
 Recheck, on each Spark, after installing this command and module:

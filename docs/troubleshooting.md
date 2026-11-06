@@ -171,9 +171,10 @@ service to work around the cooldown or discard ownership by reloading.
 
 The service uses `Restart=always` with a 30-second delay and
 `StartLimitIntervalSec=0`, so a crash is retried forever. Exit 69 is reserved
-for the daemon's startup check that fan control is unsupported, and
-`RestartPreventExitStatus=69` stops only that exit from looping. A transport
-failure or crash does not use exit 69, so it still restarts. Exit 69 used to
+for the daemon's startup check that fan control is unsupported. Exit 78 is
+reserved for a foreign lower floor. `RestartPreventExitStatus=69 78` stops
+only those two exits from looping. A transport failure or crash does not use
+either code, so it still restarts. Exit 69 used to
 cover those runtime failures too, which left a stopped daemon holding a low
 floor while temperatures stayed under the alarms (observed for 1 day 19 hours).
 One later wedge is still open. On EC 3.5.8 with the October SoC, the daemon
@@ -186,9 +187,23 @@ and `uptime=` (`CLOCK_BOOTTIME`) so the next one can be compared with those
 tools. The driver still does not clear a foreign floor and does not treat
 this wedge as solved.
 
-`dgx-fan-control watchdog` does not alarm when the last exit is 69. It still
-logs and broadcasts when the unit is `failed`, or enabled but inactive with
-another exit code, before it applies the temperature rule. SIGTERM lets the
+## Daemon restarts forever after an ACPI floor
+
+On one Spark the performance service restarted 196 times, every 30 seconds,
+logging `no dgx_ec_fan_floor cooling device: probe did not register one`.
+`status` on that machine said the probe had refused a foreign lower floor,
+left by an earlier ACPI `cur_state` write. Starting the service again cannot
+clear that floor. The daemon now exits 78 and systemd does not restart it.
+The journal line says a reboot clears the ACPI floor. Reboot. Do not toggle
+the service, and do not write ACPI level 0. The fans are held high, so the
+watchdog does not reboot for this by itself. It broadcasts that once, then
+keeps the reminder in the journal.
+
+`dgx-fan-control watchdog` does not alarm when the last exit is 69. Exit 78
+is one broadcast and then journal only. It still logs on every poll, and
+broadcasts when the state changes or every 30 minutes, when the unit is
+`failed` or enabled but inactive for another reason, before it applies the
+temperature rule. SIGTERM lets the
 daemon perform its own cleanup, without a competing `ExecStop` writer.
 
 On 2026-09-07, both machines had an **idle physical mailbox with a stale pending

@@ -28,8 +28,10 @@ NoNewPrivileges=yes
 # ProtectSystem=strict leaves the API filesystems /dev, /proc, and /sys
 # mounted as they are. ReadWritePaths=/sys keeps the level-100 write working
 # even if a later systemd remounts /sys read-only under strict.
+# /var/lib/dgx-fan-control holds the one-reboot marker. The leading minus
+# means the directory may be absent until the watchdog creates it.
 ProtectSystem=strict
-ReadWritePaths=/sys
+ReadWritePaths=/sys -/var/lib/dgx-fan-control
 ProtectHome=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes

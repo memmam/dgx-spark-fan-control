@@ -255,21 +255,50 @@ On EC 3.5.8 with the October SoC, idle fans run near 2700/4050 RPM, so 0/0
 is not a normal reading.
 
 If every fan stays at 0 RPM for more than 15 seconds, at any temperature, it
-logs one critical line and broadcasts it once with `wall`. That repeats at
-most once a minute, the same interval as the daemon-down alert. It does
-**not** power off for this alone. Fifteen seconds is several 2-second polls,
-so one missed tachometer sample does not alert, and a stop at about 39°C is
-still announced well before the chip would have to reach 70°C.
-`--stall-seconds` changes that hold.
+logs a critical line, broadcasts it with `wall`, and tries one repair.
+`--stall-seconds` changes that hold. Fifteen seconds is several 2-second
+polls, so one missed tachometer sample does not alert.
 
-When that cold stop is confirmed and `dgx_ec_fan_control` is not loaded, it
-tries once to write ACPI Fan level 100. It never writes 0 or any level below
-40. If the module is loaded, it skips the write and logs why: ACPI
-`cur_state` and the module share the EC lower-floor register.
+The repair never writes ACPI level 0 or any level below 40. With
+`dgx_ec_fan_control` unloaded, it writes ACPI Fan level 100. With the module
+loaded, it requests that cooling device's maximum state and does not write
+ACPI, because both paths use the same EC register.
 
-If every fan stays at 0 RPM for more than 10 seconds while `thermal_zone0`
-is at least 70°C, it logs at critical level and runs `systemctl poweroff`.
-That hot hold is separate from the 15-second alert.
+About 60 seconds after the zeros began (`--reboot-seconds`), if
+`nvidia-smi --query-compute-apps=pid --format=csv,noheader` lists no compute
+process, it runs `systemctl reboot` (`--reboot-action`). A failed or missing
+`nvidia-smi` counts as a job, so the machine is not rebooted on a guess. At
+most one reboot is requested per stall. A file under
+`/var/lib/dgx-fan-control` records the boot id. If the next boot is still at
+0 RPM on every fan, it runs `systemctl poweroff` (`--action`) instead of
+rebooting again. The marker is removed after the fans have read nonzero for
+30 seconds.
+
+If a GPU job is running, it alerts, attempts the repair, and waits. It
+reboots when the job exits and the fans are still at 0 RPM. If the hottest
+thermal zone, the maximum across every zone, reaches `--soc-celsius` first,
+it powers off instead. The default is **85°C**.
+
+85°C is a margin, not a measured EC limit. The kernel's critical trip is
+about 104°C (104.8 in
+[tonyd2wild/DGX-Spark-Hard-Poweroff-Fix](https://github.com/tonyd2wild/DGX-Spark-Hard-Poweroff-Fix)).
+That repository reports a hotspot spiking from about 90°C to about 98°C in
+about 2 seconds, roughly 4°C/s, before a hard power cut. At that rate the
+hotspot passes the 104.8°C critical trip before the next reading can be
+logged, so the cut the repository calls faster than Linux can log is
+consistent with the ordinary critical trip. The repository's other
+suggestion, a thermal/over-current cut, is the alternative. No sourced EC
+temperature cutoff exists. 98°C there is the last reading that was logged,
+not a limit. The watchdog polls every 2 seconds. From 85°C, a 4°C/s rise
+still leaves several samples before 104.8°C, which is time for a clean
+poweroff.
+
+A `wall` broadcast for a daemon that is enabled but not running is sent when
+that state changes, and again at most every 30 minutes
+(`--alert-repeat-seconds`) while it lasts. The journal records the condition
+on every poll. A foreign-floor exit (78) is one broadcast, then journal
+only. The watchdog does not reboot for a foreign floor: those fans are held
+high, and a reboot clears the ACPI floor.
 
 Install starts this as `dgx-fan-watchdog.service`, either with
 `scripts/install-userland` or the manual commands in
@@ -298,9 +327,11 @@ sudo systemctl start dgx-fan-control.service
 Do not write ACPI `cur_state` 0, or any level below 40, to test the stall
 path. `module status` prints `watchdog-active` and `watchdog-enabled`.
 
-`--zero-seconds`, `--stall-seconds`, `--soc-celsius`, and `--action` change
-the hot hold, the any-temperature alert hold, the temperature, and the
-command. The action is one program plus arguments, not a shell pipeline. See
+`--stall-seconds`, `--reboot-seconds`, `--soc-celsius`, `--action`,
+`--reboot-action`, and `--alert-repeat-seconds` change the alert hold, the
+reboot hold, the hottest-zone poweroff temperature, the poweroff command,
+the reboot command, and how often a standing alert is broadcast again. Each
+command is one program plus arguments, not a shell pipeline. See
 the [known issues](../README.md#known-issues) before enabling this on a
 machine that uses external fans. The cold alert and the level-100 write have
 not been run on hardware yet.

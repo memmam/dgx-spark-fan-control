@@ -162,12 +162,15 @@ enables it; `--no-watchdog` skips that. The same `install` commands, for both
 unit files, are written out in
 [startup modes](docs/installation.md#5-choose-your-startup-mode). Copying only
 the performance unit leaves `status` at `watchdog-enabled: not-found`. The
-watchdog reads `acpi_fan` and `thermal_zone0`. If every fan stays at 0 RPM for 15 seconds, at
-any temperature, it logs and broadcasts with `wall` and does not power off.
-On a cold stop, and only when `dgx_ec_fan_control` is not loaded, it tries
-once to write ACPI Fan level 100. It never writes level 0. If every fan stays
-at 0 RPM for 10 seconds while `thermal_zone0` is at least 70°C, the default
-action is `systemctl poweroff`. The same command also logs and broadcasts
+watchdog reads `acpi_fan` and the hottest thermal zone. If every fan stays
+at 0 RPM for 15 seconds it alerts and tries one repair: ACPI level 100 if
+the module is unloaded, or the module's maximum state if it is loaded. It
+never writes level 0. About 60 seconds after the zeros began, with no GPU
+compute process listed, it reboots once. A second boot that is still at 0
+RPM powers off. A running GPU job waits, and powers off if the hottest zone
+reaches 85°C first. 85°C is a margin under the kernel critical trip near
+104°C, using a reported rise of about 4°C/s, not a published EC cutoff. See
+[usage](docs/usage.md#watch-for-stopped-fans). The same command also logs and broadcasts
 when `dgx-fan-control.service` is not `active`, before it looks at
 temperature. That alert does not power the machine off. The cold alert and
 the level-100 write have not been run on hardware yet.
