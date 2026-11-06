@@ -676,7 +676,10 @@ or an HTTP API. Root jobs and system services are not killed directly.
 **Warning:** on EC 3.5.8 ACPI holds replace the stock EC curve until reboot,
 even at level 100. Do not hold them under sustained full load. The independent
 watchdog must be active before these commands write. It logs an advisory
-at 70 C and will hold 70–79 C indefinitely. At 80 C it forces level 100
+at 70 C and will hold 70–79 C indefinitely. A program can read that
+advisory from the journal or from `/var/lib/dgx-fan-control/acpi-advisory`;
+see [Listening for the advisory](ec-curve.md#listening-for-the-advisory).
+At 80 C it forces level 100
 and starts a configured stop hook; with no hook it waits until 85 C for
 SIGTERM, however long that takes. SIGKILL is at 90 C. A confirmed stop
 reboots immediately. That is phase 1. One sample at 95 C does not replace

@@ -65,9 +65,10 @@ class ThermalTests(unittest.TestCase):
             self.step(71, 100002)
         advisory = [line for line in first.output if "acpi_thermal_advisory" in line]
         self.assertEqual(len(advisory), 1)
+        self.assertIn("schema=1", advisory[0])
         self.assertIn("phase=acpi", advisory[0])
         self.assertIn("action=none", advisory[0])
-        self.assertIn("incident=no", advisory[0])
+        self.assertIn("incident_boot=-", advisory[0])
         self.assertIn("timer=no", advisory[0])
         self.assertIn("not a failure", advisory[0])
         self.assertIn("checkpoint or reduce load", advisory[0])
@@ -125,6 +126,93 @@ class ThermalTests(unittest.TestCase):
         self.send.assert_called_once()
         self.assertEqual(self.send.call_args.args[1], signal.SIGTERM)
         self.maximum.assert_not_called()
+        self.reboot.assert_not_called()
+
+    def test_advisory_record_rearms_and_a_failed_listener_does_not_block(self):
+        calls = []
+
+        def listener(fields):
+            calls.append(dict(fields))
+
+        self.guard.advisory_hook = listener
+        self.step(70, 0)
+        self.step(75, 10)
+        self.step(79, 1000)
+        self.assertEqual(len(calls), 1)
+        path = C.STALL_MARKER_DIR / C.ACPI_ADVISORY_NAME
+        text = path.read_text(encoding="ascii")
+        for line in (
+            "event=acpi_thermal_advisory",
+            "schema=1",
+            "phase=acpi",
+            "zone_c=70.0",
+            "advisory_c=70.0",
+            "hook_c=80.0",
+            "term_c=85.0",
+            "kill_c=90.0",
+            "boot_id=test-boot",
+            "incident_boot=-",
+            "sequence=1",
+            "action=none",
+            "timer=no",
+        ):
+            self.assertIn(line + "\n", text)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+        self.step(69, 1001)
+        self.assertTrue(path.exists())
+        self.assertEqual(len(calls), 1)
+        self.step(67, 1002)
+        self.assertFalse(path.exists())
+        self.step(71, 1003)
+        self.assertEqual([call["sequence"] for call in calls], ["1", "2"])
+        self.assertIn("sequence=2\n", path.read_text(encoding="ascii"))
+
+        def boom(_fields):
+            raise OSError("listener down")
+
+        self.guard.advisory_hook = boom
+        with patch.object(C, "write_state_text", side_effect=OSError("disk full")):
+            self.step(60, 2000)
+            self.step(72, 2001)
+        self.send.assert_not_called()
+        self.reboot.assert_not_called()
+        self.shutdown.assert_not_called()
+        self.step(80, 2002)
+        self.send.assert_not_called()
+        self.step(85, 2003)
+        self.send.assert_called_once_with({200: (12, "gpu_burn")}, signal.SIGTERM)
+
+    def test_advisory_hook_is_not_waited_on_and_names_the_ec_phase(self):
+        C.record_acpi_boot(C.ACPI_INCIDENT_NAME)
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = AssertionError("must not wait")
+        self.guard = self.make_guard(
+            {"ACPI_THERMAL_ADVISORY_HOOK": "/opt/notify --now"},
+        )
+        with patch.object(C.subprocess, "Popen", return_value=process) as popen:
+            self.guard.step(73, 0, self.maximum, ec_only=True)
+            self.guard.step(74, 5, self.maximum, ec_only=True)
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], ["/opt/notify", "--now"])
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        process.wait.assert_not_called()
+        self.maximum.assert_not_called()
+        self.send.assert_not_called()
+        text = (C.STALL_MARKER_DIR / C.ACPI_ADVISORY_NAME).read_text(encoding="ascii")
+        self.assertIn("phase=ec\n", text)
+        self.assertIn("incident_boot=test-boot\n", text)
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["DGX_ACPI_ADVISORY"], "1")
+        self.assertEqual(env["DGX_ACPI_ADVISORY_PHASE"], "ec")
+        self.assertEqual(env["DGX_ACPI_ADVISORY_ZONE_C"], "73.0")
+        self.assertEqual(env["DGX_ACPI_ADVISORY_INCIDENT_BOOT"], "test-boot")
+        self.assertEqual(env["DGX_ACPI_ADVISORY_HOOK_C"], "80.0")
+        self.guard.step(60, 6, self.maximum, ec_only=True)
+        with patch.object(C.subprocess, "Popen", side_effect=AssertionError("second start")):
+            self.guard.step(73, 7, self.maximum, ec_only=True)
+        process.wait.assert_not_called()
+        self.send.assert_not_called()
         self.reboot.assert_not_called()
 
     def test_missing_hook_term_then_timeout_kill_then_shutdown(self):

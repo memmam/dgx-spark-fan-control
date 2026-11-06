@@ -4409,6 +4409,8 @@ ACPI_MAX_NAME = "acpi-max-boot"
 ACPI_INCIDENT_NAME = "acpi-incident"
 ACPI_PHASE_NAME = "acpi-phase"
 ACPI_EC_STOP_NAME = "acpi-ec-stop"
+ACPI_ADVISORY_NAME = "acpi-advisory"
+ACPI_ADVISORY_SCHEMA = 1
 ACPI_RESUME_NAME = "acpi-resume-boot"
 ACPI_RESUME_TIMEOUT_SECONDS = 30.0
 
@@ -4797,6 +4799,10 @@ class AcpiThermalGuard:
         self.max_logged = False
         self.ec_logged = False
         self.advisory_logged = False
+        self.advisory_sequence = 0
+        self.advisory_process = None
+        self.advisory_hook_busy_logged = False
+        self.advisory_hook = self.start_advisory_hook
         self.reaction_logged = False
         self.ceiling_since = None
         self.watch_c = None
@@ -4805,23 +4811,141 @@ class AcpiThermalGuard:
     def hook_command(self) -> str:
         return self.defaults.get("ACPI_THERMAL_STOP_HOOK", "").strip()
 
+    def advisory_fields(self, hot, ec_only) -> dict[str, str]:
+        """Stable schema for one advisory episode. It is not a stop command."""
+        incident = _acpi_record_boot(ACPI_INCIDENT_NAME, STALL_MARKER_DIR)
+        return {
+            "event": "acpi_thermal_advisory",
+            "schema": str(ACPI_ADVISORY_SCHEMA),
+            "phase": "ec" if ec_only else "acpi",
+            "zone_c": f"{hot:.1f}",
+            "advisory_c": f"{self.advisory_c:.1f}",
+            "hook_c": f"{self.fan_c:.1f}",
+            "term_c": f"{self.stop_c:.1f}",
+            "kill_c": f"{self.kill_c:.1f}",
+            "boot_id": read_boot_id() or "-",
+            "incident_boot": incident or "-",
+            "sequence": str(self.advisory_sequence),
+            "action": "none",
+            "timer": "no",
+        }
+
+    def advisory_text(self, fields: dict[str, str]) -> str:
+        order = (
+            "event", "schema", "phase", "zone_c", "advisory_c", "hook_c",
+            "term_c", "kill_c", "boot_id", "incident_boot", "sequence",
+            "action", "timer",
+        )
+        return "".join(f"{key}={fields[key]}\n" for key in order)
+
+    def publish_advisory(self, hot, ec_only) -> None:
+        """Journal, state file, and optional hook. None of these is waited on.
+
+        The flag is already set, so a failed write or a dead hook is not
+        retried on the next poll. Escalation does not wait for either.
+        """
+        self.advisory_sequence += 1
+        fields = self.advisory_fields(hot, ec_only)
+        text = self.advisory_text(fields)
+        LOG.warning(
+            "%s; checkpoint or reduce load if you can; this is not a failure "
+            "and it does not stop the workload",
+            " ".join(f"{key}={fields[key]}" for key in fields),
+        )
+        path = STALL_MARKER_DIR / ACPI_ADVISORY_NAME
+        try:
+            temporary = path.with_suffix(".tmp")
+            write_state_text(temporary, text)
+            _fsync_existing(temporary)
+            temporary.replace(path)
+            os.chmod(path, 0o644)
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory record was not written: %s", exc)
+        try:
+            self.advisory_hook(fields)
+        except Exception as exc:
+            LOG.error("ACPI thermal advisory hook failed: %s", exc)
+
+    def clear_advisory_record(self) -> None:
+        path = STALL_MARKER_DIR / ACPI_ADVISORY_NAME
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory record was not cleared: %s", exc)
+        process = self.advisory_process
+        if process is not None:
+            try:
+                process.poll()
+            except Exception as exc:
+                LOG.error("ACPI thermal advisory hook status failed: %s", exc)
+
+    def start_advisory_hook(self, fields: dict[str, str]) -> None:
+        """Spawn the optional listener. Return as soon as it has been started.
+
+        A hook that is still running is left alone. This does not wait for
+        it, kill it, or signal the workload.
+        """
+        command = self.defaults.get("ACPI_THERMAL_ADVISORY_HOOK", "").strip()
+        if not command:
+            return
+        previous = self.advisory_process
+        if previous is not None and previous.poll() is None:
+            if not self.advisory_hook_busy_logged:
+                LOG.error(
+                    "ACPI thermal advisory hook still running; "
+                    "not starting another and not waiting"
+                )
+                self.advisory_hook_busy_logged = True
+            return
+        self.advisory_hook_busy_logged = False
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            LOG.error("ACPI thermal advisory hook is not a valid command: %s", exc)
+            return
+        if not argv:
+            return
+        env = os.environ.copy()
+        env.update({
+            "DGX_ACPI_ADVISORY": "1",
+            "DGX_ACPI_ADVISORY_PHASE": fields["phase"],
+            "DGX_ACPI_ADVISORY_ZONE_C": fields["zone_c"],
+            "DGX_ACPI_ADVISORY_C": fields["advisory_c"],
+            "DGX_ACPI_ADVISORY_HOOK_C": fields["hook_c"],
+            "DGX_ACPI_ADVISORY_TERM_C": fields["term_c"],
+            "DGX_ACPI_ADVISORY_KILL_C": fields["kill_c"],
+            "DGX_ACPI_ADVISORY_BOOT": fields["boot_id"],
+            "DGX_ACPI_ADVISORY_INCIDENT_BOOT": fields["incident_boot"],
+            "DGX_ACPI_ADVISORY_SEQUENCE": fields["sequence"],
+            "DGX_ACPI_ADVISORY_PATH": str(STALL_MARKER_DIR / ACPI_ADVISORY_NAME),
+        })
+        try:
+            self.advisory_process = subprocess.Popen(
+                argv, env=env, start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory hook failed to start: %s", exc)
+
     def note_advisory(self, hot, ec_only) -> None:
-        """Log one advisory. It does not arm a latch, a timer, or a stop."""
+        """Publish one advisory. It does not arm a latch, a timer, or a stop."""
         if hot < self.advisory_c - self.hysteresis:
-            self.advisory_logged = False
+            if self.advisory_logged:
+                self.advisory_logged = False
+                self.clear_advisory_record()
             return
         # At the hook threshold the stop ladder speaks for itself. The
         # advisory must not claim action=none on that same poll.
         if hot < self.advisory_c or hot >= self.fan_c or self.advisory_logged:
             return
         self.advisory_logged = True
-        LOG.warning(
-            "acpi_thermal_advisory phase=%s zone_c=%.1f advisory_c=%.1f "
-            "action=none incident=no timer=no; "
-            "checkpoint or reduce load if you can; this is not a failure "
-            "and it does not stop the workload",
-            "ec" if ec_only else "acpi", hot, self.advisory_c,
-        )
+        try:
+            self.publish_advisory(hot, ec_only)
+        except Exception as exc:
+            LOG.error("ACPI thermal advisory was not published: %s", exc)
 
     def ceiling_held(self, hot, now) -> bool:
         """True only after the zone has stayed at or above the ceiling."""

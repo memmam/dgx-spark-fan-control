@@ -67,10 +67,16 @@ MANUAL_STATE=
 # All temperatures are the hottest thermal zone. See docs/ec-curve.md.
 # Restart dgx-fan-watchdog.service after changing these values.
 # 70 C is an advisory only. Holding 70 through 79 C does not stop anything.
+# A program can read /var/lib/dgx-fan-control/acpi-advisory or the journal
+# line acpi_thermal_advisory. The optional hook below is not waited on.
 # 80 C starts the stop hook when one is configured, and in the ACPI phase
 # also forces level 100. With no hook, 80 C does not send SIGTERM.
 # 85 C is SIGTERM. 90 C is SIGKILL. Degrees of headroom are not seconds.
 ACPI_THERMAL_ADVISORY_C=70
+# Optional. Empty disables it. Executable plus arguments, not a shell.
+# Started when the advisory is published and never waited on. It does not
+# signal the workload. A slow or failed hook does not delay 80/85/90.
+ACPI_THERMAL_ADVISORY_HOOK=
 ACPI_THERMAL_MAX_C=80
 ACPI_THERMAL_STOP_C=85
 ACPI_THERMAL_KILL_C=90

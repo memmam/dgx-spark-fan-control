@@ -214,6 +214,8 @@ at 90 C, and that poll does not wait out the lower stages.
    the zone falls below **68 C** (advisory minus hysteresis) and then
    reaches 70 C again. A jump straight to 80 C or above does not emit the
    advisory on that poll; the stop ladder is the record of that poll.
+   The same episode is written for a program to read. See
+   [Listening for the advisory](#listening-for-the-advisory).
 2. **80 C.** In the ACPI phase, force level 100 on every ACPI Fan cooler
    that is not already at 100, and latch 100 until reboot. In the EC-only
    phase, write no `cur_state`. If `ACPI_THERMAL_STOP_HOOK` is set and the
@@ -348,6 +350,73 @@ retains precedence over hook/process probing. Invalid new thermal settings
 refuse new ACPI holds; the watchdog logs the error and uses safe thermal
 defaults rather than abandoning its true-zero monitoring.
 
+### Listening for the advisory
+
+The advisory is the window before the 80 C hook. Default threshold is **70 C**
+(`ACPI_THERMAL_ADVISORY_C`), not a separate 75 C stage. A program can
+checkpoint, shed load, or stop itself. This repository does not do that for
+it, and the advisory hook is not allowed to delay the 80/85/90 ladder.
+Nothing here was run against a live workload or on DGX hardware.
+
+Each new episode publishes three views of one record. Repeated polls while
+the zone stays at 70–79.9 C do not publish again. The episode ends only when
+the zone falls below **68 C**. The next crossing of 70 C is a new episode.
+A zone that bounces between 69 C and 71 C stays in the same episode.
+
+The record is schema 1. The keys, in this order, are `event`
+(`acpi_thermal_advisory`), `schema`, `phase` (`acpi` or `ec`), `zone_c`,
+`advisory_c`, `hook_c` (80), `term_c` (85), `kill_c` (90), `boot_id`,
+`incident_boot` (`-` when no incident file exists), `sequence`, `action`
+(`none`), and `timer` (`no`). `sequence` counts episodes in this watchdog
+process. A restart can publish again with a new sequence while the zone is
+still hot; a listener should treat the work as idempotent.
+
+1. **Journal.** The watchdog logs one warning line that starts with those
+   fields and then says to checkpoint or reduce load, and that this is not
+   a failure. `journalctl` keeps it with the service:
+
+   ```sh
+   journalctl -u dgx-fan-watchdog -f -g acpi_thermal_advisory
+   ```
+
+   Reading the system journal requires membership in the systemd journal
+   group, or root. The watchdog's own sandbox does not grant that to the
+   workload.
+
+2. **State file.** The same fields, one `key=value` per line, are replaced
+   atomically at `/var/lib/dgx-fan-control/acpi-advisory`. The directory is
+   mode `0755` and this file is mode `0644`, so a normal login can read it.
+   The watchdog's `UMask=0077` does not apply to this file. The file stays
+   until the zone falls below 68 C, including after the ladder has moved
+   on to 80 C or above. Removing the file is not a request to stop.
+
+   ```sh
+   # Example only. Not run on hardware. Poll; do not block the watchdog.
+   record=/var/lib/dgx-fan-control/acpi-advisory
+   if [ -f "$record" ] && grep -q '^event=acpi_thermal_advisory$' "$record"; then
+       phase=$(sed -n 's/^phase=//p' "$record")
+       zone=$(sed -n 's/^zone_c=//p' "$record")
+       echo "advisory phase=$phase zone=$zone; checkpoint or reduce load"
+   fi
+   ```
+
+3. **Optional hook.** `ACPI_THERMAL_ADVISORY_HOOK` is empty by default.
+   When set, it is an executable plus arguments, split with `shlex`, not a
+   shell. The watchdog starts it and does not wait for it to exit. A hook
+   that is still running is not started again and is not killed. A missing
+   executable, a bad command, or an exception is logged once for that
+   episode. The next temperature poll still runs. The hook inherits the
+   watchdog sandbox: home directories are hidden, and only `AF_UNIX` is
+   available, so it cannot call a network API. `systemctl start` of a unit
+   that knows how to notify the job is the usual shape. The hook receives
+   `DGX_ACPI_ADVISORY=1` and `DGX_ACPI_ADVISORY_PHASE`, `_ZONE_C`, `_C`,
+   `_HOOK_C`, `_TERM_C`, `_KILL_C`, `_BOOT`, `_INCIDENT_BOOT`, `_SEQUENCE`,
+   and `_PATH`. It must not assume it is the only listener.
+
+The workload is not signaled, checkpointed, or stopped by this event.
+SIGTERM is still 85 C, SIGKILL is still 90 C, and a missing stop hook
+still does not send SIGTERM at 80 C.
+
 ### Configuration and process safeguards
 
 Set these in `/etc/default/dgx-fan-control`, then restart
@@ -357,7 +426,8 @@ explicitly when customizing. Missing keys use these defaults:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `ACPI_THERMAL_ADVISORY_C` | `70` | Advisory only. Stable 70–79 C does not stop, latch, or start a timer |
+| `ACPI_THERMAL_ADVISORY_C` | `70` | Advisory only. Stable 70–79 C does not stop, latch, or start a timer. This is the listen-able warning |
+| `ACPI_THERMAL_ADVISORY_HOOK` | empty | Optional program started when the advisory is published. Not waited on. Empty disables it. Not a workload signal |
 | `ACPI_THERMAL_MAX_C` | `80` | ACPI phase: force and latch level 100. Both phases: start a configured stop hook. Not a SIGTERM |
 | `ACPI_THERMAL_STOP_C` | `85` | SIGTERM if the workload is not already confirmed stopped |
 | `ACPI_THERMAL_KILL_C` | `90` | SIGKILL. Preempts hook and SIGTERM grace |
