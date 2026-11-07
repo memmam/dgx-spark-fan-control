@@ -253,14 +253,51 @@ requested. `interpreter_ok` is still only the AML interpreter. The captured
 it. These tach readings do not separate an EC rejection from a write the EC
 accepted and did not apply.
 
-## Atarime `_FST` package read, not yet run
+## Atarime `_FST` package read, 7 Nov 2026 15:11:56 PST
 
-**UNRUN.** `research/fsl110/fst_status_atarime.c` reads `\_SB.FAN0._FST`
-and `\_SB.FAN1._FST` once. It does not call `_FSL`. The new evidence is
-the raw package (revision, cached control, speed), which `cur_state`
-hides when the control value is above 100. It is not the SMC reply from
-`WRB`. Arguments 110 and 120 are not repeated. The Kensaki 160 continuation
-stays blocked on the 2610/3915 baseline.
+Host clock `2026-11-07T23:11:56+00:00`. Checkout `e989d4f`, then the
+temperature-path fix the machine already had from `5cdf3b9`. Kernel
+`7.0.0-1024-nvidia`. `test-fst-read.sh` printed
+`override_rejected_before_hardware` for all three overrides and
+`fst_read_offline_ok`. Build and sign passed: Secure Boot enabled, enrolled
+MOK, sha512, `BUILD_SIGNED_NOT_LOADED`.
+
+Zones, millidegrees C, type `acpitz`: 42800, 40800, 40800, 40900, 41700,
+42800, 40700. Hottest of those zones 42.800 °C. `temperature.gpu` 41 °C.
+`hwmon0` `fan1_input` 2068, `hwmon1` `fan1_input` 2156. The module printed:
+
+```
+\_SB.FAN0._FST 0 0 2068
+\_SB.FAN1._FST 0 0 2156
+```
+
+Then `FST_READ_DONE` and unload. The three integers are the `_FST` package:
+revision, cached control, speed. Both controls are 0. Both speeds match the
+`fan1_input` values from the same run. This is a successful read only. It
+does not prove the earlier write was rejected, it does not prove an EC floor
+is clear, and it does not confirm the reboot after the second argument-120
+call. Do not repeat this read without a new question. The Kensaki 160
+continuation stays blocked on the 2610/3915 baseline.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- `_FST` read, cached control 0, tach match: PASS
+- write rejection, floor clear, reboot: not shown
+
+fwupd on this machine, transcribed without serial numbers. Embedded
+Controller current `0x03000d07`, minimum `0x02003400`, GUID
+`3d13c989-e6a8-4ead-95ee-921f09868f65`, with a reported successful update
+`0x03000508` to `0x03000d07`, capsule on disk. Two UEFI device-firmware
+entries, both success and capsule on disk: `b488217b-3895-4fc0-b1bf-ab7005a2d45a`
+current `0x02009e0f` minimum `0x02007300`, and
+`dd1a238a-5f8e-46bd-9401-a88da99c5a96` current `0x00000519` minimum
+`0x00000400`. `/boot/efi` is vfat on `/dev/nvme0n1p1`. That node is not to
+be read. `/lib/firmware` contains `nvidia/`, `7.0.0-1019-nvidia/`, and
+`7.0.0-1024-nvidia/` among ordinary Linux firmware. `nvidia_ffa_ec` is
+builtin, `drivers/platform/arm64/nvidia-ffa-ec`, softdep `arm-ffa`. No EFI
+directory listing was received. These capsules are update images, not the
+running SMC handler.
 
 ## Kensaki continuation from 160, not yet run
 

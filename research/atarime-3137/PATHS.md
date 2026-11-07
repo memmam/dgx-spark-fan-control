@@ -44,14 +44,30 @@ ACPI SMC. They are not in the saved captures.
 | Item | Status |
 | --- | --- |
 | Another `_FSL` level, including 110 and 120 | Blocked. No new evidence goal. |
-| kprobe or handler replacement to grab the SMC reply | Not used. `acpi_ffh_address_space_arch_handler` is not a supported trace point, and replacing the handler would affect every fixed-hardware region. |
-| `fst_status_atarime` | Ready, **unrun**. One read of the existing `_FST` package: revision, cached control, speed. That is the read path's published result, not `WRB`'s reply registers. |
+| kprobe or handler replacement to grab the SMC reply | Not used. Replacing `acpi_ffh_address_space_arch_handler` would affect every fixed-hardware region. |
+| `fst_status_atarime` | PASS as a read, 7 Nov 2026 15:11:56 PST. Package was `0 0 2068` and `0 0 2156`. Cached control is 0. Speeds match `fan1_input`. Not a write acknowledgement, not a clear floor, not a reboot confirmation. Do not repeat. |
 
-## Live inventory, read-only
+## What Atarime's fwupd report adds
 
-`fwupdmgr get-devices` is the supported list of what this machine's fwupd
-reports (version, GUID, plugin, flags). It does not download or install.
-`findmnt -t vfat` names a mounted EFI partition if the system already
-mounted one; do not guess a disk node. `/lib/firmware` is the ordinary
-Linux firmware directory. None of these is the EL3 SMC handler. If they
-are only the LVFS capsules already studied, the handler is still absent.
+Embedded Controller `0x03000d07` (minimum `0x02003400`), GUID
+`3d13c989-e6a8-4ead-95ee-921f09868f65`, updated `0x03000508` to
+`0x03000d07`, capsule on disk. UEFI device firmware
+`b488217b-3895-4fc0-b1bf-ab7005a2d45a` at `0x02009e0f` and
+`dd1a238a-5f8e-46bd-9401-a88da99c5a96` at `0x00000519`, both success,
+capsule on disk. `/boot/efi` is the mounted vfat volume. `nvidia_ffa_ec`
+is builtin at `drivers/platform/arm64/nvidia-ffa-ec`. A capsule on disk is
+the update image fwupd staged. It is not the SMC handler that is running.
+The builtin driver is the host side of FF-A. It is not that handler either.
+
+## Next listing, still missing
+
+The EFI directory names were not listed. One level of `/boot/efi/EFI`,
+then one more level only if a name is `fwupd`, `UpdateCapsule`, or
+`NVIDIA`, with sizes and no file contents. Under `/lib/firmware`, only
+`nvidia`, `7.0.0-1019-nvidia`, and `7.0.0-1024-nvidia`, and only names
+matching `ffa`, `ec`, or `soc`. Under `/usr/src`, only a file whose name
+contains `nvidia-ffa-ec`. Stop when those listings are in hand. Do not
+read `/dev/nvme0n1p1`, do not dump EFI variables, and do not install or
+update firmware. If the listings are boot loaders plus the capsules
+already identified, the running SMC handler is still not a file on this
+machine.
