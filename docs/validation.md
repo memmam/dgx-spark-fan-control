@@ -174,6 +174,50 @@ Statuses:
 - arguments 160–237: UNRUN
 - reboot after this sweep: PENDING
 
+## Kensaki continuation from 160, blocked before any write, 7 Nov 2026 14:55:24 PST
+
+Host clock `2026-11-07T22:55:24+00:00`. The script printed fifteen baseline
+samples, all 2610/3915, then `STOP_NOT_BASELINE raw=2610 3915`. It did not
+print `loaded` or a step write. Zone files were checked and not printed.
+No temperature was supplied for this capture, and none is filled in here. In `research/fsl110/ramp-kensaki.sh` that
+exit is in the baseline loop. `insmod` is the next statement after the loop,
+and `stepped=1` is only set inside the step loop. No module was loaded and
+no `_FSL` was issued. The guard is unchanged.
+
+2610/3915 is 29 percent of 9000/13500, and it is also the EC 3.5.8 duty
+formula at percent 29: `1260 + 15/86 * 7740 = 2610` and
+`1890 + 15/86 * 11610 = 3915`. The idle pair 2700/4050 is that same formula
+at percent 30, which is the duty byte on the first step of both stock
+curves. The thermal walk applies that duty byte with no add or subtract.
+The image does not show a step that turns 30 into 29. An older one-percent
+gap, 75 versus measured 74, is the same kind of discrepancy and is still
+unresolved. This pair is also exactly two-thirds, which is the telemetry
+shape. The post-`_FSL` readings in the earlier ramp were near each other
+(4950/4994, then 6030/5670), not two-thirds. That difference is consistent
+with the EC curve publishing, and it is not proof the floor register is
+clear, that the machine was damaged, or that 29 percent is the normal idle
+step.
+
+The 14:48 PST reboot was stated. No Kensaki 2700/4050 pair was reported
+after it. This row does not mark that restore PASS. Arguments 160–237 stay
+**UNRUN**. Do not loosen the baseline check and do not retry from this
+sample alone.
+
+`fanwatch_kensaki_20261107_225801.log` then shows fourteen 1-second samples
+from 22:58:02 through 22:58:15 UTC, which is 14:58:02 through 14:58:15 PST.
+Every sample is the reported SoC at 42 °C and fans 2610/3915, with no zeros.
+That label is the fanwatch SoC reading, not a hottest-zone selection. The
+pair is steady. It does not identify a cause, it does not establish 29
+percent as the normal idle step, and it does not close the reboot. The
+sweep stays blocked.
+
+Statuses:
+
+- this attempt: BLOCKED before write
+- BUILD/SIGN for the continuation binary: not a new result
+- arguments 160–237: UNRUN
+- reboot restore after the 150 sweep: still PENDING
+
 ## Atarime argument 120, two runs, 7 Nov 2026
 
 Same checkout and kernel. The first build attempt used the Kensaki script

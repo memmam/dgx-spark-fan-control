@@ -7,17 +7,86 @@
 # Cleanup only unloads a module this script loaded. It does not write a
 # fan release. Reboot after any step.
 set -u
-cd "$(dirname "$0")"
-exec > >(tee -a kensaki-ramp-hostlog.txt) 2>&1
-echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
-test "${DGX_FSL_RAMP_KENSAKI:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
-test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
+if [ "${RAMP_SOURCE_ONLY:-}" != 1 ]; then
+  cd "$(dirname "$0")"
+  exec > >(tee -a kensaki-ramp-hostlog.txt) 2>&1
+  echo "HOST_DATE $(date -Is)"
+  echo "host local clock, not labeled PST"
+  echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
+  test "${DGX_FSL_RAMP_KENSAKI:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+  test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
+  hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
+  test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
+fi
+steps=(160 170 180 190 200 210 220 225 230 232 234 236 237)
+# THERMAL_ROOT and NVIDIA_SMI_STUB exist so tests can reuse these reads.
+# One read of each temp file feeds both the guard and the log line.
+THERMAL_ROOT=${THERMAL_ROOT:-/sys/class/thermal}
+zones_ok() {
+  local z t ty name frac
+  ZONE_LINE=""
+  HOTTEST=""
+  local hottest_t="" hottest_name=""
+  local root="${THERMAL_ROOT:-/sys/class/thermal}"
+  for z in "$root"/thermal_zone*; do
+    name=${z##*/}
+    if ! ty=$(cat "$z/type" 2>/dev/null); then
+      echo "STOP_TEMP unreadable_type $z"
+      return 1
+    fi
+    if ! t=$(cat "$z/temp" 2>/dev/null); then
+      echo "STOP_TEMP unreadable $z type=$ty"
+      return 1
+    fi
+    if ! [[ "$t" =~ ^-?[0-9]+$ ]]; then
+      echo "STOP_TEMP nonnumeric $z type=$ty raw=$t"
+      return 1
+    fi
+    if [ "$t" -lt 25000 ] || [ "$t" -gt 60000 ]; then
+      echo "STOP_TEMP out_of_range $z type=$ty raw=${t}mC"
+      return 1
+    fi
+    ZONE_LINE="$ZONE_LINE ${name}:${ty}=${t}mC"
+    if [ -z "$hottest_t" ] || [ "$t" -gt "$hottest_t" ]; then
+      hottest_t=$t
+      hottest_name="${name}:${ty}"
+    fi
+  done
+  if [ -z "$hottest_t" ]; then
+    echo "STOP_TEMP no_zones $root"
+    return 1
+  fi
+  frac=$(printf '%03d' $((hottest_t % 1000)))
+  HOTTEST="${hottest_name}=${hottest_t}mC ($((hottest_t / 1000)).${frac}C)"
+}
+gpu_idle() {
+  local utils util gtemp
+  GPU_LINE=""
+  if [ -n "${NVIDIA_SMI_STUB:-}" ]; then
+    utils=$NVIDIA_SMI_STUB
+  elif ! utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null); then
+    echo "STOP_GPU nvidia-smi_failed"
+    return 1
+  fi
+  if [ -z "$utils" ]; then
+    echo "STOP_GPU empty"
+    return 1
+  fi
+  while IFS=',' read -r util gtemp; do
+    util=${util// /}
+    gtemp=${gtemp// /}
+    if [ "$util" != 0 ]; then
+      echo "STOP_GPU util=$util nvidia_gpu_temp=${gtemp}C raw=$utils"
+      return 1
+    fi
+    GPU_LINE="$GPU_LINE nvidia_gpu_temp=${gtemp}C"
+  done <<< "$utils"
+}
+if [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
 stepped=0
 loaded_by_us=0
-steps=(160 170 180 190 200 210 220 225 230 232 234 236 237)
 cleanup() {
   if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_ramp_kensaki '; then
     rmmod fsl_ramp_kensaki || true
@@ -38,41 +107,6 @@ done
 for p in /proc/fsl110 /proc/fsl_ramp_kensaki /proc/fsl120_atarime; do
   test ! -e "$p" || { echo "STOP_ALREADY_LOADED $p"; exit 1; }
 done
-zones_ok() {
-  local z t
-  for z in /sys/class/thermal/thermal_zone*; do
-    if ! t=$(cat "$z/temp" 2>/dev/null); then
-      echo "STOP_TEMP unreadable $z"
-      return 1
-    fi
-    if ! [[ "$t" =~ ^-?[0-9]+$ ]]; then
-      echo "STOP_TEMP nonnumeric $z=$t"
-      return 1
-    fi
-    if [ "$t" -lt 25000 ] || [ "$t" -gt 60000 ]; then
-      echo "STOP_TEMP out_of_range $z=$t"
-      return 1
-    fi
-  done
-}
-gpu_idle() {
-  local utils util
-  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null); then
-    echo "STOP_GPU nvidia-smi_failed"
-    return 1
-  fi
-  if [ -z "$utils" ]; then
-    echo "STOP_GPU empty"
-    return 1
-  fi
-  while IFS= read -r util; do
-    util=${util// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util raw=$utils"
-      return 1
-    fi
-  done <<< "$utils"
-}
 mapfile -t paths < <(
   for h in /sys/class/hwmon/hwmon*; do
     test "$(cat "$h/name" 2>/dev/null || true)" = acpi_fan || continue
@@ -118,7 +152,8 @@ sample_ok() {
     if ! pair=$(read_pair); then
       return 1
     fi
-    echo "$tag $i $pair"
+    zone_snap[$i]=$(date -Is)$ZONE_LINE" hottest=$HOTTEST$GPU_LINE"
+    echo "${zone_snap[$i]} $tag $i fans=$pair"
     samples_a+=("${pair%% *}")
     samples_b+=("${pair##* }")
     test "$i" = 15 || sleep 2
@@ -135,7 +170,7 @@ while [ "$i" -lt 15 ]; do
   pair="${samples_a[$i]} ${samples_b[$i]}"
   sorted=$(printf '%s\n' $pair | sort -n | tr '\n' ' ')
   test "$sorted" = "2700 4050 " || {
-    echo "STOP_NOT_BASELINE raw=$pair"
+    echo "STOP_NOT_BASELINE raw=$pair ${zone_snap[$((i + 1))]:-no_zone_snapshot}"
     exit 1
   }
   i=$((i + 1))
@@ -181,3 +216,4 @@ echo "RAMP_STEPS_DONE"
 echo "=== final zones ==="
 zones_ok || exit 1
 gpu_idle || exit 1
+echo "$(date -Is) final zones$ZONE_LINE hottest=$HOTTEST$GPU_LINE"
