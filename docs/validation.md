@@ -417,9 +417,12 @@ power-action interfaces; it has not been hardware-validated by those tests.
 
 `./scripts/check` compiles the driver's transaction functions against a fake
 FF-A peer and refuses host systemd, module, and sysfs changes. That is not
-hardware readiness. `research/live-check` is a separate opt-in harness and
-has not been run on hardware. The notes below are the operator's 7 Nov 2026
-report.
+hardware readiness. `research/live-check` is a separate opt-in harness. The first read-only
+pass on both machines, after `c92aa96`, is an operator report: kensaki
+showed 42.5°C and 2700/4050 RPM at state 0 with no manual floor; atarime
+showed 2060/2147 RPM, telemetry only, and no zone temperature because that
+status line does not print one. That missing value was not a cool reading.
+The notes below are the operator's 7 Nov 2026 report.
 Items not listed there are still pending. This tree was not used to load the
 module or to run those steps.
 

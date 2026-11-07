@@ -35,6 +35,7 @@ def snapshot(**overrides):
         "watchdog_active": "active",
         "manual_unit": "disabled",
         "hottest_c": 42.0,
+        "temperature_source": "status",
         "gpu_job": "none",
         "foreign": False,
         "cooling_device": True,
@@ -181,6 +182,111 @@ class LiveGateTests(unittest.TestCase):
         ])
         self.assertIn("PASS floor-automatic", out.getvalue())
         self.assertIn("MANUAL reboot-notifier", out.getvalue())
+
+    def test_missing_temperature_is_not_a_read_only_pass(self):
+        calls = []
+
+        def run(argv, timeout):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = LIVE.main(
+                ["--case", "unload-reload", "--consent", "unload-reload"],
+                environ={"DGX_FAN_LIVE": "1"},
+                collect=lambda _run: snapshot(
+                    profile="EC 3.13.7", cooling_device=False, state=None,
+                    hottest_c=None, temperature_source="missing (health=absent, zones=missing)",
+                ),
+                run=run,
+            )
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [])
+        text = out.getvalue() + err.getvalue()
+        self.assertIn("temperature was not read", text)
+        self.assertNotIn("PASS read-only", text)
+        self.assertIn("not a temperature pass", text)
+
+    def test_health_temperature_is_trusted_and_malformed_is_not(self):
+        value, note = LIVE.parse_health_temperature("temperature: pass (39.5C)\n")
+        self.assertEqual((value, note), (39.5, "health"))
+        warn, warn_note = LIVE.parse_health_temperature(
+            "temperature: warn (hot under load, 70.0C)\n",
+        )
+        self.assertEqual((warn, warn_note), (70.0, "health"))
+        for line in (
+            "temperature: pass (hot)\n",
+            "temperature: pass (0C)\n",
+            "temperature: fail (hottest zone is not readable)\n",
+            "fans: pass\n",
+        ):
+            parsed, kind = LIVE.parse_health_temperature(line)
+            self.assertIsNone(parsed, line)
+            self.assertNotEqual(kind, "health")
+        chosen, source = LIVE.choose_temperature(
+            None, "temperature: pass (39.5C)\n", (None, "missing"),
+        )
+        self.assertEqual((chosen, source), (39.5, "health"))
+        missing, missing_source = LIVE.choose_temperature(
+            None, "temperature: pass (nope)\n", (None, "malformed"),
+        )
+        self.assertIsNone(missing)
+        self.assertIn("health=malformed", missing_source)
+        self.assertFalse(LIVE.temperature_trusted(
+            snapshot(hottest_c=None, temperature_source=missing_source),
+        ))
+
+    def test_kernel_zone_reader_ignores_malformed_samples(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, raw in (("thermal_zone0", "0"), ("thermal_zone1", "nope"),
+                              ("thermal_zone2", "206000")):
+                zone = root / name
+                zone.mkdir()
+                (zone / "temp").write_text(raw, encoding="ascii")
+            self.assertEqual(LIVE.read_zone_temperature(root), (None, "malformed"))
+            (root / "thermal_zone3").mkdir()
+            (root / "thermal_zone3" / "temp").write_text("41250", encoding="ascii")
+            self.assertEqual(LIVE.read_zone_temperature(root), (41.25, "thermal-zone"))
+
+    def test_enabled_manual_unit_is_not_disabled_to_run_floor_case(self):
+        calls = []
+
+        def run(argv, timeout):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = LIVE.main(
+                ["--case", "floor-automatic", "--consent", "floor-automatic"],
+                environ={"DGX_FAN_LIVE": "1"},
+                collect=lambda _run: snapshot(manual_unit="enabled"),
+                run=run,
+            )
+        self.assertEqual(code, 3)
+        self.assertEqual(calls, [])
+        text = out.getvalue()
+        self.assertIn("SKIP floor-automatic", text)
+        self.assertIn("will not change that saved setting", text)
+        self.assertNotIn("systemctl", text)
+        self.assertEqual(
+            LIVE.unmet("service-start-stop", snapshot(manual_unit="enabled")),
+            [],
+        )
+        self.assertEqual(
+            LIVE.unmet("unload-reload", snapshot(manual_unit="enabled")),
+            [],
+        )
+
+    def test_zero_clamp_wording_is_not_a_state_zero_stop(self):
+        text = " ".join(why for _name, why in LIVE.MANUAL)
+        self.assertNotIn("state 0 as a written stop", text)
+        self.assertIn("0xffff", text)
+        self.assertIn("literal lower clamp of 0", text)
 
     def test_unload_does_not_pass_module_parameters(self):
         self.assertEqual(LIVE.commands_for("unload-reload")[1], ["modprobe", LIVE.MODULE])
