@@ -35,7 +35,11 @@ Carry-forward, decided on this branch:
 - No ACPI `cur_state` writes. No fault latch. Curves and the 85 °C
   true-zero cutoff are unchanged.
 - The module version is 0.1.8 so it is not labeled as stock 0.1.6 or as
-  the loaded 0.1.7. Do not install it on the Sparks from this pass.
+  the loaded 0.1.7.
+- `scripts/kensaki-regression` is the Kensaki check for this delta. With
+  no `DGX_FAN_SUPERVISED=1` it does not touch the host. `floor` is
+  set-state 6 then automatic, and it checks that ACPI Fan `cur_state`
+  does not change. Atarime is refused. No GPU load.
 
 Older sections below are the record as it stood at this commit, including
 commands this tree no longer provides.
