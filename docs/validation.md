@@ -54,6 +54,46 @@ module changes, or a regression is being checked.
 Older sections below are the record as it stood at `e57001b`, including
 commands this tree no longer provides.
 
+## Kensaki direct `_FSL` 110, 7 Nov 2026 about 14:11–14:12 PST
+
+Owner chat times, not a remote `uptime` clock. Kensaki, EC 3.5.8, kernel
+`7.0.0-1024-nvidia`. The controller was fully uninstalled. No GPU load.
+Atarime was not run. No further write is authorized from this row.
+
+Checkout `ac496545149aa87c413f0eea6224d0480f8918aa`. The temporary module
+is `research/fsl110`. It is not DKMS and it is not the controller. About
+14:11 PST, `build-sign.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc was
+13.3.0. The signature hash was sha512. `modinfo` signer was `DGX Spark
+local module signing`. The build had no failure. It warned about the
+compiler name only, and it skipped BTF because `vmlinux` was absent.
+
+About 14:12 PST the operator ran `sudo DGX_FSL110=yes bash ./run-once.sh`.
+The script printed `before 2700 4050`, then `loaded`, then status
+`interpreter_ok`. Sample 1 was hwmon0 2700 and hwmon1 4050. Sample 2 was
+hwmon0 4500 and hwmon1 4590. Sample 3 was the same 4500/4590. The module
+was then unloaded.
+
+One direct `\_SB.FAN0._FSL` with argument 110 completed. That argument
+requests 4687 on both channels. The published `acpi_fan` speeds left
+2700/4050 and landed above the earlier level-100 observation of about
+4320/4320, so the downstream read was not hard-clamped at that earlier
+level-100 result. These numbers are not an independently verified physical
+shaft speed on EC 3.5.8. The calculated producer and the readback path are
+still only bounded, not traced into the tachometer.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- single request, evaluation, and readback response: PASS
+- physical RPM: UNVERIFIED
+- sustained behavior: UNRUN
+- reboot cleanup: PENDING
+
+Unload does not clear the hold. The operator was told to reboot and then
+confirm fanwatch is back at 2700/4050. That confirmation is not in hand.
+Do not mark the restore PASS, and do not issue another fan write, until
+that output exists.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
