@@ -204,7 +204,8 @@ the module.
 
 Run `./scripts/check` (Python 3.10+ and a C compiler) for hardware-free policy,
 failure-path, compiled C transaction, signing-wrapper, and source-contract tests
-plus shell syntax checks. GitHub Actions runs the same checks. Kernel
+plus shell syntax checks. The check refuses systemd, module, firmware, and
+sysfs changes. GitHub Actions runs the same checks. Kernel
 compilation and real EC behavior need a compatible Spark.
 
 - [Firmware protocol](docs/protocol.md)

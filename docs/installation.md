@@ -20,7 +20,7 @@ uname -r
 mokutil --sb-state
 ```
 
-Keep this checkout for builds and updates. Commands below assume you are in its
+`./scripts/check` does not talk to systemd or write sysfs. Keep this checkout for builds and updates. Commands below assume you are in its
 root. If matching headers are unavailable, resolve that first through your
 DGX OS package repositories. Another kernel's headers are not a substitute.
 

@@ -26,8 +26,11 @@ From the checkout root, on EC 3.5.8, at idle, with
 `dgx-fan-watchdog.service` active:
 
 ```sh
-sudo research/acpi-floor-sweep/acpi-floor-sweep 40 35
+sudo DGX_FAN_HARDWARE_TEST=1 research/acpi-floor-sweep/acpi-floor-sweep 40 35
 ```
+
+Without that variable the script exits before preflight. `./scripts/check`
+sets `DGX_FAN_CONTROL_OFFLINE=1`, which also refuses this script.
 
 Defaults are levels 40 then 35, 180 seconds each, one sample per second.
 `--min-rpm` defaults to 1000. `--max-temp` defaults to 60 C. A CSV is

@@ -2475,7 +2475,9 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual((second / "cur_state").read_text(), "35\n")
 
     def test_supported_commands_do_not_repeat_their_output(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(CONTROL, "enable_manual_oneshot") as enable, \
+             patch.object(CONTROL, "disable_manual_oneshot") as disable:
             thermal = Path(directory)
             device = thermal / "cooling_device0"
             device.mkdir()
@@ -2498,9 +2500,10 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(stderr, "")
             self.assertEqual((device / "cur_state").read_text(), "6\n")
             code, stdout, stderr = run_cli([*argv, "automatic"])
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 1)
             self.assertEqual(stdout, "")
-            self.assertEqual(stderr, "")
+            self.assertEqual(stderr.count("offline tests refuse to write"), 1)
+            self.assertIn("/etc", stderr)
             self.assertEqual((device / "cur_state").read_text(), "0\n")
             code, stdout, stderr = run_cli([*argv, "status"])
             self.assertEqual(code, 0)
@@ -2510,6 +2513,8 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(stdout.count("watchdog-active:"), 1)
             self.assertEqual(stdout.count("watchdog-enabled:"), 1)
             self.assertEqual(stderr, "")
+            enable.assert_not_called()
+            disable.assert_not_called()
 
     def test_unknown_curve_and_unprivileged_module_are_reported_once(self):
         with patch.dict("os.environ", {"DGX_FAN_CURVE": "nope"}):

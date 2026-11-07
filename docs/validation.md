@@ -415,48 +415,55 @@ power-action interfaces; it has not been hardware-validated by those tests.
 
 ## Module 0.1.7 hardware checks
 
-**Pending. Not run.** Nothing in this section has been executed on a machine.
 `./scripts/check` compiles the driver's transaction functions against a fake
-FF-A peer. That is fault injection on a desk. It does not load
-`dgx_ec_fan_control`, does not open sysfs, and does not talk to an EC. A pass
-there is not hardware readiness.
+FF-A peer and refuses host systemd, module, and sysfs changes. That is not
+hardware readiness. The notes below are the operator's 7 Nov 2026 report.
+Items not listed there are still pending. This tree was not used to load the
+module or to run those steps.
 
-Rebuild and install version 0.1.7 before any step below. Leave
-`automatic_floor_recovery` and `allow_unverified_writes` unset. Do not load
-`research/mailbox`. Do not write ACPI level 0. Do not clear a floor of
-`0x10fe` with a module write. Do not try to cause a mailbox wedge.
+### Observed, both machines
 
-### EC 3.5.8, control
+Both machines built, signed, and loaded 0.1.7 with `automatic_floor_recovery`
+unset and `allow_unverified_writes` unset.
 
-1. Module loaded, performance service stopped. `status` is state 0 and the
-   fans follow the EC curve. The log's fan traffic is the probe read, not a
-   recovery floor command.
-2. `set-state` to a middle floor, read both tachometers, then `automatic`.
-   Status returns to state 0. Unload while the module still owns that floor
-   restores automatic control and does not log `-116`.
-3. Leave monitoring running for an ordinary session. If a preflight or read
-   returns `-110` on its own, the log says `not submitting a floor read` and
-   names the profile. The next read is that same operation again. It is not
-   an operation-0x04 recovery submit, and it is not a repeating
-   `recovery_unverified` fence.
-4. If ACPI has already written level 100, probe refuses `0x10fe` and does not
-   write over it. `status` reports an ownership change. Reboot, and confirm
-   the EC curve is back. Another observed floor value is not, by itself,
-   proof that ACPI wrote it.
-5. Reboot or unload with a floor the module owns. A timed-out setter is not
-   replayed. A secure-firmware call that never returns holds the driver's
-   mutex, including remove and the reboot notifier. That limit stays; this
-   list does not add a timeout around the call.
+### Observed on kensaki, EC 3.5.8
 
-### EC 3.13.7, telemetry only
+Probe refused a foreign floor of `0x10fe`. A reboot cleared it. The next probe
+was clean. A middle floor, state 6, then `automatic`, returned to the EC
+curve. Unload while the module owned state 6 restored automatic control, and
+the following load was clean. With the performance service idle, state moved
+0 to 1, and stopping the service returned to 0.
 
-1. Probe binds telemetry, `status` prints `control unsupported on this
-   firmware`, and there is no cooling device. The log has no operation 0x04.
-2. If a telemetry or capability read times out on its own, the log names the
-   profile and says no floor read was submitted. The next hwmon read is the
-   original operation, not a recovery fence and not another 0x04.
-3. An ACPI write on this firmware may be accepted and must not be expected to
-   change RPM. Do not use this machine for ACPI floor tests.
+A reboot with saved manual state 6 came up at state 0 from the probe, and
+userspace reapplied 6 on the next second. The journal from the previous boot
+has no reboot-notifier line, so the shutdown restore is unverified. The saved
+setting was then cleared and the machine is at state 0.
+
+### Observed on atarime, EC 3.13.7
+
+Telemetry only: no cooling device, both tachometers healthy, unload and reload
+clean. A saved last-set of 12 was kept and not applied.
+
+### Not observed
+
+Sustained load, a natural mailbox timeout, suspend, and the reboot notifier
+were not run. Do not treat them as passed. No wedge was induced.
+
+### Still open
+
+Leave both module parameters unset. Do not load `research/mailbox`. Do not
+write ACPI level 0 or clear `0x10fe` with a module write. Do not induce a wedge.
+
+EC 3.5.8: an ordinary monitoring session that happens to time out has not
+been seen. The open question is a log line `not submitting a floor read` and
+a following read that is not operation 0x04. Shutdown restore via the reboot
+notifier is unverified. A `sync_send_receive2` that never returns still holds
+the driver mutex; do not add a timeout around that call to test it.
+
+EC 3.13.7: a telemetry or capability timeout has not been seen. The same log
+line would have to name the profile and the next read must not be a floor
+command. Do not use this machine for ACPI floor tests. An ACPI write here may
+be accepted and must not be expected to change RPM.
 
 ### Still unresolved after 0.1.7
 

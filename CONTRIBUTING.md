@@ -4,11 +4,17 @@ Issues and pull requests are welcome. Include your exact hardware, kernel and
 firmware versions when reporting compatibility or thermal behavior. Please use
 small, reviewable changes and describe how you checked them.
 
-Run `./scripts/check` before submitting. Policy/filesystem tests use temporary
-directories and mocks; they must never read or write the test host's real
-thermal sysfs. Transaction tests compile the driver's actual C functions with
-simulated FF-A responses; they exercise failure recovery without contacting
-firmware. Driver changes also need a `W=1` build on the target kernel and
+Run `./scripts/check` before submitting. It exports `DGX_FAN_CONTROL_OFFLINE=1`.
+While that is set, the process refuses `systemctl`, module loaders, fwupd,
+`nvidia-smi`, `dmesg`, reboot and poweroff, shell commands that name those
+tools, process signals, and writes under `/sys`, `/etc`, `/var`, and the
+other host config roots. A mock that calls back into `subprocess` still hits
+the refusal. Direct `unittest` discovery loads the same guard. The variable
+is not set in the fan services, so a normal watchdog or `set-state` is
+unchanged. Policy tests use temporary directories. Transaction tests compile
+the driver's C functions against a fake FF-A peer. `research/acpi-floor-sweep`
+is not part of the check; running it requires `DGX_FAN_HARDWARE_TEST=1`.
+Driver changes also need a `W=1` build on the target kernel and
 an explicitly documented hardware validation result or testing limitation.
 
 Keep `PACKAGE_VERSION` in `dkms.conf` aligned with `DGX_EC_DRIVER_VERSION`

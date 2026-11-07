@@ -1,9 +1,12 @@
 import hashlib
 import importlib.util
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
+
+os.environ["DGX_FAN_CONTROL_OFFLINE"] = "1"
 
 
 ROOT = Path(__file__).resolve().parents[1]

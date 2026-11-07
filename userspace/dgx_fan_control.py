@@ -18,6 +18,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -98,6 +99,122 @@ MANUAL_STATE_NAME = "manual-state"
 DAEMON_RESTART_LOOP = 3
 DAEMON_ALERT_INTERVAL_SECONDS = 60.0
 STALL_MARKER_DIR = Path("/var/lib/dgx-fan-control")
+# Set only by ./scripts/check and the test modules. Production units do not
+# set it. When it is set, host commands and host-path writes fail before
+# they start. Unsetting it restores the normal watchdog and fan commands.
+OFFLINE_GUARD_ENV = "DGX_FAN_CONTROL_OFFLINE"
+_HOST_WRITE_ROOTS = (
+    "/sys", "/proc", "/etc", "/usr", "/lib", "/lib64",
+    "/var", "/run", "/boot", "/dev", "/opt",
+)
+_OFFLINE_COMPILE_OK = frozenset({
+    "cc", "gcc", "c99", "c11", "clang", "as", "ld", "python", "python3",
+})
+_OFFLINE_SHELL_BLOCKED = re.compile(
+    r"(?:^|[^A-Za-z0-9_./-])("
+    r"systemctl|systemd-run|busctl|modprobe|insmod|rmmod|dkms|"
+    r"reboot|poweroff|shutdown|halt|telinit|wall|kill|killall|pkill|"
+    r"fwupdmgr|fwupdtool|fwupd|nvidia-smi|dmesg"
+    r")(?:$|[^A-Za-z0-9_./-])"
+)
+
+
+class OfflineGuardError(RuntimeError):
+    """An offline test tried to touch the host. Nothing was executed."""
+
+
+def offline_guard_active() -> bool:
+    return os.environ.get(OFFLINE_GUARD_ENV) == "1"
+
+
+def offline_blocks_real(fn: object) -> bool:
+    """True when offline and fn is not a test double."""
+    return offline_guard_active() and not hasattr(fn, "assert_called")
+
+
+def _under_temp(path: Path) -> bool:
+    temp = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = Path(os.path.abspath(path))
+    return resolved == temp or temp in resolved.parents
+
+
+def refuse_host_write(path: Path) -> None:
+    """Block writes to host sysfs, firmware, and persistent config.
+
+    The check uses the absolute path string. It does not stat the target.
+    """
+    if not offline_guard_active():
+        return
+    text = os.path.abspath(os.fspath(path))
+    temp = os.path.abspath(tempfile.gettempdir())
+    if text == temp or text.startswith(temp + os.sep):
+        return
+    for root in _HOST_WRITE_ROOTS:
+        if text == root or text.startswith(root + os.sep):
+            raise OfflineGuardError(f"offline tests refuse to write {text}")
+
+
+def refuse_offline_exec(*args, **kwargs) -> None:
+    """Block host programs. Compilers and temp-dir executables still run."""
+    if not offline_guard_active():
+        return
+    if kwargs.get("shell"):
+        text = args[0] if args else ""
+        if not isinstance(text, str) or _OFFLINE_SHELL_BLOCKED.search(text):
+            raise OfflineGuardError("offline tests refuse a shell command")
+        return
+    if not args:
+        raise OfflineGuardError("offline tests refuse an empty command")
+    argv = args[0]
+    if isinstance(argv, (str, Path)):
+        program = str(argv)
+    else:
+        try:
+            program = str(next(iter(argv)))
+        except StopIteration:
+            raise OfflineGuardError("offline tests refuse an empty command") from None
+    base = Path(program).name
+    if base in _OFFLINE_COMPILE_OK:
+        return
+    if program.startswith("/") and _under_temp(Path(program)):
+        return
+    raise OfflineGuardError(f"offline tests refuse to run {base}")
+
+
+def install_offline_subprocess_guard() -> None:
+    """Wrap subprocess so a mock that calls back into it still cannot exec."""
+    if not offline_guard_active():
+        return
+    current = subprocess.run
+    if getattr(current, "_dgx_offline_guard", False):
+        return
+    bare_run = current
+    bare_popen = subprocess.Popen
+
+    def guarded_run(*args, **kwargs):
+        refuse_offline_exec(*args, **kwargs)
+        guarded_run.real_invocations += 1
+        return guarded_run._bare(*args, **kwargs)
+
+    def guarded_popen(*args, **kwargs):
+        refuse_offline_exec(*args, **kwargs)
+        guarded_popen.real_invocations += 1
+        return guarded_popen._bare(*args, **kwargs)
+
+    guarded_run._dgx_offline_guard = True
+    guarded_run._bare = bare_run
+    guarded_run.real_invocations = 0
+    guarded_popen._dgx_offline_guard = True
+    guarded_popen._bare = bare_popen
+    guarded_popen.real_invocations = 0
+    subprocess.run = guarded_run
+    subprocess.Popen = guarded_popen
+
+
+install_offline_subprocess_guard()
 STALL_MARKER_NAME = "true-zero-reboot"
 MODULE_NAME = "dgx_ec_fan_control"
 MANAGED_BLACKLIST_NAME = "dgx-spark-fan-control-disable.conf"
@@ -284,6 +401,8 @@ def systemctl_query(verb: str, unit: str = DAEMON_UNIT) -> str:
         )
     except subprocess.TimeoutExpired:
         return "timeout"
+    except OfflineGuardError:
+        return "unknown"
     except OSError as exc:
         if access_denied(exc):
             return NEEDS_ROOT
@@ -336,7 +455,7 @@ def systemctl_show_properties(unit: str, names: tuple[str, ...],
             command, check=False, capture_output=True, text=True,
             timeout=CHECK_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
         return {}
     found: dict[str, str] = {}
     for line in (completed.stdout or "").splitlines():
@@ -589,6 +708,7 @@ NOTIFY_DEFAULT = Path("/etc/default/dgx-fan-control")
 
 def ensure_state_dir(path: Path) -> None:
     """Create the state directory and keep it traversable by later SSH logins."""
+    refuse_host_write(path)
     path.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(path, 0o755)
@@ -598,6 +718,7 @@ def ensure_state_dir(path: Path) -> None:
 
 def write_state_text(path: Path, text: str) -> None:
     """Write a state file as mode 0644 so a login can read the flag."""
+    refuse_host_write(path)
     ensure_state_dir(path.parent)
     path.write_text(text, encoding="ascii")
     try:
@@ -765,6 +886,8 @@ def read_defaults(path: Path = NOTIFY_DEFAULT) -> dict[str, str]:
     Permission denied is raised so a health check can say it needs root
     instead of treating the file as unset.
     """
+    if offline_guard_active() and path == NOTIFY_DEFAULT:
+        return {}
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -818,6 +941,8 @@ def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> b
         )
     except subprocess.TimeoutExpired:
         return "timeout"
+    except OfflineGuardError:
+        return None
     except OSError as exc:
         if access_denied(exc):
             return NEEDS_ROOT
@@ -843,7 +968,7 @@ def read_progress_value(command: str) -> float | None:
             command, shell=True, check=False, capture_output=True, text=True,
             timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
         return None
     if completed.returncode != 0:
         return None
@@ -931,7 +1056,7 @@ def run_nvidia_smi(args: list[str], *, sleeper=None,
             )
         except subprocess.TimeoutExpired:
             code, stderr = "timeout", ""
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, OfflineGuardError) as exc:
             return None, ("missing", _nvidia_smi_snippet(str(exc)))
         except OSError as exc:
             code, stderr = "error", _nvidia_smi_snippet(str(exc))
@@ -1535,6 +1660,7 @@ def write_last_manual_state(state_dir: Path, state: int,
 def write_owned_module_option(etc: Path, state: int, floor: int) -> None:
     """modprobe options the kernel probe reads at the next load."""
     path = etc / "modprobe.d" / OWNED_MODPROBE_NAME
+    refuse_host_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "# Managed by dgx-fan-control. Do not edit.\n"
@@ -1544,8 +1670,10 @@ def write_owned_module_option(etc: Path, state: int, floor: int) -> None:
 
 
 def clear_owned_module_option(etc: Path) -> None:
+    path = etc / "modprobe.d" / OWNED_MODPROBE_NAME
+    refuse_host_write(path)
     try:
-        (etc / "modprobe.d" / OWNED_MODPROBE_NAME).unlink()
+        path.unlink()
     except OSError:
         return
 
@@ -3629,7 +3757,7 @@ def read_kernel_log() -> str:
             ["dmesg"], check=False, capture_output=True, text=True,
             timeout=CHECK_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
         return ""
     return completed.stdout or ""
 
@@ -3693,6 +3821,7 @@ def read_state(cooling_device: Path) -> int:
 def write_state(cooling_device: Path, state: int) -> None:
     if not 0 <= state <= MAX_STATE:
         raise ValueError(f"state must be between 0 and {MAX_STATE}")
+    refuse_host_write(cooling_device)
     try:
         (cooling_device / "cur_state").write_text(f"{state}\n", encoding="ascii")
     except OSError as exc:
@@ -3894,6 +4023,7 @@ def acpi_fan_result_line(device: Path) -> str:
 def write_acpi_fan_level(device: Path, level: int) -> None:
     if not ACPI_MIN_LEVEL <= level <= ACPI_MAX_LEVEL:
         raise ValueError("ACPI levels must be 35 through 100; never write 0")
+    refuse_host_write(device)
     with acpi_write_lock():
         maximum = int((device / "max_state").read_text(encoding="ascii").strip())
         if level > maximum:
@@ -4024,10 +4154,13 @@ def classify_ec_update_block(*, devices_text: str | None, devices_ok: bool,
 
 
 def _run_fwupd(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        argv, check=False, capture_output=True, text=True,
-        timeout=CHECK_TIMEOUT_SECONDS,
-    )
+    try:
+        return subprocess.run(
+            argv, check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except OfflineGuardError as exc:
+        raise FileNotFoundError(argv[0] if argv else "fwupd") from exc
 
 
 def read_ec_update_block(log_text: str, run=None,
@@ -4104,6 +4237,8 @@ def describe_control(kind: str, profile: str | None = None) -> str:
 
 def module_is_loaded(module: str = MODULE_NAME, module_root: Path | None = None) -> bool:
     root = module_root if module_root is not None else Path("/sys/module")
+    if module_root is None and offline_guard_active():
+        return False
     return (root / module).is_dir()
 
 
@@ -4191,6 +4326,7 @@ def _read_text(path: Path) -> str:
 
 
 def write_text_if_changed(path: Path, text: str) -> None:
+    refuse_host_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.is_file():
         try:
@@ -4602,6 +4738,8 @@ def _kill_resume_group(process) -> None:
     except (OSError, AttributeError):
         return
     try:
+        if offline_blocks_real(os.killpg):
+            raise OfflineGuardError("offline tests refuse to signal a process group")
         os.killpg(process.pid, signal.SIGKILL)
     except OSError as exc:
         LOG.error("ACPI resume hook: process-group kill failed: %s", exc)
@@ -5159,10 +5297,14 @@ class AcpiThermalGuard:
             try:
                 # pidfds pin a process, preventing a PID-reuse race between
                 # inspection and signaling. No unsafe os.kill fallback.
+                if offline_blocks_real(os.pidfd_open):
+                    raise OfflineGuardError("offline tests refuse to signal a process")
                 fd = os.pidfd_open(pid)
                 if self.identity(pid) != expected:
                     LOG.warning("ACPI thermal: PID %s changed/protected; skipped", pid)
                     continue
+                if offline_blocks_real(signal.pidfd_send_signal):
+                    raise OfflineGuardError("offline tests refuse to signal a process")
                 signal.pidfd_send_signal(fd, sig)
                 LOG.critical("ACPI thermal: sent %s to workload PID %s", sig.name, pid)
             except (OSError, AttributeError) as exc:

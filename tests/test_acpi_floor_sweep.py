@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 import importlib.machinery
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+os.environ["DGX_FAN_CONTROL_OFFLINE"] = "1"
 
 ROOT = Path(__file__).resolve().parents[1]
 _loader = importlib.machinery.SourceFileLoader(
@@ -149,6 +152,43 @@ class SweepTests(unittest.TestCase):
         (floor / "cur_state").write_text("6\n")
         self.assertFalse(sweep_mod.telemetry_only_bind(
             self.spark.thermal, self.spark.hwmon))
+
+    def test_main_and_preflight_do_not_touch_hardware_offline(self):
+        def exploded(*_args, **_kwargs):
+            raise AssertionError("preflight")
+
+        with patch.object(sweep_mod, "preflight", side_effect=exploded):
+            self.assertEqual(sweep_mod.main([]), 1)
+            os.environ["DGX_FAN_HARDWARE_TEST"] = "1"
+            try:
+                self.assertEqual(sweep_mod.main([]), 1)
+            finally:
+                del os.environ["DGX_FAN_HARDWARE_TEST"]
+        self.assertEqual(self.spark.level(), 100)
+        run = sweep_mod.subprocess.run
+        bare = getattr(run, "_bare", None)
+        spy_calls = []
+
+        def spy(*args, **kwargs):
+            spy_calls.append(args)
+            raise AssertionError("systemctl")
+
+        if bare is not None:
+            run._bare = spy
+        orig_euid = sweep_mod.os.geteuid
+        sweep_mod.os.geteuid = lambda: 0
+        try:
+            problem = sweep_mod.preflight(
+                self.spark.thermal, self.spark.hwmon,
+                log_text="pinned EC 3.5.8 capabilities\n",
+            )
+        finally:
+            sweep_mod.os.geteuid = orig_euid
+            if bare is not None:
+                run._bare = bare
+        self.assertEqual(problem, "offline checks do not access hardware")
+        self.assertEqual(spy_calls, [])
+        self.assertEqual(self.spark.level(), 100)
 
 
 if __name__ == "__main__":

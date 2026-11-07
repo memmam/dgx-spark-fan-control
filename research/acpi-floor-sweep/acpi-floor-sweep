@@ -238,10 +238,14 @@ def preflight(thermal_root: Path | None = None,
     if telemetry_only_bind(thermal_root, hwmon_root):
         return TELEMETRY_ONLY_MESSAGE
     if log_text is None:
+        if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+            return "offline checks do not access hardware"
         log_text = read_kernel_log()
     if pinned_ec_name(log_text) == "EC 3.13.7":
         return ("telemetry only, nothing written; the kernel log shows "
                 "EC 3.13.7, which ignores ACPI fan levels")
+    if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+        return "offline checks do not access hardware"
     if Path(f"/sys/module/{MODULE_NAME}").exists():
         return f"unload {MODULE_NAME} first; it shares the EC floor register"
     try:
@@ -255,6 +259,20 @@ def preflight(thermal_root: Path | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+        print(
+            "acpi-floor-sweep: refusing; offline checks do not access hardware",
+            file=sys.stderr,
+        )
+        return 1
+    if os.environ.get("DGX_FAN_HARDWARE_TEST") != "1":
+        print(
+            "acpi-floor-sweep: refusing; set DGX_FAN_HARDWARE_TEST=1 to run "
+            "this hardware diagnostic. It writes ACPI fan levels 35 through "
+            "100 on EC 3.5.8 and does not restore the EC curve.",
+            file=sys.stderr,
+        )
+        return 1
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("levels", nargs="*", type=int, default=[40, 35])
     parser.add_argument("--hold", type=float, default=180.0,
