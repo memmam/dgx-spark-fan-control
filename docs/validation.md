@@ -456,9 +456,10 @@ parameters at `N`.
 | saved floor 6 reapplied after reboot | kensaki | boot | **PASS** | `applied manual floor state 6 from last-set` at 19:28:27 PST | already shown; not notifier proof |
 | shutdown reboot notifier | kensaki | boot | **UNVERIFIED** | previous-boot grep had neither success nor failure line. Not a recorded failure | a log that survives shutdown |
 | suspend | kensaki | blocked | **BLOCKED** | `systemctl suspend` refused; no sleep occurred | the NVIDIA drop-in is removed on purpose |
-| performance curve under `gpu_burn` | kensaki | supervised | **OBSERVED** | 19:57–20:04 PST. Idle state 1 at 41.9°C, then state 12 at hottest 80.4°C with `dgx_ec_fan` 9000/13500. Cooldown to state 1 at 44.8°C, then stop to state 0 at 42.7°C. The 70°C hottest bound was exceeded. Not a bounded pass and not a module failure. No kernel log. Do not repeat this ramp | source change, or a new bound with a different goal |
-| fixed state 12, idle, service stopped | kensaki | not run | **NOT RUN** | the curve ramp above is not this row. `set-state 12` while the performance service is running is not this row | one idle soak with the service stopped |
-| natural mailbox timeout on 0.1.7 | either | not run | **UNOBSERVED** | do not induce one | one appears in ordinary use |
+| performance curve under `gpu_burn` | kensaki | supervised | **OBSERVED** | 19:57–20:04 PST. Idle state 1 at 41.9°C, then state 12 at hottest 80.4°C with `dgx_ec_fan` 9000/13500. Cooldown to state 1 at 44.8°C, then stop to state 0 at 42.7°C. The 70°C hottest bound was exceeded. Not a bounded pass and not a module failure. A later kernel excerpt shows the ending write at 04:04:48 UTC, state 0 floor `0xffff`. Do not repeat this ramp | source change, or a new bound with a different goal |
+| fixed state 12, idle, service stopped | kensaki | supervised | **OBSERVED** | 20:10–20:12 PST. Service inactive, `set-state 12` at 43.5°C, last-set 12. After 60s, state 12, hottest 38.8°C, both fan paths 9000/13500. Not a load | source or regression |
+| fixed state 12 under `gpu_burn` | kensaki | supervised | **INTERRUPTED** | 20:17 PST start from 36.8°C. About 20:20–20:23, GPU 71–73°C and hottest 80–83°C. Mailbox timeout at 20:22 UTC-equivalent. Not an equilibrium and not a bounded pass. Burn exit and later RPM not confirmed | do not repeat while the mailbox is unrecovered |
+| natural mailbox timeout on 0.1.7 | kensaki EC 3.5.8 | live | **OBSERVED** | 04:22:13–04:23:07 UTC. Last floor write 04:10:28 UTC state 12 `0x34bc`. Then op `0x7` completion `-110`, and later op `0x7`/`0x4` preflights refused with no floor read. Recovery not established. Not induced | do not induce another. A later boot that actually recovers is different evidence |
 | foreign floor `0x10fe` | kensaki | earlier live | **PASS** refuse | module did not clear it; reboot cleared it. Date not recorded | source or regression |
 | state 6 then `automatic` | kensaki | earlier live | **PASS** | returned to the EC curve. Date not recorded | source or regression |
 | unload while owning state 6 | kensaki | earlier live | **PASS** | restore and the next probe were clean. Date not recorded | source or regression |
@@ -557,8 +558,11 @@ state 1, hottest 44.8°C, watchdog active, manual floor none. At 20:04
 `nvidia-smi --query-compute-apps` was empty. `systemctl stop` returned
 without an error. Status was state 0, manual floor none, 42.7°C, watchdog
 active and enabled, and `dgx-fan-manual.service` was enabled. The
-performance service's final `is-active` line was not supplied. No kernel
-log was captured, so a mailbox timeout is not ruled in or out.
+performance service's final `is-active` line was not supplied. A kernel
+excerpt exported later shows curve writes from 03:59:07 through 04:04:48
+UTC ending at state 0, floor `0xffff`. That excerpt does not show a
+`-110` in that earlier window. The timeout further down is the next
+section, not this ramp.
 
 State 12 at 80.4°C and 9000/13500 RPM is the top of this curve, and the
 fall to state 1 at 44.8°C is the idle point below 50°C. Stop returned
@@ -566,6 +570,80 @@ state 0. That behavior is supported. The run is not a bounded pass,
 because the hottest zone went past the 70°C stop. It is not a module
 failure. The older stock-curve and ACPI-hold `gpu_burn` notes are a
 different record. Do not repeat this ramp.
+
+### 6 Nov 2026, 20:10–20:25 PST fixed floor and natural timeout
+
+Checkout `5e7cf1f`. Module 0.1.7. Kensaki, EC 3.5.8. Parameters stayed
+`N`/`N`. No ACPI write and no `automatic_floor_recovery`. Atarime was
+left unchanged. The two Sparks were joined top to top with a thermal pad.
+NVIDIA Sync read Kensaki 38 and Atarime 42. That coupling is context for
+the low idle zones below. It is not a second test.
+
+Kernel lines in this section are UTC on 7 Nov 2026. PST is eight hours
+earlier. The burn process and the fan speed after 20:23 PST were not
+confirmed. Do not fill those in.
+
+At 20:10 PST the performance service was inactive, `MANUAL_STATE` was
+unset, and both ACPI hold and incident files were absent. `set-state 12`
+succeeded: hottest 43.5°C, `manual-floor: 12 (last-set)`, watchdog
+active. The kernel line at 04:10:28 UTC is `cooling state=12 lower floor=0x34bc`.
+At 20:12 PST, after 60 seconds with no job, status was state 12, hottest
+38.8°C. Both `dgx_ec_fan` and `acpi_fan` read 9000/13500 RPM. Other zones
+were 36–38.8°C. That is the idle fixed-floor observation. It is not a load.
+
+At 20:17 PST the zone was steady at 36.8°C and the operator started
+foreground `~/gpu-burn/gpu_burn 600`. Around 20:20 PST the GPU reading was
+71°C and the hottest zone was 80°C and rising. The 70°C hottest stop was
+already past. Around 20:23 PST the operator reported the GPU holding about
+71–73°C and the hottest zone about 81–83°C, and that the mailbox had
+died. The burn was to be interrupted and the status/sensors watch stopped.
+Neither the burn's exit nor a later fan reading was supplied. That hold
+is not a sustained equilibrium. No thermal policy was changed. The
+published 90°C to 98°C spike and the 104.8°C power-loss report stay
+background. They were not a trip point edited in this session.
+
+The supplied kernel excerpt, same export, also contains earlier lines that
+are not this failure. From 03:59:07 through 04:04:48 UTC the performance
+curve wrote floors, ending at state 0, floor `0xffff`. That is the
+20:04 PST stop of the curve run above. At 04:06:09 UTC, operation `0x7`
+preflight failed `-16` (`-EBUSY`) twice, and the original request was not
+submitted. That was before `set-state 12`. The mailbox then accepted the
+04:10:28 UTC floor write, so those two busy preflights were not this wedge.
+
+From 04:22:13 UTC the wedge is operation `0x7`, which is
+`DGX_EC_FAN_GET_TELEMETRY`. Transaction 3560 is phase `completion`, state
+`0x2`, 100 polls, `-110`, with `timeout left as -110; not submitting a
+floor read (profile=EC 3.5.8)`. Transaction 3561 at 04:22:14 UTC is the
+same operation in phase `preflight`, again `-110`, and
+`operation=0x7 preflight failed: -110; original request not submitted`.
+Transaction 3562 at 04:22:18 UTC is operation `0x4`,
+`DGX_EC_FAN_GET_LOWER_LIMIT`, phase `preflight` only, same `-110`, original
+not submitted. Repeats of `0x7` and `0x4` continue through 04:23:07 UTC,
+transaction 3587, all phase `preflight`, state `0x2`, no floor read. No
+recovery line is in the excerpt. No floor write appears after 04:10:28 UTC.
+
+Operation `0x7` is the hwmon telemetry read (`dgx_ec_fan` `fan*_input`).
+Operation `0x4` is the cooling-device floor read (`cur_state`). Operation
+`0x5` is the floor write and does not appear after the state 12 line.
+With `automatic_floor_recovery` off, a failed `0x7` does not submit
+`0x4`. The following `0x4` preflights are separate callers. The status
+and `sensors` watch is one such pair: `status` reads `cur_state`, and
+`sensors` reads `dgx_ec_fan`. The excerpt does not name the process, so a
+thermal-core poll of the cooling device is not ruled out. Each caller
+still runs the 100-poll preflight. The driver does not latch a dead
+mailbox and skip that poll. It refuses the original command. That is why
+the log keeps moving through new transaction numbers without a floor read
+and without a recovery.
+
+The last confirmed floor write remains `0x34bc` at 04:10:28 UTC. The
+excerpt cannot show that the tachometers stayed at 9000/13500, or whether
+the pending command was caused by temperature, the burn, or the telemetry
+polling. `sync_send_receive2` has no host timeout. These lines show the
+poll loop returning `-110`. They do not show a call that never returned.
+Recovery was not demonstrated. Do not set `automatic_floor_recovery`. Do
+not write ACPI. Do not run `automatic`, `status`, `sensors`, or an unload
+to probe it. The watchdog reads `acpi_fan`, not this mailbox, and was
+left running.
 
 ### Earlier 0.1.7 observations
 
@@ -590,14 +668,12 @@ kept and was not applied.
 These are the open hardware rows. This list is not a request to run them
 from this commit.
 
-- Fixed state 12 while idle, with the performance service stopped.
-  The 19:57–20:04 curve ramp already reached state 12 under load and is
-  not repeated. A later burn on that fixed floor is a separate comparison
-  and is not part of the idle soak. Older stock-curve and ACPI-hold
-  `gpu_burn` notes are not either row.
-- A natural mailbox timeout on 0.1.7, only if ordinary use produces one.
-  Do not induce it. The open question is still a log line that a floor read
-  was not submitted, and that the next read is not operation `0x04`.
+- Recovery from the 20:22 PST Kensaki mailbox timeout. The timeout itself
+  is observed. Do not induce another. Do not claim the fans, the burn
+  exit, or a restored mailbox from the excerpt alone.
+- The fixed-12 burn was interrupted in the low 80s hottest and is not an
+  equilibrium measurement. The idle state-12 soak is already recorded.
+  Do not repeat either while this mailbox is unrecovered.
 - The reboot notifier, only if a future shutdown can retain the kernel log.
   Repeating saved state 6 without that capture will not resolve it.
 - Suspend, only if `AllowSuspend=no` is no longer required. Do not remove
