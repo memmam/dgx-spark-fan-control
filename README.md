@@ -17,8 +17,10 @@
 > An incident stays latched across reboot until explicit manual reset.
 > Read [escalation, recovery, configuration, and safeguards](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
 > The burn view's GPU temperature can read about 10 C below the hottest
-> zone. `acpi-floor-sweep --max-temp` defaults to 60 C; supervised burns
-> must raise it (for example `--max-temp 95`), without bypassing escalation.
+> zone. The checkout diagnostic `extras/acpi-floor-sweep` is not installed
+> by `scripts/install-userland`. Its `--max-temp` defaults to 60 C;
+> supervised burns must raise it (for example `--max-temp 95`), without
+> bypassing escalation. Finishing at level 100 does not restore the EC curve.
 > The 85 C true-zero fan poweroff remains separate and unchanged.
 
 

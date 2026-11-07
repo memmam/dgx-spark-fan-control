@@ -143,21 +143,24 @@ measurements (about 1940 RPM, with level 20 stalling one fan). Level 35 is
 the lowest level measured to hold here: on EC 3.5.8 at idle, with the module
 unloaded, a 30-minute hold at 35 kept the fans at 2070/2025 RPM, and the
 hottest zone peaked at 53.7 C and settled at 52.8 C. In an earlier run at 35,
-fan1 read 2160, one EC step higher. To measure it on your own machine, run
-`scripts/acpi-floor-sweep` as root on EC 3.5.8, at idle, with the module
-unloaded and `dgx-fan-control.service` stopped:
+fan1 read 2160, one EC step higher. The checkout diagnostic
+`extras/acpi-floor-sweep` can repeat that idle measurement. It is not
+installed by `scripts/install-userland`. Run it as root on EC 3.5.8, at
+idle, with the module unloaded and `dgx-fan-control.service` stopped:
 
 ```
 sudo systemctl stop dgx-fan-control.service
 sudo modprobe -r dgx_ec_fan_control
 sudo systemctl start dgx-fan-watchdog.service
-sudo scripts/acpi-floor-sweep 40 35
+sudo extras/acpi-floor-sweep 40 35
 ```
 
 It holds each level for 180 seconds and logs both fans and the hottest zone
 every second to a CSV. It writes level 100 at once if a fan reads 0 or is
 missing, a fan drops below 1000 RPM, the hottest zone reaches 60 C, or the run
-is interrupted, and it always writes 100 when it finishes. It never writes a
+is interrupted, and it also writes 100 when it finishes. Level 100 is still
+an ACPI hold. A clean exit does not restore the EC curve; reboot does, the
+same as any other ACPI write from this project. It never writes a
 level below 35, the lowest level to use. EC 3.13.7 ignores ACPI fan levels, so the script refuses
 before any write when `dgx_ec_fan` is present without `dgx_ec_fan_floor`, or
 when this boot's kernel log shows the module pinned EC 3.13.7. The shared
@@ -185,7 +188,7 @@ about **10 C below the hottest thermal zone**.
 
 The independent `dgx-fan-watchdog.service` now monitors this project's ACPI
 holds even after the writing command exits. Both `acpi-max` (including
-stall repair) and `scripts/acpi-floor-sweep` arm a boot-scoped hold record
+stall repair) and `extras/acpi-floor-sweep` arm a boot-scoped hold record
 **before** writing. They refuse without an active watchdog, with invalid
 thermal configuration, or without positive EC 3.5.8 identification from the
 kernel's pinned version or the EC's ESRT GUID/version. EC 3.13.7 remains
@@ -511,10 +514,10 @@ file blocks later ACPI writes from this project. It does not block a
 workload manager from starting work again under the restored EC curve. The
 file is retried until this boot's copy has been synced to disk.
 
-`acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
+`extras/acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
 must explicitly raise it, for example `--max-temp 95`; that changes only
 the sweep abort, **not** the thermal escalation thresholds. The sweep's
-exit/abort writes 100; it neither stops the burn nor restores automatic
-control. Raising `--max-temp` is not permission to hold ACPI under full load.
+exit or abort writes level 100, which is still an ACPI hold until reboot.
+It does not stop the burn, and it does not restore the EC curve. Raising `--max-temp` is not permission to hold ACPI under full load.
 The 80/85/90 C load-stop defaults intentionally interrupt such a burn.
 The 70 C line does not.

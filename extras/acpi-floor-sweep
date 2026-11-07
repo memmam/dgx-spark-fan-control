@@ -13,9 +13,13 @@ Steps every ACPI Fan cooling device through the given levels (default
 40 35), holds each one, and logs every fan tachometer plus the hottest
 thermal zone each interval. It stops and writes level 100 at once if any fan
 reads 0 or is missing, a fan falls below --min-rpm, the hottest zone reaches
---max-temp, or the run is interrupted. It always writes level 100 when it
-finishes. It never writes a level below 35 or writes 0. The independent
+--max-temp, or the run is interrupted. It also writes 100 when it finishes.
+Level 100 is still an ACPI hold: it does not restore the EC curve. Any ACPI
+write from this project, including a clean exit, stays in effect until
+reboot. It never writes a level below 35 or writes 0. The independent
 watchdog must be running; protection continues after this script exits.
+This file is a checkout diagnostic. scripts/install-userland does not
+install it.
 """
 from __future__ import annotations
 
