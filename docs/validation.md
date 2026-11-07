@@ -458,8 +458,9 @@ parameters at `N`.
 | suspend | kensaki | blocked | **BLOCKED** | `systemctl suspend` refused; no sleep occurred | the NVIDIA drop-in is removed on purpose |
 | performance curve under `gpu_burn` | kensaki | supervised | **OBSERVED** | 19:57–20:04 PST. Idle state 1 at 41.9°C, then state 12 at hottest 80.4°C with `dgx_ec_fan` 9000/13500. Cooldown to state 1 at 44.8°C, then stop to state 0 at 42.7°C. The 70°C hottest bound was exceeded. Not a bounded pass and not a module failure. A later kernel excerpt shows the ending write at 04:04:48 UTC, state 0 floor `0xffff`. Do not repeat this ramp | source change, or a new bound with a different goal |
 | fixed state 12, idle, service stopped | kensaki | supervised | **OBSERVED** | 20:10–20:12 PST. Service inactive, `set-state 12` at 43.5°C, last-set 12. After 60s, state 12, hottest 38.8°C, both fan paths 9000/13500. Not a load | source or regression |
-| fixed state 12 under `gpu_burn` | kensaki | supervised | **INTERRUPTED** | 20:17 PST start from 36.8°C. About 20:20–20:23, GPU 71–73°C and hottest 80–83°C. Mailbox timeout at 20:22 UTC-equivalent. Not an equilibrium and not a bounded pass. Burn exit and later RPM not confirmed | do not repeat while the mailbox is unrecovered |
-| natural mailbox timeout on 0.1.7 | kensaki EC 3.5.8 | live | **OBSERVED** | 04:22:13–04:23:07 UTC. Last floor write 04:10:28 UTC state 12 `0x34bc`. Then op `0x7` completion `-110`, and later op `0x7`/`0x4` preflights refused with no floor read. Recovery not established. Not induced | do not induce another. A later boot that actually recovers is different evidence |
+| fixed state 12 under `gpu_burn` | kensaki | supervised | **INTERRUPTED** | 20:17 PST start from 36.8°C. About 20:20–20:23, GPU 71–73°C and hottest 80–83°C. Mailbox timeout during the run. 20:27 PST burn and watch confirmed stopped. Not an equilibrium and not a bounded pass | do not repeat it as an equilibrium measurement |
+| natural mailbox timeout on 0.1.7 | kensaki EC 3.5.8 | live | **OBSERVED** | 04:22:13–04:23:07 UTC. Last floor write 04:10:28 UTC state 12 `0x34bc`. Then op `0x7` completion `-110`, and later op `0x7`/`0x4` preflights refused with no floor read. Not induced. In-session recovery was not shown. The next row is a later boot | do not induce another |
+| power-off and next boot after that timeout | kensaki | supervised | **OBSERVED** | 20:30 PST `acpi_fan` still 9000/13500 and zones 33.9–36.8°C, no GPU job. Not a mailbox recovery. 20:36 PST boot reported. 04:35:54 UTC probe registered the cooling device in automatic state, baseline 2610/3915. Status state 0, manual none, 42.8°C. Shutdown notifier not captured. Cause unresolved | do not treat this as in-session recovery |
 | foreign floor `0x10fe` | kensaki | earlier live | **PASS** refuse | module did not clear it; reboot cleared it. Date not recorded | source or regression |
 | state 6 then `automatic` | kensaki | earlier live | **PASS** | returned to the EC curve. Date not recorded | source or regression |
 | unload while owning state 6 | kensaki | earlier live | **PASS** | restore and the next probe were clean. Date not recorded | source or regression |
@@ -580,8 +581,7 @@ NVIDIA Sync read Kensaki 38 and Atarime 42. That coupling is context for
 the low idle zones below. It is not a second test.
 
 Kernel lines in this section are UTC on 7 Nov 2026. PST is eight hours
-earlier. The burn process and the fan speed after 20:23 PST were not
-confirmed. Do not fill those in.
+earlier.
 
 At 20:10 PST the performance service was inactive, `MANUAL_STATE` was
 unset, and both ACPI hold and incident files were absent. `set-state 12`
@@ -597,10 +597,12 @@ foreground `~/gpu-burn/gpu_burn 600`. Around 20:20 PST the GPU reading was
 already past. Around 20:23 PST the operator reported the GPU holding about
 71–73°C and the hottest zone about 81–83°C, and that the mailbox had
 died. The burn was to be interrupted and the status/sensors watch stopped.
-Neither the burn's exit nor a later fan reading was supplied. That hold
-is not a sustained equilibrium. No thermal policy was changed. The
+That hold is not a sustained equilibrium. No thermal policy was changed. The
 published 90°C to 98°C spike and the 104.8°C power-loss report stay
 background. They were not a trip point edited in this session.
+
+The burn exit and the fan speed after 20:23 PST are in the next section.
+They were not in this excerpt.
 
 The supplied kernel excerpt, same export, also contains earlier lines that
 are not this failure. From 03:59:07 through 04:04:48 UTC the performance
@@ -640,10 +642,50 @@ excerpt cannot show that the tachometers stayed at 9000/13500, or whether
 the pending command was caused by temperature, the burn, or the telemetry
 polling. `sync_send_receive2` has no host timeout. These lines show the
 poll loop returning `-110`. They do not show a call that never returned.
-Recovery was not demonstrated. Do not set `automatic_floor_recovery`. Do
-not write ACPI. Do not run `automatic`, `status`, `sensors`, or an unload
-to probe it. The watchdog reads `acpi_fan`, not this mailbox, and was
-left running.
+In-session recovery was not demonstrated. The watchdog reads `acpi_fan`,
+not this mailbox, and was left running.
+
+### 6 Nov 2026, 20:26–20:36 PST after the timeout
+
+Same host, module, and checkout. No new workload. Parameters stayed
+`N`/`N`. No ACPI write and no `automatic_floor_recovery`.
+
+At 20:26 PST the fans were still audible. At 20:27 PST the operator
+confirmed that `gpu_burn` and the status/sensors watch had stopped. At
+20:30 PST one non-packet reading: `nvidia-smi --query-compute-apps` was
+empty; `acpi_fan` was `hwmon0` `fan1=9000` and `hwmon1` `fan1=13500`;
+thermal zones 0 through 6 read 36800, 34000, 34800, 33900, 34800, 36800,
+and 35800 millidegrees C (36.8, 34.0, 34.8, 33.9, 34.8, 36.8, and 35.8°C).
+The floor speeds were still present on the ACPI tachometers, and the zones
+were at idle. That confirms retention after the timeout. It does not read
+the packet mailbox and is not a mailbox recovery.
+
+At 20:31 PST the operator was given `systemctl disable` of
+`dgx-fan-manual.service`, removal of
+`/var/lib/dgx-fan-control/manual-state` and
+`/etc/modprobe.d/dgx-fan-control-owned.conf`, then `systemctl poweroff`,
+and then power back on. At 20:36 PST the operator reported that it had
+booted. No shutdown terminal output was supplied. Nothing says whether
+poweroff completed on its own or needed a physical cut, or whether it
+hung. Those method details are not verified.
+
+On the new boot the performance service was inactive, the manual unit was
+disabled, and the watchdog was active. The kernel at 04:35:54 UTC
+(20:35:54 PST) logged the packet service at partition `0x8003`, properties
+`0x109`, FF-A 1.2, pinned EC 3.5.8 capabilities, baseline `fan1=2610`
+`fan2=3915` RPM, `automatic fan policy active for module load`, and
+`additive fan-floor cooling device registered in automatic state`. The
+previous boot's shutdown notifier line was not captured, so this does not
+show that the notifier succeeded. Status was then state 0, manual floor
+none, 42.8°C, watchdog active and enabled. `systemctl enable` of the
+manual unit created
+`/etc/systemd/system/multi-user.target.wants/dgx-fan-manual.service`,
+pointing at `/etc/systemd/system/dgx-fan-manual.service`. The performance
+service was not started.
+
+Firmware communication and automatic status worked after that power-off
+and boot. That is not recovery inside the timed-out session. The cause of
+the timeout is unresolved. No further load was run.
 
 ### Earlier 0.1.7 observations
 
@@ -668,12 +710,13 @@ kept and was not applied.
 These are the open hardware rows. This list is not a request to run them
 from this commit.
 
-- Recovery from the 20:22 PST Kensaki mailbox timeout. The timeout itself
-  is observed. Do not induce another. Do not claim the fans, the burn
-  exit, or a restored mailbox from the excerpt alone.
+- The 20:22 PST Kensaki mailbox timeout is observed, and the next boot's
+  probe completed. In-session recovery was not shown. The shutdown
+  notifier for that power-off was not captured. The cause is unresolved.
+  Do not induce another timeout.
 - The fixed-12 burn was interrupted in the low 80s hottest and is not an
-  equilibrium measurement. The idle state-12 soak is already recorded.
-  Do not repeat either while this mailbox is unrecovered.
+  equilibrium measurement. The idle state-12 soak and the post-timeout
+  tachometer reading are already recorded.
 - The reboot notifier, only if a future shutdown can retain the kernel log.
   Repeating saved state 6 without that capture will not resolve it.
 - Suspend, only if `AllowSuspend=no` is no longer required. Do not remove
