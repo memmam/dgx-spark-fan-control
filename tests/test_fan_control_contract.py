@@ -153,6 +153,50 @@ def kernel_source_digest() -> str:
 
 
 class UserlandPolicyTests(unittest.TestCase):
+    def test_daemon_curves_match_the_early_policy(self):
+        """Lock the tables the 6 Nov decision adopted.
+
+        Default breakpoints are the September table. a594c98 adds the
+        state-1 pin and leaves 50/55/60/65/70 mapped to 3/5/8/10/12.
+        Quiet is patch/0001-performance-curve.patch as copied at 012f671,
+        not those temperatures plus 7 °C. Poll, filter, and step limits
+        are the same early daemon constants. They are not ACPI level edges.
+        """
+        self.assertEqual(CONTROL.PERFORMANCE_CURVE, (
+            (0.0, 1),
+            (50.0, 3),
+            (55.0, 5),
+            (60.0, 8),
+            (65.0, 10),
+            (70.0, 12),
+        ))
+        self.assertEqual(CONTROL.QUIET_CURVE, (
+            (0.0, 1),
+            (52.0, 2),
+            (57.0, 3),
+            (62.0, 4),
+            (66.0, 5),
+            (70.0, 6),
+            (73.0, 8),
+            (76.0, 10),
+            (78.0, 12),
+        ))
+        default_steps = [temperature for temperature, _state in CONTROL.PERFORMANCE_CURVE if temperature]
+        quiet_steps = [temperature for temperature, _state in CONTROL.QUIET_CURVE if temperature]
+        self.assertNotEqual([temperature + 7.0 for temperature in default_steps], quiet_steps)
+        self.assertEqual(CONTROL.curve_state(49.9), 1)
+        self.assertEqual(CONTROL.curve_state(50.0), 3)
+        self.assertEqual(CONTROL.curve_state(55.0), 5)
+        self.assertEqual(CONTROL.curve_state(65.0), 10)
+        self.assertEqual(CONTROL.curve_state(70.0), 12)
+        self.assertEqual(CONTROL.curve_state(51.9, CONTROL.QUIET_CURVE), 1)
+        self.assertEqual(CONTROL.curve_state(78.0, CONTROL.QUIET_CURVE), 12)
+        self.assertEqual(CONTROL.POLL_SECONDS, 2.0)
+        self.assertEqual(CONTROL.FILTER_ALPHA, 0.35)
+        self.assertEqual(CONTROL.DOWN_HYSTERESIS_C, 4.0)
+        self.assertEqual(CONTROL.UP_STATES_PER_POLL, 2)
+        self.assertEqual(CONTROL.DOWN_STATES_PER_POLL, 1)
+
     def test_performance_curve_reaches_maximum_at_seventy(self):
         self.assertEqual(CONTROL.curve_state(0.1), 1)
         self.assertEqual(CONTROL.curve_state(49.9), 1)

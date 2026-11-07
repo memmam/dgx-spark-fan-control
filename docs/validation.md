@@ -7,6 +7,83 @@ the relevant source changed, a regression is being checked, or a defined
 new observation is available. Older sections below are provenance for
 earlier versions. They are not a second to-do list.
 
+## Software curve baseline
+
+The daemon curve is temperature to cooling state. It is a separate record
+from the stock EC duty steps and from the Kensaki ACPI level samples below.
+The tuples were already in the tree. This section says which early commits
+they come from, and which chat lines adopted them. The evening checkout did
+not choose a different table: the tuples are the same from `012f671` through
+`db0e19a`.
+
+The default breakpoints are the September table. `a594c98` (2026-11-05 23:30 UTC)
+adds the state-1 pin and leaves the rest: 50 °C → 3, 55 → 5, 60 → 8, 65 → 10,
+70 → 12. Below 50 °C the daemon stays at state 1. The user kept that pin
+because a 0 RPM clamp has latched, and later kept this default when quiet
+was added. Quiet is opt-in (`--curve quiet` or `DGX_FAN_CURVE=quiet`). The
+user agreed with that split ("Sounds good."). `012f671` copies
+`tenhkspark/dgx-spark-fan-tuning` `patch/0001-performance-curve.patch`:
+0 °C → 1, 52 → 2, 57 → 3, 62 → 4, 66 → 5, 70 → 6, 73 → 8, 76 → 10, 78 → 12.
+That patch is the measured upstream table. It is a different shape from
+adding 7 °C to 50/55/60/65/70. The chat export does not contain the patch
+body; the patch file and `012f671` do, and they match.
+
+The early daemon still smooths with a 2-second poll, filter alpha 0.35,
+4 °C of downward hysteresis, two states up per poll, and one state down.
+Those constants are in the code from before the quiet commit. The chat
+export does not restate them. ACPI level edges are not a source for them.
+
+EC 3.13.7 floor words follow `2000 + (4350 - 2000) * (state - 1) / 11`,
+state 1 at 2000 and state 12 at 4350. That formula is the one in the
+profile handoff the user returned. `allow_unverified_writes` stays off, and
+that firmware remains telemetry-only. The formula is a floor-word sequence,
+not a tachometer map. On EC 3.5.8
+the state-1 floor word is 2700. Idle stock tachometers of 2700/4050 are
+state 0, the unset curve.
+
+### ACPI samples on Kensaki, EC 3.5.8
+
+Module and service were stopped for these sweeps. Level 100 read 4320/4320.
+That is not 9000/13500. The user set the operational floor at 35: "We
+inherited 30, you bumped to 40, we tested and agreed on 35." Userspace
+refuses a level below 35. The kernel probe string still says below 30.
+Changing that string is a module rebuild and is not part of this baseline.
+
+The 35 hold, 11:30:56–12:00:59 PST, started and ended at 2160/2025. The
+visible ends of that log are 42.8 °C and about 50.5 °C. An in-run note of
+about 44.7 °C is the assistant's, during the hold. The middle of the user
+log is truncated. A later descent through 35 read 2070/2025. Both samples
+stay in the record. They are not one number.
+
+Direct user readings after that hold: level 80 dropped to 3780/3780, and
+52 → 51 dropped fan1 from 2790 to 2610. Fan1 at 2700 was not in the tested
+levels. The user first read the top edge as 87 → 86, then accepted the
+corrected log: fan2 holds 4050 through 88 and drops at 87; fan1 holds 4050
+through 86 and drops at 85. The search stopped there ("Nope, we found what
+we were looking for."). Levels 78–80 of that last pass were not run. At
+level 81, fan1 read 0 while fan2 read 3780; the sweep restored 100, and
+five following samples were 4320/4320. Calling that zero a tach glitch is
+an assistant hypothesis.
+
+Coarse levels 40, 45, 50, 55, 60, 70, 80, 90, and 100, and the ascending
+51–54 and 91–95 pins, are assistant summaries of truncated logs. Use them
+as summaries. The assistant's later model of one shared RPM target, a
+percent grid, and ACPI hysteresis is labeled in that chat as a fit, not a
+confirmed mechanism.
+
+These samples are not a request to sweep again.
+
+### Left unchanged
+
+`automatic_floor_recovery` and `allow_unverified_writes` stay off. A
+mailbox timeout stays that timeout. There is no fault latch: a later
+`-EBUSY` on 6 Nov was followed by a successful floor write, and a latch
+would also have to decide whether a reboot notifier may still clear an
+owned floor. That choice is not made here. The 70/80/85/90 ladder and the
+separate true-zero 85 °C poweroff are unchanged. Suspend stays blocked by
+`nvidia-no-systemd-suspend`. The ledger's PASS and BLOCKED rows stay as
+they are.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
