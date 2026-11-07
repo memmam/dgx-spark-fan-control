@@ -271,8 +271,24 @@ at 90 C, and that poll does not wait out the lower stages.
 
    SIGKILL and the 10-second SIGTERM grace are workload escalation. They
    are not poweroff. If the stop cannot be verified, poweroff still waits
-   for the same **15 seconds at or above 90 C**. Five seconds after SIGKILL
-   at 86 C does not power off.
+   for the same **15 seconds at or above 90 C**, counted from SIGKILL, not
+   from an earlier watch. Five seconds after SIGKILL at 86 C does not power
+   off. A failed recovery reboot drops that SIGKILL clock and starts a new
+   15 seconds. The failure poll itself does not power off.
+
+   Two clocks are separate. `since` is how long the current workload stage
+   has run: the hook grace, the SIGTERM grace, or the time since SIGKILL.
+   `ceiling_since` is only the poweroff observation. It is kept for an
+   EC-only watch after a confirmed stop, for an unverified SIGKILL, and for
+   the wait after a failed reboot. Entering any of those starts it over. A
+   measured zone below 90 C clears it, including a zone below 80 C while a
+   new process is present or `nvidia-smi` did not answer. An EC-only sample
+   with no readable zone clears it and does not count as heat. A poll that
+   this policy skips, including the true-zero handoff, clears it so the gap
+   is not added to the 15 seconds. Phase 1 is different on purpose: an
+   unreadable zone there is treated as 90 C and can continue the clock.
+   That fail-closed path is not used in the EC-only phase, which does not
+   write ACPI and does not power off on the unreadable sample.
 
    These intervals were not timed on hardware and they are not a claim
    about when a machine will cut power. An unreadable zone in this phase
@@ -443,7 +459,7 @@ explicitly when customizing. Missing keys use these defaults:
 | `ACPI_THERMAL_SHUTDOWN_C` | `90` | Thermal poweroff threshold. The zone must stay at or above this. Below it, this path does not power off |
 | `ACPI_THERMAL_HOOK_SECONDS` | `10` | Grace for a hook that actually started, then SIGTERM. Not a poweroff timer |
 | `ACPI_THERMAL_TERM_SECONDS` | `10` | SIGTERM grace before SIGKILL. Not a poweroff timer |
-| `ACPI_THERMAL_KILL_SECONDS` | `5` | Accepted and validated. It does not power off and it does not delay SIGKILL |
+| `ACPI_THERMAL_KILL_SECONDS` | deprecated | If an old file sets it, the value is checked, a warning is logged, and the value is ignored. Absent from the shipped defaults. It does not delay SIGKILL or poweroff |
 | `ACPI_THERMAL_SHUTDOWN_SECONDS` | `15` | How long the zone must stay at or above `SHUTDOWN_C` before poweroff. One sample is not enough |
 | `ACPI_THERMAL_HYSTERESIS_C` | `2` | Clears the advisory below 68 C. Hook cooling is adequate below 83 C. Manual reset requires a zone below 78 C. Not a reboot delay |
 | `ACPI_THERMAL_SHUTDOWN` | `yes` | Only explicit `no` disables this shutdown stage, not true-zero poweroff or the recovery reboot |

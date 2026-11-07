@@ -4761,10 +4761,20 @@ class AcpiThermalGuard:
         self.shutdown_c = self.number("ACPI_THERMAL_SHUTDOWN_C", 90)
         self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
         self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
-        # Validated so a bad value still refuses the config. It does not
-        # power the machine off. SIGKILL uses KILL_C and TERM_SECONDS.
-        self.kill_s = self.number("ACPI_THERMAL_KILL_SECONDS", 5)
         self.shutdown_s = self.number("ACPI_THERMAL_SHUTDOWN_SECONDS", 15)
+        legacy_kill = defaults.get("ACPI_THERMAL_KILL_SECONDS")
+        if legacy_kill is not None and str(legacy_kill).strip() != "":
+            # Reject a bad value, then ignore it. SIGKILL timing is KILL_C
+            # and TERM_SECONDS. Poweroff timing is SHUTDOWN_SECONDS.
+            self.number("ACPI_THERMAL_KILL_SECONDS", 5)
+            LOG.warning(
+                "ACPI_THERMAL_KILL_SECONDS=%s is deprecated and ignored; "
+                "it does not delay SIGKILL or poweroff. SIGKILL is at "
+                "KILL_C or after ACPI_THERMAL_TERM_SECONDS. Poweroff waits "
+                "ACPI_THERMAL_SHUTDOWN_SECONDS at or above "
+                "ACPI_THERMAL_SHUTDOWN_C",
+                legacy_kill,
+            )
         # ACPI_THERMAL_COOL_SECONDS is ignored. Recovery does not wait for a
         # temperature hold; a confirmed stop reboots on the verifying poll.
         self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
@@ -4945,10 +4955,22 @@ class AcpiThermalGuard:
         except Exception as exc:
             LOG.error("ACPI thermal advisory was not published: %s", exc)
 
+    def clear_poweroff_clock(self) -> None:
+        """Drop the poweroff observation. It does not change since."""
+        self.ceiling_since = None
+
     def ceiling_held(self, hot, now) -> bool:
-        """True only after the zone has stayed at or above the ceiling."""
+        """True only after continuous measured heat at or above the ceiling.
+
+        since is the workload-stage clock (hook, SIGTERM, SIGKILL, watch).
+        ceiling_since belongs only to ec-watch, kill, and reboot-wait.
+        A caller clears it when that stage begins, when a measured sample
+        is below the ceiling, when an EC sample is unreadable, and when a
+        poll is skipped. Phase 1 does not clear it for an unreadable zone:
+        that sample is treated as the ceiling and can continue the clock.
+        """
         if hot < self.shutdown_c:
-            self.ceiling_since = None
+            self.clear_poweroff_clock()
             return False
         if self.ceiling_since is None:
             self.ceiling_since = now
@@ -5164,22 +5186,37 @@ class AcpiThermalGuard:
             # An accepted recovery reboot stands. A missing sample must not
             # turn it into poweroff, and neither must residual heat.
             if self.stage == "reboot":
+                self.clear_poweroff_clock()
                 LOG.critical(
                     "ACPI thermal: hottest zone unreadable after recovery "
                     "reboot was requested; leaving the reboot in place"
                 )
                 return
             if ec_only:
+                # Not a measured sample. It breaks the poweroff clock and
+                # does not count as time at the ceiling.
+                self.clear_poweroff_clock()
                 LOG.critical(
                     "EC-only thermal phase: hottest zone unreadable; "
                     "not writing ACPI and not powering off on this sample"
                 )
                 return
-            LOG.critical("ACPI thermal: hottest zone unreadable; escalating conservatively")
+            LOG.critical(
+                "ACPI thermal: hottest zone unreadable; escalating "
+                "conservatively as %.1fC. This phase-1 sample can continue "
+                "a poweroff clock; an EC-only unreadable sample cannot",
+                self.shutdown_c,
+            )
             hot = self.shutdown_c
         else:
             # Advisory only. It must not fall through into a latch or a timer.
             self.note_advisory(hot, ec_only)
+            if hot < self.shutdown_c:
+                self.clear_poweroff_clock()
+        # The poweroff clock is owned by ec-watch, kill, and reboot-wait.
+        # Every other stage, including reboot, drops it.
+        if self.stage not in ("ec-watch", "kill", "reboot-wait"):
+            self.clear_poweroff_clock()
         if not ec_only and hot >= self.fan_c:
             # The latch is persisted BEFORE the writes. A failed/partial write
             # is retried next poll; no lower-level writer can undo escalation.
@@ -5195,6 +5232,7 @@ class AcpiThermalGuard:
                 LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; forcing level 100; EC curve remains replaced", hot, self.fan_c)
                 self.max_logged = True
         if self.stage == "reboot":
+            self.clear_poweroff_clock()
             return
         # Below 80 C the advisory is the whole policy. Do not query targets,
         # arm the incident, or start a stop-stage timer from it.
@@ -5218,15 +5256,35 @@ class AcpiThermalGuard:
             self.send(self.selected, signal.SIGTERM)
             self.stage, self.since = "term", now
 
-        if self.stage == "ec-watch":
-            if not stopped() and hot >= self.fan_c:
+        if self.stage == "reboot-wait":
+            if not stopped():
+                self.clear_poweroff_clock()
                 self.stage = "idle"
-            elif stopped():
+            else:
+                status = self.reboot()
+                if status == 0:
+                    self.clear_poweroff_clock()
+                    self.stage = "reboot"
+                elif self.ceiling_held(hot, now):
+                    self._last_resort_shutdown(
+                        hot,
+                        "recovery reboot failed and the zone stayed at or "
+                        "above %.1fC" % self.shutdown_c,
+                    )
+                return
+        if self.stage == "ec-watch":
+            if not stopped():
+                # The stop is no longer confirmed. A cool sample or a new
+                # process ends the observation, including when discovery fails.
+                self.clear_poweroff_clock()
+                if hot >= self.fan_c:
+                    self.stage = "idle"
+                else:
+                    return
+            else:
                 reason = self.post_stop_reason(hot, now)
                 if reason:
                     self._last_resort_shutdown(hot, reason)
-                return
-            else:
                 return
         if self.stage == "incident" and hot >= self.fan_c and not stopped():
             self.stage = "idle"
@@ -5328,9 +5386,10 @@ class AcpiThermalGuard:
                         "SIGKILL workload targets"
                     )
                     self.send(live, signal.SIGKILL)
+                    # since is this SIGKILL. The poweroff clock starts over;
+                    # it does not keep time from an earlier watch.
+                    self.clear_poweroff_clock()
                     self.stage, self.since = "kill", now
-                    # The target snapshot was taken before this signal. Do not
-                    # power off in this same poll; the next one can see the stop.
                     entered_kill = True
         if (ec_only and self.stage not in ("idle", "reboot", "shutdown", "ec-watch")
                 and stopped()):
@@ -5341,7 +5400,8 @@ class AcpiThermalGuard:
             )
             self.ceiling_since = None
             self.stage, self.since = "ec-watch", now
-        elif (not ec_only and self.stage not in ("idle", "reboot", "shutdown")
+        elif (not ec_only and self.stage not in (
+                "idle", "reboot", "shutdown", "reboot-wait")
                 and acpi_record_current(ACPI_INCIDENT_NAME) and stopped()):
             self.finish_hook()
             try:
@@ -5354,13 +5414,20 @@ class AcpiThermalGuard:
             )
             status = self.reboot()
             if status == 0:
+                self.clear_poweroff_clock()
                 self.stage = "reboot"
             else:
-                LOG.critical("ACPI thermal: recovery reboot failed (%s)", status)
-                if self.ceiling_held(hot, now):
-                    self._last_resort_shutdown(
-                        hot, "recovery reboot failed and the shutdown ceiling held",
-                    )
+                LOG.critical(
+                    "ACPI thermal: recovery reboot failed (%s); "
+                    "poweroff waits for a new %.0fs at or above %.1fC",
+                    status, self.shutdown_s, self.shutdown_c,
+                )
+                # Drop any SIGKILL clock. This poll can start the new one
+                # and cannot complete it.
+                self.clear_poweroff_clock()
+                self.stage = "reboot-wait"
+                self.since = now
+                self.ceiling_held(hot, now)
         elif self.stage == "kill":
             # SIGKILL already happened. Staying under the shutdown threshold
             # does not power off. The first sample at the threshold only
@@ -5396,8 +5463,10 @@ class AcpiThermalGuard:
 def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WATCHDOG_ZERO_FAN_CELSIUS):
     phase = acpi_protection_phase()
     if phase == "off":
+        guard.clear_poweroff_clock()
         return
     if classify_fan_binding(thermal_root, hwmon_root) == "unsupported":
+        guard.clear_poweroff_clock()
         return
     # Preserve the existing true-zero 85 C path and its precedence. This policy
     # covers spinning or unknown fans. Verified 0/0 at or above the cutoff,
@@ -5416,6 +5485,8 @@ def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WAT
     if true_zero and (
         hot is None or not math.isfinite(hot) or hot >= zero_fan_celsius
     ):
+        # The true-zero rule owns this sample. It is not time at 90 C.
+        guard.clear_poweroff_clock()
         return
 
     def force_max():

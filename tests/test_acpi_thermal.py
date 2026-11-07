@@ -944,6 +944,94 @@ class ThermalTests(unittest.TestCase):
         self.reboot.assert_not_called()
         self.maximum.assert_not_called()
 
+    def test_kill_seconds_is_deprecated_and_does_not_delay_sigkill(self):
+        with self.assertLogs(C.LOG, level="WARNING") as logs:
+            guard = self.make_guard({"ACPI_THERMAL_KILL_SECONDS": "5"})
+        self.assertIn("deprecated and ignored", "\n".join(logs.output))
+        self.assertFalse(hasattr(guard, "kill_s"))
+        with self.assertNoLogs(C.LOG, level="WARNING"):
+            self.make_guard({})
+
+    def test_phase2_cool_or_unreadable_sample_breaks_the_poweroff_clock(self):
+        self.targets.return_value = {}
+        self.guard.step(90, 0, self.maximum, ec_only=True)
+        self.guard.step(90, 1, self.maximum, ec_only=True)
+        self.assertEqual(self.guard.ceiling_since, 1)
+        self.targets.return_value = {201: (99, "other")}
+        self.guard.step(70, 10, self.maximum, ec_only=True)
+        self.assertIsNone(self.guard.ceiling_since)
+        self.shutdown.assert_not_called()
+        self.targets.return_value = {}
+        self.guard.step(90, 16, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.discovery_complete = False
+        self.guard.step(75, 20, self.maximum, ec_only=True)
+        self.assertIsNone(self.guard.ceiling_since)
+        self.guard.discovery_complete = True
+        self.targets.return_value = {}
+        self.guard.step(90, 36, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(None, 40, self.maximum, ec_only=True)
+        self.assertIsNone(self.guard.ceiling_since)
+        self.shutdown.assert_not_called()
+        self.maximum.assert_not_called()
+        self.guard.step(90, 41, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(90, 56, self.maximum, ec_only=True)
+        self.shutdown.assert_called_once()
+        self.reboot.assert_not_called()
+
+    def test_skipped_poll_does_not_extend_the_poweroff_clock(self):
+        thermal, hwmon = self.fake_fans(90000)
+        C.record_acpi_boot(C.ACPI_HOLD_NAME)
+        self.targets.return_value = {}
+        self.guard.step(90, 0, self.maximum, ec_only=True)
+        self.guard.step(90, 1, self.maximum, ec_only=True)
+        self.assertEqual(self.guard.ceiling_since, 1)
+        for sensor in hwmon.glob("hwmon*"):
+            (sensor / "fan1_input").write_text("0")
+        C.poll_acpi_thermal(self.guard, thermal, hwmon, 10)
+        self.assertIsNone(self.guard.ceiling_since)
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+        self.guard.step(90, 12, self.maximum, ec_only=True)
+        self.shutdown.assert_not_called()
+        self.guard.step(90, 27, self.maximum, ec_only=True)
+        self.shutdown.assert_called_once()
+
+    def test_failed_reboot_starts_a_new_poweroff_clock(self):
+        self.reboot.return_value = 1
+        self.step(90, 0)
+        self.assertEqual(self.guard.stage, "kill")
+        self.shutdown.assert_not_called()
+        self.targets.return_value = {}
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(90, 16)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_called_once()
+        self.assertEqual(self.guard.stage, "reboot-wait")
+        self.assertEqual(self.guard.ceiling_since, 16)
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(90, 30)
+        self.shutdown.assert_not_called()
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(90, 31)
+        self.shutdown.assert_called_once()
+        self.assertGreaterEqual(self.reboot.call_count, 2)
+
+    def test_successful_reboot_drops_a_ripe_poweroff_clock(self):
+        self.step(90, 0)
+        self.targets.return_value = {}
+        with patch.object(self.guard, "identity", return_value=None):
+            self.step(95, 20)
+        self.reboot.assert_called_once()
+        self.shutdown.assert_not_called()
+        self.assertEqual(self.guard.stage, "reboot")
+        self.assertIsNone(self.guard.ceiling_since)
+        self.step(99, 40)
+        self.shutdown.assert_not_called()
+        self.reboot.assert_called_once()
+
     def test_phase2_drop_below_90_restarts_the_poweroff_clock(self):
         self.targets.return_value = {}
         self.guard.step(90, 0, self.maximum, ec_only=True)

@@ -87,9 +87,13 @@ ACPI_THERMAL_KILL_C=90
 ACPI_THERMAL_SHUTDOWN_C=90
 ACPI_THERMAL_HOOK_SECONDS=10
 ACPI_THERMAL_TERM_SECONDS=10
-ACPI_THERMAL_KILL_SECONDS=5
+# ACPI_THERMAL_KILL_SECONDS is deprecated. If an old file still sets it,
+# the process logs a warning and ignores the value. SIGKILL is not delayed
+# by it, and it is not the poweroff interval.
 # How long the zone must stay at or above SHUTDOWN_C before poweroff.
-# Not a measured trip time. KILL_SECONDS does not power off.
+# Not a measured trip time. A sample below SHUTDOWN_C, an EC-only unreadable
+# sample, or a skipped poll breaks that interval. Phase 1 still treats an
+# unreadable zone as SHUTDOWN_C.
 ACPI_THERMAL_SHUTDOWN_SECONDS=15
 ACPI_THERMAL_HYSTERESIS_C=2
 # Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
