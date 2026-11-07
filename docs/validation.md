@@ -1,5 +1,59 @@
 # Validation and provenance
 
+## Rollback point for this branch
+
+`e57001b9adaf1ca5695da447939c8def68eb51f5`, author date 2026-11-06 11:26:42
+−0800, is the git tip before `3fdcc4d` (13:46 −0800 the same day), the first
+ACPI thermal-escalation commit. History from there back is linear. Nothing
+was committed during the Kensaki step-down searches (about 11:31–13:03
+−0800), so this commit is the tree those searches ran against. It is not a
+hardware-proven last-working module. The later loaded module was 0.1.7.
+This commit is module 0.1.6. Its parent `2955201` differs only in install
+documentation.
+
+The daemon curves in this commit are the accepted ones: default 50→3, 55→5,
+60→8, 65→10, 70→12 with the state-1 pin, and the opt-in quiet table from
+the tenhkspark patch. ACPI level samples from that afternoon stay research
+evidence. This tree does not write ACPI `cur_state`.
+
+With the module unloaded, a true-zero stall used to write ACPI level 100.
+That write is removed and nothing is substituted for it. The alert, the one
+reboot when no work is running, and the true-zero poweroff at 85 °C remain.
+Those actions were not re-measured on hardware for this commit.
+
+Carry-forward, decided on this branch:
+
+- EC 3.5.8 keeps the one idle-mailbox floor read. Status `0x08` with the
+  packet poll still 2 was measured, and one `GET_LOWER_LIMIT` recovered
+  that case. The floor write is not replayed.
+- The 6 Nov timeout happened while that read was already disabled. Its OEM
+  status was not captured. That log does not make the read unsafe, and it
+  does not show the read would have cleared that wedge.
+- EC 3.13.7 still gets no floor command, including after a telemetry
+  timeout. There is no module parameter for this. `allow_unverified_writes`
+  stays off.
+- No ACPI `cur_state` writes. No fault latch. Curves and the 85 °C
+  true-zero cutoff are unchanged.
+- The module version is 0.1.8 so it is not labeled as stock 0.1.6 or as
+  the loaded 0.1.7.
+- `scripts/kensaki-regression` is the Kensaki check for this delta. With
+  no `DGX_FAN_SUPERVISED=1` it does not touch the host. `floor` is
+  set-state 6 then automatic, and it checks that ACPI Fan `cur_state`
+  does not change. Atarime is refused. No GPU load.
+
+## Kensaki script, 6 Nov 2026 23:22 PST
+
+Checkout `0d9b49e` on Kensaki, EC 3.5.8. The operator ran
+`scripts/kensaki-regression` with `DGX_FAN_SUPERVISED=1`. The script
+printed `PASS preflight`, `PASS install`, and `PASS floor`. No status
+text, RPM, temperature, or kernel log was supplied with those lines, so
+this row is the script result only. Atarime was not run. No GPU load was
+run. Do not repeat these three cases unless this command or the installed
+module changes, or a regression is being checked.
+
+Older sections below are the record as it stood at `e57001b`, including
+commands this tree no longer provides.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and

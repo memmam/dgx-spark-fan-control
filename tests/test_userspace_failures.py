@@ -320,22 +320,10 @@ class UserlandFailureTests(unittest.TestCase):
             cur_state = acpi / "cur_state"
             cur_state.write_text("40\n", encoding="ascii")
             (acpi / "max_state").write_text("100\n", encoding="ascii")
-            with patch.object(
-                CONTROL, "read_kernel_log",
-                return_value=(
-                    "dgx_ec_fan_control: EC 3.13.7 floor writes disabled; "
-                    "registering hwmon telemetry only\n"
-                ),
-            ), patch.object(CONTROL, "write_acpi_fan_level") as write_acpi:
-                code, stdout, stderr = run_cli([*argv, "acpi-max"])
-            self.assertEqual(code, 0)
-            combined = stdout + stderr
-            self.assertIn(
-                "acpi-max: nothing written (EC 3.13.7, telemetry only; "
-                "EC runs its own curve)",
-                combined,
-            )
-            self.assertNotIn("ERROR", combined)
+            with patch.object(CONTROL, "write_acpi_fan_level") as write_acpi:
+                with self.assertRaises(SystemExit) as caught:
+                    run_cli([*argv, "acpi-max"])
+            self.assertEqual(caught.exception.code, 2)
             write_acpi.assert_not_called()
             self.assertEqual(cur_state.read_text(encoding="ascii"), "40\n")
 
@@ -524,26 +512,14 @@ class UserlandFailureTests(unittest.TestCase):
                 "--thermal-root", str(thermal),
                 "--hwmon-root", str(root / "hwmon"),
             ]
-            with patch.object(
-                CONTROL, "read_kernel_log",
-                return_value=(
-                    "dgx_ec_fan_control: EC 3.13.7 floor writes disabled; "
-                    "registering hwmon telemetry only\n"
-                ),
-            ), patch.object(CONTROL, "write_acpi_fan_level") as write_acpi, \
+            with patch.object(CONTROL, "write_acpi_fan_level") as write_acpi, \
                  patch.object(CONTROL, "set_acpi_fans") as set_acpi:
-                code, stdout, stderr = run_cli([*argv, "acpi-max"])
-                code40, out40, err40 = run_cli([*argv, "acpi-max", "--level", "40"])
-            self.assertEqual(code, 0)
-            self.assertEqual(code40, 0)
-            for combined in (stdout + stderr, out40 + err40):
-                self.assertIn(
-                    "acpi-max: nothing written (EC 3.13.7, telemetry only; "
-                    "EC runs its own curve)",
-                    combined,
-                )
-                self.assertNotIn("ERROR", combined)
-                self.assertNotIn(CONTROL.ACPI_RPM_NOTE, combined)
+                with self.assertRaises(SystemExit) as caught:
+                    run_cli([*argv, "acpi-max"])
+                with self.assertRaises(SystemExit) as caught40:
+                    run_cli([*argv, "acpi-max", "--level", "40"])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(caught40.exception.code, 2)
             write_acpi.assert_not_called()
             set_acpi.assert_not_called()
             self.assertEqual(cur_state.read_text(encoding="ascii"), "40\n")
@@ -1085,10 +1061,10 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertEqual(actions, [])
             self.assertEqual(len(alerts), 1)
             self.assertIn("fans are stopped", alerts[0])
-            self.assertEqual(sum("wrote ACPI Fan level 100" in line for line in logs.output), 1)
+            self.assertEqual(sum("not writing ACPI Fan cur_state" in line for line in logs.output), 1)
             for name in ("cooling_device0", "cooling_device1"):
                 self.assertEqual(
-                    (root / "thermal" / name / "cur_state").read_text(), "100\n",
+                    (root / "thermal" / name / "cur_state").read_text(), "40\n",
                 )
 
             clock[0] = 0.0
@@ -2113,10 +2089,10 @@ class UserlandFailureTests(unittest.TestCase):
                 module=False,
             )
             self.assertEqual(actions, [CONTROL.WATCHDOG_REBOOT_ACTION])
-            self.assertIn("wrote ACPI Fan level 100", "\n".join(logs))
+            self.assertIn("not writing ACPI Fan cur_state", "\n".join(logs))
             self.assertEqual(
                 (root / "thermal" / "cooling_device0" / "cur_state").read_text(),
-                "100\n",
+                "40\n",
             )
 
             root = Path(directory) / "stopped"
@@ -2342,7 +2318,7 @@ class UserlandFailureTests(unittest.TestCase):
             self.assertTrue(alerts)
             self.assertIn("fans are stopped", alerts[0])
             self.assertFalse(any("will not trip" in line for line in logs.output))
-            self.assertTrue(any("wrote ACPI Fan level 100" in line for line in logs.output))
+            self.assertTrue(any("not writing ACPI Fan cur_state" in line for line in logs.output))
 
     def _acpi_tree(self, root: Path) -> tuple[Path, Path, Path]:
         thermal = root / "thermal"
@@ -2362,108 +2338,29 @@ class UserlandFailureTests(unittest.TestCase):
             fans.append(device)
         return thermal, fans[0], fans[1]
 
-    def test_acpi_max_writes_only_fan_devices(self):
+    def test_acpi_max_is_not_a_command_and_does_not_write(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, second = self._acpi_tree(Path(directory))
-            code, stdout, stderr = run_cli([
-                "--thermal-root", str(thermal), "acpi-max",
-            ])
-            text = stdout + stderr
-            self.assertEqual(code, 0)
-            self.assertEqual((first / "cur_state").read_text(), "100\n")
-            self.assertEqual((second / "cur_state").read_text(), "100\n")
+            for argv in (
+                ["--thermal-root", str(thermal), "acpi-max"],
+                ["--thermal-root", str(thermal), "acpi-max", "--level", "0"],
+                ["--thermal-root", str(thermal), "acpi-max", "--level", "35"],
+                ["--thermal-root", str(thermal), "acpi-max", "--level", "100"],
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    run_cli(argv)
+                self.assertEqual(caught.exception.code, 2)
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
+            self.assertEqual((second / "cur_state").read_text(), "40\n")
             self.assertEqual(
-                (thermal / "cooling_device0" / "cur_state").read_text(), "0\n"
+                (thermal / "cooling_device0" / "cur_state").read_text(), "0\n",
             )
-            self.assertEqual(stdout.count("cooling_device1 (Fan): 100/100\n"), 1)
-            self.assertEqual(stdout.count("cooling_device2 (Fan): 100/100\n"), 1)
-            self.assertNotIn("cooling_device", stderr)
-            self.assertNotIn("cooling_device0", text)
-            self.assertEqual(text.count(CONTROL.ACPI_RPM_NOTE), 1)
-            self.assertIn("without changing RPM", stdout)
-            self.assertIn("check fan RPM afterward", stdout)
-
-    def test_acpi_max_exits_nonzero_without_a_fan_or_when_a_write_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            empty = root / "empty"
-            empty.mkdir()
-            code, stdout, stderr = run_cli(["--thermal-root", str(empty), "acpi-max"])
-            self.assertEqual(code, 1)
-            self.assertEqual((stdout + stderr).count("no ACPI Fan cooling device found"), 1)
-            self.assertNotIn("no ACPI Fan cooling device found", stdout)
-            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout + stderr)
-
-            thermal, first, second = self._acpi_tree(root)
-            original = CONTROL.write_acpi_fan_level
-
-            def broken_write(device, level):
-                if device == second:
-                    raise OSError("write failed")
-                original(device, level)
-
-            with patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write):
-                code, stdout, stderr = run_cli(["--thermal-root", str(thermal), "acpi-max"])
-            self.assertEqual(code, 1)
-            self.assertEqual((stdout + stderr).count("failed on 1 device"), 1)
-            self.assertNotIn("failed on 1 device", stdout)
-            self.assertNotIn(CONTROL.ACPI_RPM_NOTE, stdout + stderr)
-            self.assertNotIn("cooling_device", stdout)
-
-    def test_acpi_level_refuses_below_floor_and_fail_hot_rewrites_one_hundred(self):
-        with tempfile.TemporaryDirectory() as directory:
-            thermal, first, second = self._acpi_tree(Path(directory))
-            code, stdout, stderr = run_cli([
-                "--thermal-root", str(thermal), "acpi-max", "--level", "20",
-            ])
-            self.assertEqual(code, 1)
-            self.assertEqual((stdout + stderr).count("refusing ACPI fan level 20"), 1)
-            self.assertIn("stops both fans", stderr)
-            self.assertNotIn("refusing ACPI fan level", stdout)
-            self.assertNotIn("Traceback", stdout + stderr)
+            with self.assertRaises(RuntimeError):
+                CONTROL.set_acpi_fans(thermal, 100, force=True)
+            with self.assertRaises(RuntimeError):
+                CONTROL.write_acpi_fan_level(first, 100)
             self.assertEqual((first / "cur_state").read_text(), "40\n")
             self.assertEqual((second / "cur_state").read_text(), "40\n")
-            code, stdout, stderr = run_cli([
-                "--thermal-root", str(thermal), "acpi-max", "--level", "40",
-            ])
-            self.assertEqual(code, 0)
-            self.assertEqual((stdout + stderr).count(CONTROL.ACPI_RPM_NOTE), 1)
-            self.assertEqual(stdout.count("cooling_device1 (Fan): 40/100\n"), 1)
-            self.assertNotIn("40/100", stderr)
-            self.assertEqual((first / "cur_state").read_text(), "40\n")
-            (second / "cur_state").write_text("7\n", encoding="ascii")
-
-            original = CONTROL.write_acpi_fan_level
-
-            def broken_write(device, level):
-                if device == second and level == 60:
-                    raise OSError("write failed")
-                original(device, level)
-
-            with patch.object(CONTROL, "write_acpi_fan_level", side_effect=broken_write):
-                with self.assertRaises(RuntimeError):
-                    CONTROL.set_acpi_fans(thermal, 60)
-            self.assertEqual((first / "cur_state").read_text(), "100\n")
-            self.assertEqual((second / "cur_state").read_text(), "100\n")
-
-    def test_acpi_level_floor_is_thirty_five(self):
-        self.assertEqual(CONTROL.ACPI_MIN_LEVEL, 35)
-        with tempfile.TemporaryDirectory() as directory:
-            thermal, first, second = self._acpi_tree(Path(directory))
-            code, stdout, stderr = run_cli([
-                "--thermal-root", str(thermal), "acpi-max", "--level", "34",
-            ])
-            self.assertEqual(code, 1)
-            self.assertEqual((stdout + stderr).count("refusing ACPI fan level 34"), 1)
-            self.assertIn("Level 35 is the lowest level measured to hold", stderr)
-            self.assertEqual((first / "cur_state").read_text(), "40\n")
-            self.assertEqual((second / "cur_state").read_text(), "40\n")
-            code, stdout, stderr = run_cli([
-                "--thermal-root", str(thermal), "acpi-max", "--level", "35",
-            ])
-            self.assertEqual(code, 0)
-            self.assertEqual((first / "cur_state").read_text(), "35\n")
-            self.assertEqual((second / "cur_state").read_text(), "35\n")
 
     def test_supported_commands_do_not_repeat_their_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4026,49 +3923,15 @@ class UserlandFailureTests(unittest.TestCase):
         self.assertEqual(combined.count("Connection timed out"), 3)
         self.assertNotIn("Connection timed out", stdout)
 
-    def test_acpi_max_refuses_a_live_module_and_level_zero(self):
+    def test_library_acpi_writer_refuses_without_touching_cur_state(self):
         with tempfile.TemporaryDirectory() as directory:
             thermal, first, _second = self._acpi_tree(Path(directory))
-            argv = ["--thermal-root", str(thermal), "acpi-max"]
-            with patch.object(CONTROL, "module_is_loaded", return_value=False), \
-                 patch.object(CONTROL, "systemctl_is_active", return_value="active"):
-                code, stdout, stderr = run_cli(argv)
-            combined = stdout + stderr
-            self.assertEqual(code, 1)
-            self.assertEqual(combined.count("refusing ACPI write"), 1)
-            self.assertIn("service is active", combined)
-            self.assertIn("Do not write ACPI level 0", combined)
-            self.assertNotIn("Traceback", combined)
-            self.assertEqual((first / "cur_state").read_text(), "40\n")
-
-            with patch.object(CONTROL, "module_is_loaded", return_value=False), \
-                 patch.object(CONTROL, "systemctl_is_active", return_value="inactive"):
-                code, stdout, stderr = run_cli([*argv, "--level", "0"])
-            combined = stdout + stderr
-            self.assertEqual(code, 1)
-            self.assertIn("stops both fans", combined)
-            self.assertEqual(combined.count("refusing ACPI fan level 0"), 1)
-            self.assertNotIn("Traceback", combined)
-            self.assertEqual((first / "cur_state").read_text(), "40\n")
-
-            stdout_buffer = io.StringIO()
-            with redirect_stdout(stdout_buffer):
+            with self.assertRaises(RuntimeError):
                 CONTROL.set_acpi_fans(
-                    thermal, 100, module_loaded=False, service_active="inactive",
-                    profile="EC 3.13.7",
+                    thermal, 0, module_loaded=False, service_active="inactive",
+                    force=True,
                 )
-            lines = stdout_buffer.getvalue().strip().splitlines()
-            self.assertEqual(lines[-1], CONTROL.ACPI_RPM_NOTE)
-            stdout_buffer = io.StringIO()
-            with redirect_stdout(stdout_buffer):
-                CONTROL.set_acpi_fans(
-                    thermal, 100, module_loaded=False, service_active="inactive",
-                    profile=None,
-                )
-            self.assertEqual(
-                stdout_buffer.getvalue().strip().splitlines()[-1],
-                CONTROL.ACPI_RPM_NOTE,
-            )
+            self.assertEqual((first / "cur_state").read_text(), "40\n")
 
     def test_runtime_daemon_error_stays_restartable(self):
         with patch.object(CONTROL, "run_daemon", side_effect=OSError(errno.ETIMEDOUT, "timeout")):

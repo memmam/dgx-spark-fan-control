@@ -145,13 +145,13 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.8/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.8/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.6
-sudo dkms build -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.8/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.8
+sudo dkms build -m dgx-spark-fan-control -v 0.1.8 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.8 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -228,9 +228,8 @@ follows replaces it with the current result and, on a healthy run, also
 clears the stored needs-intervention flag and the stall and watchdog-reboot
 markers. The plain command runs under `sudo` but does not write
 (`recorded: no`).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or because a downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ```sh
 sudo dgx-fan-control health
@@ -266,9 +265,8 @@ sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or because a downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 To leave the watchdog disabled, run
 `sudo ./scripts/install-userland --no-watchdog`. The health check still
@@ -394,9 +392,8 @@ The first `health` run prints the old record as `stale (written by a
 different install)`; that is expected, and the `--record` run replaces it.
 Why that refresh is required, and what `--record` clears, is in
 [section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or because a downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 Update the kernel module only when this checkout changes files under
 `kernel/`. Compare the loaded module with this checkout:
@@ -406,7 +403,7 @@ modinfo dgx_ec_fan_control | grep ^version:
 ```
 
 Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
-(currently `0.1.6`). If they already match and `kernel/` did not change,
+(currently `0.1.8`). If they already match and `kernel/` did not change,
 stop here. Otherwise use the same module route you installed with:
 [7A](#7a-update-the-module-with-dkms) or
 [7B](#7b-update-the-module-by-hand).
@@ -422,11 +419,11 @@ DKMS signs with the enrolled MOK already configured in
 checkout, refresh the registered source and rebuild for the running kernel:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.8/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.8/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
-sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)" --force
+  /usr/src/dgx-spark-fan-control-0.1.8/kernel/
+sudo dkms install -m dgx-spark-fan-control -v 0.1.8 -k "$(uname -r)" --force
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -463,9 +460,8 @@ modinfo dgx_ec_fan_control | grep ^version:
 
 Why that refresh is required, and what `--record` clears, is in
 [section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or because a downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ## 7B. Update the module by hand
 
@@ -515,9 +511,8 @@ modinfo dgx_ec_fan_control | grep ^version:
 
 Why that refresh is required, and what `--record` clears, is in
 [section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to `sudo dgx-fan-control acpi-max` when a
-downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or because a downgrade to EC 3.5.8 leaves a fan at 0 RPM.
 
 ## EC firmware pairing and downgrade
 
@@ -592,21 +587,17 @@ done
 
 There should be two `acpi_fan` readings in total, one per device on this
 hardware, and every one must be greater than 0. A missing reading is not
-confirmed. If any reading is missing or 0 RPM, immediately run
-`sudo dgx-fan-control acpi-max`, then read the tachometers again.
-On EC 3.5.8 an ACPI level of 0 stops the fans.
-`acpi-max` writes level 100. Never write `cur_state` 0 or any ACPI level
-below 35. If `acpi-max` refuses because the module or
-`dgx-fan-control.service` is active, stop that service, unload
-`dgx_ec_fan_control`, and run `acpi-max` again. Do not pass `--force`, and
-do not choose a level below 35.
+confirmed. This tree does not write an ACPI fan level when a reading is
+missing or 0. The watchdog alerts from these tachometers. A loaded module
+can request its own maximum state. With the module unloaded, no fan command
+is issued. Do not write `cur_state` 0.
 
 A firmware change marks the stored health record stale. What `--record`
 saves, and what it clears on a healthy run, is in
 [section 4](#4-install-the-command-then-load-the-driver).
 EC 3.13.7 telemetry-only is a healthy result, not needs-intervention.
 Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to the `acpi-max` safety step above.
+result.
 
 ```sh
 sudo dgx-fan-control health
@@ -670,9 +661,8 @@ the previous section. Confirm with the `fwupdtool` line, not with
 `fwupd.conf`. Then refresh the stored health record again so it matches
 this firmware. What `--record` saves and clears is in
 [section 4](#4-install-the-command-then-load-the-driver).
-Do not write an ACPI level to make this health check pass or to provoke a
-result. That does not apply to the `acpi-max` safety step after the
-downgrade reboot.
+Do not write an ACPI level to make this health check pass, to provoke a
+result, or after the downgrade reboot.
 
 ```sh
 sudo dgx-fan-control health

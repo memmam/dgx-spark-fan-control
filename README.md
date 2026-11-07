@@ -95,11 +95,10 @@ Forum measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
 about 1620 with the second fan stalling, and level 0 stops both fans. **Never
 write an ACPI level below 35, the lowest level measured to hold. Level 0 stops
 both fans immediately and they stay stopped; it also does not clear a foreign
-floor.** This command refuses levels below 35. `acpi-max` refuses while
-`dgx_ec_fan_control` is loaded or `dgx-fan-control.service` is active, unless
-`--force` is passed. On EC 3.13.7 the same ACPI write is accepted and does not change fan speed. An ACPI level
-does not survive reboot: these machines returned to about 2700/4050 RPM
-without another `acpi-max`.
+floor.** This tree does not write an ACPI fan level. On EC 3.13.7 the same
+ACPI write, when made outside this tree, is accepted and does not change fan
+speed. An ACPI level does not survive reboot: these machines returned to
+about 2700/4050 RPM after reboot.
 
 Other GB10 boards, generic kernels, and any capability reply other than the
 two profiles above are rejected. The driver does not relax validation to make
@@ -166,9 +165,10 @@ enables it, and also enables `dgx-fan-health.service` and
 [startup modes](docs/installation.md#5-choose-your-startup-mode). Copying only
 the performance unit leaves `status` at `watchdog-enabled: not-found`. The
 watchdog reads `acpi_fan` and the hottest thermal zone. If every fan stays
-at 0 RPM for 15 seconds it alerts and tries one repair: ACPI level 100 if
-the module is unloaded, or the module's maximum state if it is loaded. It
-never writes level 0. About 60 seconds after the zeros began, with no work
+at 0 RPM for 15 seconds it alerts. If the module is loaded it requests
+the module's maximum state. If the module is unloaded it does not write
+an ACPI fan level and does not issue another fan command. It never writes
+ACPI level 0. About 60 seconds after the zeros began, with no work
 in progress, it reboots once. The default signal is an `nvidia-smi` compute
 process, and only when `BUSY_CHECK` is unset. A persistent server keeps that
 default busy, so the reboot stays deferred and only a true zero at 85°C
@@ -185,8 +185,8 @@ critical trip near 104°C. Keeping the fans running, and pre-cooling, are
 the defenses. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
 also logs and broadcasts
 when `dgx-fan-control.service` is not `active`, before it looks at
-temperature. That alert does not power the machine off. The cold alert and
-the level-100 write have not been run on hardware yet.
+temperature. That alert does not power the machine off. The cold alert
+has not been run on hardware yet.
 
 ## Quiet curve
 
@@ -226,26 +226,25 @@ fan-floor probe on both DGX Sparks in this tree's 6 Nov 2026 retest: baseline
 about 2700/4050 RPM, and `set-state` changed speed while the daemon was
 stopped. tenhkspark's notes and NVIDIA forum topic 386805 post 21 also
 describe a mailbox timeout and 0/0 tachometers on that mix. Both outcomes
-are real. If probe times out, `acpi-max` is the fallback, and only while
-this module is not loaded. The two writers share one lower-floor register.
+are real. If probe times out, this tree does not write an ACPI fan level
+as a fallback. The two writers would share one lower-floor register.
 Downgrading EC 3.13.7 to 3.5.8, and blocking fwupd from putting 3.13.7
 back, are in
 [EC firmware pairing and downgrade](docs/installation.md#ec-firmware-pairing-and-downgrade).
 
-## ACPI-only mode
+## Module off
 
-Use this when fans should be driven with `acpi-max` and the kernel module
-should stay unloaded. `disable` does not uninstall the driver. Full removal
-is `sudo dkms remove dgx-spark-fan-control/0.1.6 --all` (the version in
-`dkms.conf`).
+`module disable` unloads the driver and does not write an ACPI fan level.
+Full removal is `sudo dkms remove dgx-spark-fan-control/0.1.8 --all` (the
+version in `dkms.conf`).
 
 ```sh
 sudo dgx-fan-control module disable
 sudo dgx-fan-control module status
-sudo dgx-fan-control acpi-max
 ```
 
-Do not load the module again while that ACPI level is still the EC floor.
+Do not load the module again while an ACPI level from outside this tree is
+still the EC floor.
 Probe refuses a floor it did not set, and it does not clear it. `module
 enable` also does not start the performance service.
 
@@ -263,8 +262,9 @@ blacklist, restores the modules-load.d entry, and loads the module. It does
 `sudo systemctl enable --now dgx-fan-control.service`. Neither `module enable`
 nor `module disable` enables, starts, or stops the watchdog. On EC 3.13.7, where the
 module registers telemetry only, enable loads the module and leaves the
-service disabled. It prints once that fan control is unsupported and points
-at `acpi-max` for EC 3.5.8. `--force-service` starts the daemon anyway.
+service disabled. It prints once that fan control is unsupported. This tree
+does not write an ACPI fan level in that case. `--force-service` starts the
+daemon anyway.
 
 `module status` prints whether the module is loaded, whether the managed
 blacklist or another blacklist is present, whether the performance service
@@ -284,14 +284,8 @@ code, with the time it happened, when the unit is failed or still enabled
 and inactive. It still
 alerts when the unit is `failed`, or enabled but inactive after another exit.
 
-`acpi-max` refuses while `dgx_ec_fan_control` is loaded or the fan service is
-active, because both write the same EC lower floor. `--force` writes anyway
-and logs a warning. It refuses levels below 35. Level 0 stops both fans; do
-not use it as a recovery step. On success it prints each Fan device's
-`cur_state/max_state` (for example `cooling_device0 (Fan): 100/100`). On EC
-3.13.7, or when the EC is unknown, it adds that firmware may accept the write
-without changing RPM. On EC 3.5.8 it prints `check fan RPM`. It exits nonzero
-when no Fan cooling device is found or a write fails.
+This project does not write ACPI Fan `cur_state`. Level 0 stops both fans;
+do not use it as a recovery step.
 
 This project does not put the module in the initramfs. `modules-load.d` loads
 it after the root filesystem is mounted, so `module disable` does not run

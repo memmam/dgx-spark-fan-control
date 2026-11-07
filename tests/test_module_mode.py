@@ -142,7 +142,7 @@ class ModuleModeTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         sentence = (
             "fan control unsupported on EC 3.13.7; telemetry only, "
-            "service left disabled; use acpi-max on EC 3.5.8"
+            "service left disabled; this tree does not write ACPI fan levels"
         )
         root = logging.getLogger()
         handler = logging.StreamHandler(stderr)
@@ -332,23 +332,19 @@ class ModuleModeTests(unittest.TestCase):
                     CONTROL.set_acpi_fans(
                         thermal, 100, module_loaded=True, service_active="inactive",
                     )
-            self.assertIn("refusing ACPI write", str(refused.exception))
-            self.assertIn("Do not write ACPI level 0", str(refused.exception))
+            self.assertIn("does not write ACPI fan levels", str(refused.exception))
             self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "40\n")
             self.assertEqual(stdout.getvalue(), "")
             stdout = io.StringIO()
-            with redirect_stdout(stdout), self.assertLogs(CONTROL.LOG, level="WARNING") as logs:
-                CONTROL.set_acpi_fans(
-                    thermal, 100, module_loaded=True, service_active="inactive",
-                    force=True, profile="EC 3.5.8",
-                )
-            text = stdout.getvalue()
-            self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "100\n")
-            self.assertEqual(sum("forcing an ACPI write" in line for line in logs.output), 1)
-            self.assertEqual(text.count("cooling_device0 (Fan): 100/100\n"), 1)
-            self.assertEqual(text.count("check fan RPM"), 1)
-            self.assertNotIn("3.13.7", text)
-            self.assertFalse(any("100/100" in line or "check fan RPM" in line for line in logs.output))
+            with redirect_stdout(stdout):
+                with self.assertRaises(RuntimeError) as forced:
+                    CONTROL.set_acpi_fans(
+                        thermal, 100, module_loaded=True, service_active="inactive",
+                        force=True, profile="EC 3.5.8",
+                    )
+            self.assertIn("does not write ACPI fan levels", str(forced.exception))
+            self.assertEqual((fan / "cur_state").read_text(encoding="ascii"), "40\n")
+            self.assertEqual(stdout.getvalue(), "")
 
 
 if __name__ == "__main__":
