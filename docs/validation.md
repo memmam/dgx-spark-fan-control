@@ -1,5 +1,12 @@
 # Validation and provenance
 
+Current hardware results for module 0.1.7 are the
+[hardware ledger](#module-017-hardware-ledger). A `./scripts/check` pass is
+not hardware readiness. Do not repeat a row marked PASS or BLOCKED unless
+the relevant source changed, a regression is being checked, or a defined
+new observation is available. Older sections below are provenance for
+earlier versions. They are not a second to-do list.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
@@ -413,82 +420,146 @@ below the hottest zone. These observations motivated the separate
 The implementation is tested with mocked thermal, process, hook, and
 power-action interfaces; it has not been hardware-validated by those tests.
 
-## Module 0.1.7 hardware checks
+## Module 0.1.7 hardware ledger
 
-`./scripts/check` compiles the driver's transaction functions against a fake
-FF-A peer and refuses host systemd, module, and sysfs changes. That is not
-hardware readiness. `research/live-check` is a separate opt-in harness. The first read-only
-pass on both machines, after `c92aa96`, is an operator report: kensaki
-showed 42.5°C and 2700/4050 RPM at state 0 with no manual floor; atarime
-showed 2060/2147 RPM, telemetry only, and no zone temperature because that
-status line does not print one. That missing value was not a cool reading.
-A later Kensaki `service-start-stop` at `391abc5` started the performance
-service, read cooling state 0 once, and failed before `systemctl stop`.
-That phrase in status is the state-0 label. It is not evidence the process
-exited. The notes below are the operator's 7 Nov 2026 report.
-Items not listed there are still pending. This tree was not used to load the
-module or to run those steps.
+This is the record for loaded module **0.1.7**. The live rows below were run
+from checkout `5e7cf1f` unless a row names an earlier checkout. Spark journal
+clocks for the 6 Nov 2026 evening session are **7 Nov 2026 UTC**. The
+operator's clock for that session is **America/Los_Angeles, PST**.
 
-### Observed, both machines
+`./scripts/check` is an offline mock suite. A pass there is not hardware
+readiness. `research/live-check` is opt-in and is not part of that suite.
 
-Both machines built, signed, and loaded 0.1.7 with `automatic_floor_recovery`
-unset and `allow_unverified_writes` unset.
+Do not repeat a **PASS** or **BLOCKED** row unless the relevant source
+changed, a regression is being checked, or a defined new observation is
+available. The reboot-notifier gap was seen again on 6 Nov 2026. That repeat
+is the same missing log, not a new kind of evidence. Do not rerun that
+saved-floor reboot until shutdown kernel logs can be kept.
 
-### Observed on kensaki, EC 3.5.8
+These are not pending tests: a deliberate mailbox wedge, clearing a foreign
+floor, writing a literal lower clamp of 0, an ACPI fan hold, and
+`allow_unverified_writes` or `automatic_floor_recovery`. Leave both
+parameters at `N`.
 
-Probe refused a foreign floor of `0x10fe`. A reboot cleared it. The next probe
-was clean. A middle floor, state 6, then `automatic`, returned to the EC
-curve. Unload while the module owned state 6 restored automatic control, and
-the following load was clean. With the performance service idle, state moved
-0 to 1, and stopping the service returned to 0.
+### Matrix
 
-A reboot with saved manual state 6 came up at state 0 from the probe, and
-userspace reapplied 6 on the next second. The journal from the previous boot
-has no reboot-notifier line, so the shutdown restore is unverified. The saved
-setting was then cleared and the machine is at state 0.
+| Test | Host | Kind | Outcome | Evidence | Do not repeat unless |
+| --- | --- | --- | --- | --- | --- |
+| `./scripts/check`, 212 tests, no sudo | both | offline | **PASS** at `5e7cf1f` | operator, 6 Nov 2026 PST | source or regression |
+| read-only health, numeric zone | kensaki EC 3.5.8 | live read-only | **PASS** 43.9°C | `5e7cf1f`, params `N`/`N` | source or regression |
+| read-only health, numeric zone | atarime EC 3.13.7 | live read-only | **PASS** 44.8°C | telemetry only; an earlier `c92aa96` pass had no zone number and was not this result | source or regression |
+| `service-start-stop` | kensaki | supervised | **PASS** | state 0 on sample 1, state 1 on sample 2, then stop; final inactive, state 0, manual floor none, watchdog active, 41.8°C | source or regression |
+| `service-start-stop` | atarime | supervised | **MANUAL** | refused: no controller start and no floor write. Not a lifecycle pass | firmware gains floor control |
+| `unload-reload`, idle | kensaki | supervised | **PASS** | 41.8°C, final state 0, manual none, watchdog active, fans 2700/4050 | source or regression |
+| `unload-reload`, idle | atarime | supervised | **PASS** | 42.4°C, stayed telemetry only, watchdog active, fans 2061/2148. Saved last-set 12 was not applied | source or regression |
+| manual units | both | configuration | **left enabled** | both units were enabled; cleanup put kensaki's enablement back after `automatic` | do not disable to satisfy a harness |
+| saved floor 6 reapplied after reboot | kensaki | boot | **PASS** | `applied manual floor state 6 from last-set` at 19:28:27 PST | already shown; not notifier proof |
+| shutdown reboot notifier | kensaki | boot | **UNVERIFIED** | previous-boot grep had neither success nor failure line. Not a recorded failure | a log that survives shutdown |
+| suspend | kensaki | blocked | **BLOCKED** | `systemctl suspend` refused; no sleep occurred | the NVIDIA drop-in is removed on purpose |
+| sustained load of this module's control path | kensaki | not run | **NOT RUN** | older `gpu_burn` notes are a different EC-curve record | a real session under this module |
+| natural mailbox timeout on 0.1.7 | either | not run | **UNOBSERVED** | do not induce one | one appears in ordinary use |
+| foreign floor `0x10fe` | kensaki | earlier live | **PASS** refuse | module did not clear it; reboot cleared it. Date not recorded | source or regression |
+| state 6 then `automatic` | kensaki | earlier live | **PASS** | returned to the EC curve. Date not recorded | source or regression |
+| unload while owning state 6 | kensaki | earlier live | **PASS** | restore and the next probe were clean. Date not recorded | source or regression |
+| performance service 0 to 1 to stop | kensaki | earlier live | **PASS** | idle service, then stop back to state 0. Date not recorded. Distinct from the later sampled start/stop | source or regression |
+| earlier saved-6 reboot | kensaki | earlier boot | **PASS** reapply, notifier **UNVERIFIED** | same missing notifier line as 6 Nov. Date not recorded | do not repeat for the same gap |
+| telemetry unload, last-set 12 kept | atarime | earlier live | **PASS** | last-set 12 not applied. Date not recorded | source or regression |
 
-### Observed on atarime, EC 3.13.7
+### 6 Nov 2026, about 19:17–19:34 PST
 
-Telemetry only: no cooling device, both tachometers healthy, unload and reload
-clean. A saved last-set of 12 was kept and not applied.
+Checkout `5e7cf1f`. Loaded module 0.1.7.
+`automatic_floor_recovery=N` and `allow_unverified_writes=N` on both.
+No GPU job. Both `dgx-fan-manual.service` units stayed enabled.
+Journals from the Sparks use 7 Nov 2026 UTC.
 
-### Offline check after 5a19111
+Both machines, without sudo: `./scripts/check` passed 212 tests. No polkit
+prompt. That is the offline row above.
 
-On 6 Nov 2026 Pacific (logged 7 Nov UTC), after that commit was pulled and
-userspace was installed, both machines ran `cd ~/dsfc && ./scripts/check`
-without sudo. Status and health were healthy first: kensaki at state 0 with
-no manual floor, atarime telemetry only. Both finished 193 tests in about
-1.5 seconds with the same one error and one failure, and no authentication
-prompt. The error was an ACPI fixture reported as EC 3.13.7 telemetry,
-including on kensaki. The failure was `acpi-max` on an empty fixture exiting
-0. This is the operator's report, not a hardware run from this tree.
+Read-only live checks then printed a numeric zone: kensaki 43.9°C, atarime
+44.8°C. Health was healthy. This replaces the earlier `c92aa96` read-only
+on atarime, which had no zone number because telemetry-only `status` does
+not print one. That earlier pass did not validate temperature.
 
-### Not observed
+Kensaki `service-start-stop` passed. Sample 1 was still state 0. Sample 2
+was state 1. Stop ran. The explicit finish was inactive, state 0, manual
+floor none, watchdog active, 41.8°C. An earlier attempt at checkout
+`391abc5` read state 0 once and returned before `systemctl stop`. That was
+a harness stop, not this pass. Atarime correctly printed `MANUAL` for
+`service-start-stop`: no controller start and no floor write.
 
-Sustained load, a natural mailbox timeout, suspend, and the reboot notifier
-were not run. Do not treat them as passed. No wedge was induced.
+Idle `unload-reload` passed on both. Kensaki finished at 41.8°C, state 0,
+manual floor none, watchdog active, fans 2700/4050. Atarime finished at
+42.4°C, telemetry only, watchdog active, fans 2061/2148. Atarime's saved
+last-set 12 was not applied and was not edited.
 
-### Still open
+Kensaki reboot, same evening. Preflight was state 0, manual floor none,
+41.8°C, performance service inactive, manual unit enabled, watchdog active,
+parameters `N`/`N`, no GPU job. `set-state 6` persisted at 41.5°C. The
+operator rebooted at 19:28 PST. The previous boot's kernel journal had no
+`automatic fan policy active for reboot` line and no
+`failed to restore automatic fan policy for reboot` line. The new probe
+logged `pinned EC 3.5.8 capabilities fan0=1260..9000 fan1=1890..13500` and
+did not log ownership or refusal of an existing floor. Coming up unset does
+not prove the notifier ran. At 19:28:27 PST the manual unit logged
+`applied manual floor state 6 from last-set`. Final status was state 6,
+manual floor 6, watchdog active, 43.1°C. Saved-floor reapplication passed.
+Shutdown restore stays unverified.
 
-Leave both module parameters unset. Do not load `research/mailbox`. Do not
-write ACPI level 0 or clear `0x10fe` with a module write. Do not induce a wedge.
+Cleanup was `sudo dgx-fan-control automatic` and then
+`sudo systemctl enable dgx-fan-manual.service`, because `automatic` disables
+that unit. Afterward the unit was enabled, state was 0, manual floor was
+none, the zone was 40.3°C, and the watchdog was active.
 
-EC 3.5.8: an ordinary monitoring session that happens to time out has not
-been seen. The open question is a log line `not submitting a floor read` and
-a following read that is not operation 0x04. Shutdown restore via the reboot
-notifier is unverified. A `sync_send_receive2` that never returns still holds
-the driver mutex; do not add a timeout around that call to test it.
+Suspend was then tried on Kensaki. `/sys/power/state` contained `freeze mem`
+and `/sys/power/mem_sleep` showed `[s2idle]`. `systemctl suspend` refused
+with `Sleep verb suspend is disabled by config`. No suspend occurred.
+`/etc/systemd/sleep.conf.d/disable_suspend.conf` sets `AllowSuspend=no`.
+`dpkg-query -S` names the file `nvidia-no-systemd-suspend`. `dpkg-query -s`
+reports version `25.06-1`, maintainer `dgx-dev@nvidia.com`, description
+`Disables suspend using systemd drop-in` and
+`Disables suspend by setting AllowSuspend=no`. The package does not say why
+suspend is disabled. Leave the drop-in in place. This is a host
+configuration block, not a module failure.
 
-EC 3.13.7: a telemetry or capability timeout has not been seen. The same log
-line would have to name the profile and the next read must not be a floor
-command. Do not use this machine for ACPI floor tests. An ACPI write here may
-be accepted and must not be expected to change RPM.
+### Earlier 0.1.7 observations
 
-### Still unresolved after 0.1.7
+The calendar date of these runs was not recorded. They are earlier than
+19:17 PST on 6 Nov 2026. Hosts and firmware are the same pair. Module
+0.1.7. Do not invent a tighter timestamp.
+
+On kensaki the module refused foreign floor `0x10fe` (4350 RPM) and did not
+clear it (`ESTALE` / `-EBUSY`). A reboot cleared it. State 6 then
+`automatic` returned to the EC curve. Unload while the module owned state 6
+restored automatic control, and the next probe was clean. With the
+performance service idle, state went 0 to 1, and stopping the service
+returned to 0. An earlier reboot with saved state 6 reapplied 6 and also
+lacked the notifier line. That is the same unverified shutdown restore as
+the 6 Nov reboot, not a second open test.
+
+On atarime, telemetry-only unload and reload passed. Saved last-set 12 was
+kept and was not applied.
+
+### Remaining gaps
+
+These are the open hardware rows. This list is not a request to run them
+from this commit.
+
+- Sustained load while this module is the floor controller on EC 3.5.8.
+  Older `gpu_burn` notes in this file describe the stock EC curve and an
+  ACPI hold. They are not this row.
+- A natural mailbox timeout on 0.1.7, only if ordinary use produces one.
+  Do not induce it. The open question is still a log line that a floor read
+  was not submitted, and that the next read is not operation `0x04`.
+- The reboot notifier, only if a future shutdown can retain the kernel log.
+  Repeating saved state 6 without that capture will not resolve it.
+- Suspend, only if `AllowSuspend=no` is no longer required. Do not remove
+  `nvidia-no-systemd-suspend` to force the test.
+
+### Not a hardware pass
 
 The host cannot stop ACPI or another FF-A client from owning the floor.
-A reply that matches in both the packet cache and the OEM image can still be
-stale; there is no host sequence number that proves this attempt produced it.
-No captured incident shows mailbox status bits 0–1 clear while the packet
-poll stays pending, so automatic recovery stays off. A `sync_send_receive2`
-that never returns is not interruptible from this driver.
+A reply that matches in both the packet cache and the OEM image can still
+be stale. No captured incident shows mailbox status bits 0–1 clear while
+the packet poll stays pending, so automatic recovery stays off. A
+`sync_send_receive2` that never returns is not interruptible from this
+driver, and the live harness timeout does not interrupt it either.
