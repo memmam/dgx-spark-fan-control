@@ -2,6 +2,7 @@
 """Offline checks must fail before any host command or host-path write."""
 
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -103,6 +104,53 @@ class OfflineGuardTests(unittest.TestCase):
              patch.object(Path, "read_text", autospec=True, side_effect=exploded):
             self.assertFalse(CONTROL.module_is_loaded())
             self.assertEqual(CONTROL.read_defaults(), {})
+
+    def test_host_sysfs_does_not_reclassify_a_fixture(self):
+        real_glob = Path.glob
+
+        def guarded_glob(self, pattern):
+            text = os.path.abspath(self)
+            if text == "/sys/class/hwmon" or text.startswith("/sys/class/hwmon" + os.sep):
+                raise AssertionError("read host hwmon")
+            if text.startswith("/sys/firmware") or text.startswith("/sys/class/thermal"):
+                raise AssertionError(f"read host sysfs {text}")
+            return real_glob(self, pattern)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            thermal = root / "thermal"
+            fan = thermal / "cooling_device0"
+            fan.mkdir(parents=True)
+            (fan / "type").write_text("Fan\n", encoding="ascii")
+            (fan / "cur_state").write_text("40\n", encoding="ascii")
+            (fan / "max_state").write_text("100\n", encoding="ascii")
+            with patch.object(Path, "glob", guarded_glob):
+                self.assertIsNone(CONTROL.find_fan_hwmon(Path("/sys/class/hwmon")))
+                self.assertEqual(
+                    CONTROL.classify_fan_binding(thermal, Path("/sys/class/hwmon")),
+                    "absent",
+                )
+                self.assertIsNone(CONTROL.acpi_ec_version())
+                self.assertEqual(CONTROL.cooling_devices(Path("/sys/class/thermal")), [])
+                self.assertEqual(CONTROL.read_named_fan_rpms(Path("/sys/class/hwmon")), [])
+            hwmon = root / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "name").write_text(CONTROL.HWMON_DEVICE_NAME + "\n", encoding="ascii")
+            self.assertEqual(
+                CONTROL.classify_fan_binding(thermal, root / "hwmon"),
+                "unsupported",
+            )
+
+    def test_missing_nvidia_smi_stays_inside_target_discovery(self):
+        guard = CONTROL.AcpiThermalGuard({})
+        before = self.run.real_invocations
+        with self.assertLogs(CONTROL.LOG, level="ERROR") as logs:
+            self.assertEqual(guard.discover_targets(), {})
+        text = " ".join(logs.output)
+        self.assertIn("nvidia-smi unavailable", text)
+        self.assertNotIn("observation failed", text)
+        self.assertFalse(guard.discovery_complete)
+        self.assertEqual(self.run.real_invocations, before)
 
     def test_unpatched_process_signal_is_refused(self):
         def spy(*_args, **_kwargs):

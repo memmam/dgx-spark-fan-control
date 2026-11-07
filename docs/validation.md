@@ -444,6 +444,17 @@ setting was then cleared and the machine is at state 0.
 Telemetry only: no cooling device, both tachometers healthy, unload and reload
 clean. A saved last-set of 12 was kept and not applied.
 
+### Offline check after 5a19111
+
+On 6 Nov 2026 Pacific (logged 7 Nov UTC), after that commit was pulled and
+userspace was installed, both machines ran `cd ~/dsfc && ./scripts/check`
+without sudo. Status and health were healthy first: kensaki at state 0 with
+no manual floor, atarime telemetry only. Both finished 193 tests in about
+1.5 seconds with the same one error and one failure, and no authentication
+prompt. The error was an ACPI fixture reported as EC 3.13.7 telemetry,
+including on kensaki. The failure was `acpi-max` on an empty fixture exiting
+0. This is the operator's report, not a hardware run from this tree.
+
 ### Not observed
 
 Sustained load, a natural mailbox timeout, suspend, and the reboot notifier

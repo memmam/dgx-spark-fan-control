@@ -127,6 +127,21 @@ def offline_guard_active() -> bool:
     return os.environ.get(OFFLINE_GUARD_ENV) == "1"
 
 
+def offline_hides_host_path(path: Path) -> bool:
+    """Offline checks must not classify a fixture from this machine's sysfs.
+
+    The check uses the absolute path string and does not stat the directory.
+    A temporary fixture is not under these roots, so it is still read.
+    """
+    if not offline_guard_active():
+        return False
+    text = os.path.abspath(os.fspath(path))
+    for root in ("/sys", "/proc"):
+        if text == root or text.startswith(root + os.sep):
+            return True
+    return False
+
+
 def offline_blocks_real(fn: object) -> bool:
     """True when offline and fn is not a test double."""
     return offline_guard_active() and not hasattr(fn, "assert_called")
@@ -333,6 +348,8 @@ class ForeignFloor(RuntimeError):
 
 
 def cooling_devices(thermal_root: Path) -> list[Path]:
+    if offline_hides_host_path(thermal_root):
+        return []
     matches = []
     for candidate in sorted(thermal_root.glob("cooling_device*")):
         try:
@@ -354,6 +371,8 @@ def find_cooling_device(thermal_root: Path) -> Path:
 
 
 def find_fan_hwmon(hwmon_root: Path) -> Path | None:
+    if offline_hides_host_path(hwmon_root):
+        return None
     matches = []
     for candidate in sorted(hwmon_root.glob("hwmon*")):
         try:
@@ -379,6 +398,8 @@ def read_thermal_zone_c(thermal_root: Path, zone: str = "thermal_zone0") -> floa
 
 def read_named_fan_rpms(hwmon_root: Path, device_name: str = ACPI_FAN_NAME) -> list[int]:
     """RPM inputs for one hwmon name. Does not require this project's module."""
+    if offline_hides_host_path(hwmon_root):
+        return []
     readings = []
     for device in sorted(hwmon_root.glob("hwmon*")):
         try:
@@ -4864,6 +4885,8 @@ def acpi_ec_version(esrt_root: Path = Path("/sys/firmware/efi/esrt/entries")) ->
     pinned = pinned_ec_name(read_kernel_log())
     if pinned:
         return pinned.removeprefix("EC ")
+    if offline_hides_host_path(esrt_root):
+        return None
     for entry in esrt_root.glob("entry*"):
         try:
             if (entry / "fw_class").read_text().strip().lower() != EC_FWUPD_GUID:
@@ -5263,7 +5286,7 @@ class AcpiThermalGuard:
                     elif value:
                         self.discovery_complete = False
                         LOG.error("ACPI thermal: unparseable compute PID %r; recovery reboot inhibited", value)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired, OfflineGuardError) as exc:
             self.discovery_complete = False
             LOG.error("ACPI thermal: nvidia-smi unavailable or timed out: %s", exc)
         for value in self.defaults.get("ACPI_THERMAL_PIDS", "").replace(",", " ").split():
@@ -5272,7 +5295,7 @@ class AcpiThermalGuard:
             else:
                 LOG.error("ACPI thermal: ignoring invalid PID %r", value)
         names = set(self.defaults.get("ACPI_THERMAL_PROCESS_NAMES", "").replace(",", " ").split())
-        if names:
+        if names and not offline_guard_active():
             for path in Path("/proc").glob("[0-9]*"):
                 try:
                     if (path / "comm").read_text().strip() in names:
