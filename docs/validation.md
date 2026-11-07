@@ -92,9 +92,26 @@ Statuses:
 Unload does not clear the hold. The operator was told to reboot and then
 confirm fanwatch is back at 2700/4050. That confirmation is not in hand.
 Do not mark the restore PASS, and do not issue another fan write, until
-that output exists.
+that output exists. Reboot was started. No post-reboot fanwatch output has
+arrived, so reboot cleanup stays PENDING.
 
-## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
+## Atarime direct `_FSL` 110
+
+Status: **UNRUN**. No build output and no call output from Atarime are in
+hand. Kensaki's reboot cleanup stays PENDING and is a separate row.
+
+The same `research/fsl110` module is the caller. `run-once.sh` stays
+Kensaki-only. Atarime is `build-sign-atarime.sh` then
+`run-once-atarime.sh`, and only after the build script prints
+`BUILD_SIGNED_NOT_LOADED`. The build script signs with the DKMS-configured
+certificate only when `mokutil --test-key` says that certificate is already
+enrolled. It does not generate or enroll a key. The run script requires
+hostname `atarime`, the controller absent, exactly two nonzero `acpi_fan`
+readings, every thermal zone in 25–60 °C, and GPU utilization 0. It does
+not require 2700/4050. One `run` only. `interpreter_ok` is not an EC accept
+or reject. Speeds that stay near the idle tach are no observed effect, not
+a protocol rejection. Unload does not clear a hold. Reboot after the trial
+whatever the speeds do. Do not mark this PASS from the script existing.
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
 the EC blocked in `DisabledDevices`. SoC/UEFI stayed October `0x02009e0f`.

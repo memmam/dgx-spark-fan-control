@@ -20,6 +20,11 @@ exactly `run`, and a second `run` returns `-EBUSY` before ACPI.
 EC kept 4687. Unload does not undo a hold. The release that has restored
 2700/4050 is a reboot, seen after level 100 through this same method.
 
+`run-once.sh` is Kensaki only and still requires the 2700/4050 pair. Atarime
+uses `build-sign-atarime.sh` and `run-once-atarime.sh`. Those refuse any other
+hostname. The module is unchanged: one `run` still calls `\_SB.FAN0._FSL`
+with 110 and a second `run` is refused before ACPI.
+
 ## Cleanup
 
 `rmmod fsl110` removes `/proc/fsl110` and does not change the fan. Delete this
