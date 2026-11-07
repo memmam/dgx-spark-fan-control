@@ -2662,17 +2662,10 @@ def recover_fan_stall(thermal_root: Path, *, module_loaded: bool) -> None:
             MAX_STATE,
         )
         return
-    try:
-        set_acpi_fans(
-            thermal_root, ACPI_MAX_LEVEL,
-            module_loaded=False, service_active="inactive", report=False,
-        )
-    except (OSError, RuntimeError, ValueError) as exc:
-        LOG.error("fan stall: ACPI level %d write failed: %s", ACPI_MAX_LEVEL, exc)
-        return
     LOG.critical(
-        "fan stall: wrote ACPI Fan level %d because every fan read 0 RPM",
-        ACPI_MAX_LEVEL,
+        "fan stall: module is not loaded; not writing ACPI Fan cur_state. "
+        "No fan command is issued on this path. The alert, one reboot, and "
+        "the true-zero poweroff still apply."
     )
 
 
@@ -3836,15 +3829,11 @@ def acpi_fan_result_line(device: Path) -> str:
 
 
 def write_acpi_fan_level(device: Path, level: int) -> None:
-    maximum = int((device / "max_state").read_text(encoding="ascii").strip())
-    if not 0 <= level <= maximum:
-        raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
-    (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
-    observed = int((device / "cur_state").read_text(encoding="ascii").strip())
-    if observed != level:
-        raise RuntimeError(
-            f"ACPI fan readback mismatch: wrote {level}, read {observed}"
-        )
+    """Refuse before any sysfs write. ACPI Fan cur_state is not a control path."""
+    raise RuntimeError(
+        f"refusing ACPI Fan cur_state write of {level} on {device}: "
+        "this tree does not write ACPI fan levels"
+    )
 
 
 def pinned_ec_name(log_text: str) -> str | None:
@@ -4269,7 +4258,7 @@ def enable_kernel_module(etc: Path, *, runner, loaded: bool,
         # on the EC 3.13.7 enable path.
         print(
             f"fan control unsupported on {label}; telemetry only, "
-            "service left disabled; use acpi-max on EC 3.5.8"
+            "service left disabled; this tree does not write ACPI fan levels"
         )
         note_initramfs(etc)
         return
@@ -4358,68 +4347,12 @@ def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
                   force: bool = False,
                   profile: str | None = None,
                   report: bool = True) -> None:
-    """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
-
-    Refuses while this module is loaded or its daemon is active, unless force
-    is set. A level below 35 is refused before any write. Level 0 stops both
-    fans. EC 3.13.7 accepts the ACPI write and ignores RPM.
-    """
-    if level < ACPI_MIN_LEVEL or level > ACPI_MAX_LEVEL:
-        raise ValueError(
-            f"refusing ACPI fan level {level}: this command only writes "
-            f"{ACPI_MIN_LEVEL} through {ACPI_MAX_LEVEL}. "
-            "Level 35 is the lowest level measured to hold. Level 20 has "
-            "stalled one fan. Level 0 stops both fans immediately "
-            "and they stay stopped. Do not write 0."
-        )
-    if module_loaded is None:
-        module_loaded = module_is_loaded()
-    if service_active is None:
-        service_active = systemctl_is_active()
-    refusal = acpi_write_refusal(module_loaded, service_active)
-    if refusal and not force:
-        raise RuntimeError(refusal)
-    if refusal and force:
-        LOG.warning(
-            "forcing an ACPI write while the kernel module or the fan service "
-            "is active. This overwrites the shared EC lower floor. "
-            "Do not write level 0; it stops both fans."
-        )
-    devices = acpi_fan_devices(thermal_root)
-    if not devices:
-        raise RuntimeError("no ACPI Fan cooling device found")
-
-    def fail_hot() -> None:
-        if level == ACPI_MAX_LEVEL:
-            return
-        for device in devices:
-            try:
-                write_acpi_fan_level(device, ACPI_MAX_LEVEL)
-            except (OSError, RuntimeError, ValueError) as exc:
-                LOG.error(
-                    "fail-hot ACPI write of %s failed: %s", ACPI_MAX_LEVEL, exc,
-                )
-
-    failures: list[BaseException] = []
-    summaries: list[str] = []
-    try:
-        for device in devices:
-            try:
-                write_acpi_fan_level(device, level)
-                summaries.append(acpi_fan_result_line(device))
-            except (OSError, RuntimeError, ValueError) as exc:
-                failures.append(exc)
-        if failures:
-            raise RuntimeError(
-                f"ACPI fan update to {level} failed on {len(failures)} device(s)"
-            )
-        if report:
-            for line in summaries:
-                print(line)
-            print(acpi_result_note(profile))
-    except BaseException:
-        fail_hot()
-        raise
+    """Refuse before any ACPI Fan cur_state write, including --force and fail-hot."""
+    del thermal_root, module_loaded, service_active, force, profile, report
+    raise RuntimeError(
+        f"refusing ACPI Fan cur_state write of {level}: "
+        "this tree does not write ACPI fan levels"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4499,16 +4432,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=WATCHDOG_MAX_DEFER_SECONDS,
         help="after this long deferred, alert and keep waiting; never reboot through work",
     )
-    acpi_max = subparsers.add_parser(
-        "acpi-max",
-        help="set ACPI Fan cooling devices without this kernel module",
-    )
-    acpi_max.add_argument("--level", type=int, default=ACPI_MAX_LEVEL)
-    acpi_max.add_argument(
-        "--force",
-        action="store_true",
-        help="write ACPI even if this kernel module or its daemon is active",
-    )
     module = subparsers.add_parser(
         "module",
         help="enable or disable the kernel module for ACPI-only fan control",
@@ -4583,23 +4506,6 @@ def main(argv: list[str] | None = None) -> int:
                 max_defer_seconds=args.max_defer_seconds,
                 stuck_seconds=args.stuck_seconds,
             )
-        if args.command == "acpi-max":
-            # Telemetry-only firmware (EC 3.13.7): ACPI cur_state writes are
-            # accepted and ignored for RPM. Do not write; leave set_acpi_fans
-            # unchanged for the watchdog stall-repair caller on supported EC.
-            if classify_fan_binding(args.thermal_root, args.hwmon_root) == "unsupported":
-                profile = pinned_ec_name(read_kernel_log()) or "EC 3.13.7"
-                LOG.info(
-                    "acpi-max: nothing written (%s, telemetry only; "
-                    "EC runs its own curve)",
-                    profile,
-                )
-                return 0
-            set_acpi_fans(
-                args.thermal_root, args.level, force=args.force,
-                profile=pinned_ec_name(read_kernel_log()),
-            )
-            return 0
         if args.command == "module":
             if os.geteuid() != 0:
                 raise PermissionError("dgx-fan-control module requires root")

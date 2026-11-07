@@ -1,5 +1,29 @@
 # Validation and provenance
 
+## Rollback point for this branch
+
+`e57001b9adaf1ca5695da447939c8def68eb51f5`, author date 2026-11-06 11:26:42
+−0800, is the git tip before `3fdcc4d` (13:46 −0800 the same day), the first
+ACPI thermal-escalation commit. History from there back is linear. Nothing
+was committed during the Kensaki step-down searches (about 11:31–13:03
+−0800), so this commit is the tree those searches ran against. It is not a
+hardware-proven last-working module. The later loaded module was 0.1.7.
+This commit is module 0.1.6. Its parent `2955201` differs only in install
+documentation.
+
+The daemon curves in this commit are the accepted ones: default 50→3, 55→5,
+60→8, 65→10, 70→12 with the state-1 pin, and the opt-in quiet table from
+the tenhkspark patch. ACPI level samples from that afternoon stay research
+evidence. This tree does not write ACPI `cur_state`.
+
+With the module unloaded, a true-zero stall used to write ACPI level 100.
+That write is removed and nothing is substituted for it. The alert, the one
+reboot when no work is running, and the true-zero poweroff at 85 °C remain.
+Those actions were not re-measured on hardware for this commit.
+
+Older sections below are the record as it stood at this commit, including
+commands this tree no longer provides.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
