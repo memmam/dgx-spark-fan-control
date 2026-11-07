@@ -288,7 +288,11 @@ at 90 C, and that poll does not wait out the lower stages.
    is not added to the 15 seconds. Phase 1 is different on purpose: an
    unreadable zone there is treated as 90 C and can continue the clock.
    That fail-closed path is not used in the EC-only phase, which does not
-   write ACPI and does not power off on the unreadable sample.
+   write ACPI and does not power off on the unreadable sample. An exception
+   from the thermal poll is a third case: the watchdog logs it, clears only
+   the poweroff clock, and keeps polling. The incident latch and the
+   workload stage are left as they were. An unreadable phase-1 zone is not
+   this exception path and is still treated as 90 C.
 
    These intervals were not timed on hardware and they are not a claim
    about when a machine will cut power. An unreadable zone in this phase

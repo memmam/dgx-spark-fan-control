@@ -999,6 +999,86 @@ class ThermalTests(unittest.TestCase):
         self.guard.step(90, 27, self.maximum, ec_only=True)
         self.shutdown.assert_called_once()
 
+    def test_watchdog_poll_exception_restarts_the_poweroff_interval(self):
+        thermal, hwmon = self.fake_fans(90000)
+        C.STALL_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+        (C.STALL_MARKER_DIR / C.ACPI_INCIDENT_NAME).write_text(
+            "old-boot\n", encoding="ascii",
+        )
+        real = C.poll_acpi_thermal
+        script = ("seed", "raise", "raise", "good", "good")
+        seen = []
+        clock = {"t": 0.0, "i": 0}
+        shutdowns = []
+
+        def monotonic():
+            return clock["t"]
+
+        def wrapped(guard, thermal_root, hwmon_root, now, zero=C.WATCHDOG_ZERO_FAN_CELSIUS):
+            kind = script[clock["i"]]
+            clock["i"] += 1
+            if clock["i"] < len(script):
+                clock["t"] = (0.0, 20.0, 21.0, 22.0, 37.0)[clock["i"]]
+            guard.targets = lambda: {}
+            guard.discovery_complete = True
+            guard.identity = lambda _pid: None
+            if kind == "seed":
+                guard.stage = "ec-watch"
+                guard.since = 2.5
+                guard.ceiling_since = 0.0
+                guard.selected = {}
+                return
+            if kind == "raise":
+                self.assertEqual(guard.stage, "ec-watch")
+                self.assertEqual(guard.since, 2.5)
+                if clock["i"] == 2:
+                    self.assertEqual(guard.ceiling_since, 0.0)
+                else:
+                    self.assertIsNone(guard.ceiling_since)
+                guard.ceiling_since = 0.0
+                raise OSError("thermal sensor read failed")
+            if not seen:
+                self.assertIsNone(guard.ceiling_since)
+            else:
+                self.assertEqual(guard.ceiling_since, 22.0)
+            self.assertEqual(guard.stage, "ec-watch")
+            self.assertEqual(guard.since, 2.5)
+            seen.append(now)
+            return real(guard, thermal_root, hwmon_root, now, zero)
+
+        def poweroff(action):
+            shutdowns.append((clock["t"], action))
+            return 0
+
+        event = Mock()
+        event.is_set.side_effect = [False] * 9 + [True]
+        event.wait.return_value = False
+        with patch.object(C, "Event", return_value=event), \
+             patch.object(C.signal, "signal"), \
+             patch.object(C, "observe_hot_job"), \
+             patch.object(C, "poll_acpi_thermal", side_effect=wrapped), \
+             patch.object(C, "run_watchdog_action", side_effect=poweroff), \
+             self.assertLogs(C.LOG, level="CRITICAL") as logs:
+            self.assertEqual(C.run_watchdog(
+                thermal, hwmon, defaults={}, runner=Mock(return_value=0),
+                unit_state=lambda: ("inactive", "disabled", 0, "success", 0),
+                notifier=lambda *_: None, monotonic=monotonic,
+                marker_path=C.STALL_MARKER_DIR / "exception-stall",
+                boot_id="test-boot", gpu_jobs=lambda: False,
+                reboot_seconds=10**9, poll_seconds=1,
+            ), 0)
+        text = "\n".join(logs.output)
+        self.assertEqual(text.count("ACPI thermal observation failed"), 2)
+        self.assertEqual(text.count("poweroff interval cleared"), 2)
+        self.assertEqual(
+            (C.STALL_MARKER_DIR / C.ACPI_INCIDENT_NAME).read_text().strip(),
+            "old-boot",
+        )
+        for fan in C.acpi_fan_devices(thermal):
+            self.assertEqual((fan / "cur_state").read_text().strip(), "35")
+        self.assertEqual(seen, [22.0, 37.0])
+        self.assertEqual(shutdowns, [(37.0, C.WATCHDOG_DEFAULT_ACTION)])
+
     def test_failed_reboot_starts_a_new_poweroff_clock(self):
         self.reboot.return_value = 1
         self.step(90, 0)

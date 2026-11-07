@@ -3131,7 +3131,15 @@ def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
         try:
             poll_acpi_thermal(acpi_guard, thermal_root, hwmon_root, monotonic(), zero_fan_celsius)
         except (OSError, RuntimeError, ValueError) as exc:
-            LOG.critical("ACPI thermal observation failed: %s; preserving true-zero monitoring", exc)
+            # The sample did not finish. Time during this fault is not
+            # continuous heat. The workload stage and the incident latch stay.
+            acpi_guard.clear_poweroff_clock()
+            LOG.critical(
+                "ACPI thermal observation failed: %s; poweroff interval "
+                "cleared; preserving true-zero monitoring, the incident "
+                "latch, and the workload stage",
+                exc,
+            )
         active_state, enabled_state, exec_status, unit_result, n_restarts = (
             split_unit_state(unit_state())
         )
