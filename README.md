@@ -253,7 +253,7 @@ are real. If probe times out, `acpi-max` is the fallback, and only while
 this module is not loaded. The two writers share one lower-floor register.
 Downgrading EC 3.13.7 to 3.5.8, and blocking fwupd from putting 3.13.7
 back, are in
-[EC firmware pairing and downgrade](docs/installation.md#ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](docs/installation.md#7-ec-firmware-pairing-and-downgrade).
 
 ## ACPI-only mode
 

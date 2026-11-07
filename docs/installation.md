@@ -218,7 +218,7 @@ probing can still reject the firmware contract. See
 [troubleshooting](troubleshooting.md) if needed. Fan-floor control needs
 EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
 back, are in
-[EC firmware pairing and downgrade](#ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](#7-ec-firmware-pairing-and-downgrade).
 
 Finish by refreshing the stored health record. Installing a different
 build marks the old record stale, so the first `health` run after an
@@ -364,28 +364,15 @@ The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
 Continue to [pre-cooling and everyday usage](usage.md).
 
-## 6. Update the userspace
+## 6. Updating
 
-Userspace and module updates are in
-[Updates and removal](maintenance.md#update-this-projects-source).
-Do that userspace update on every update. It does not rebuild the kernel
-module. Do not build a module before `git pull`.
+Update the userspace on every update. Rebuild the kernel module only when
+the version check on
+[Updates and removal](maintenance.md#update-this-projects-source)
+says `kernel/` changed, and only after `git pull` and that userspace update.
+The DKMS and by-hand rebuilds stay on that page.
 
-## 7A. Update the module with DKMS
-
-After the userspace update, follow
-[Update the module with DKMS](maintenance.md#update-the-module-with-dkms)
-only when that page's version check says `kernel/` changed. Building before
-`git pull` rebuilds the old source under the new version number.
-
-## 7B. Update the module by hand
-
-After the userspace update, follow
-[Update the module by hand](maintenance.md#update-the-module-by-hand)
-only when that page's version check says `kernel/` changed. Building before
-`git pull` rebuilds the old source under the new version number.
-
-## EC firmware pairing and downgrade
+## 7. EC firmware pairing and downgrade
 
 Fan-floor control needs **EC 3.5.8**. **EC 3.13.7** accepts the capability
 reply and then refuses floor writes. Downgrade to 3.5.8, then block EC
