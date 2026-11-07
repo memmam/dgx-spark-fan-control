@@ -200,6 +200,15 @@ call was requested and is not yet confirmed. The second run does show that
 Atarime had booted far enough to execute the probe. It is not a Kensaki
 post-reboot fan pair.
 
+A later fanwatch, about 17 seconds, SoC 45–47 °C, showed fan 1 at 2064–2079
+and fan 2 at 2156–2168, with no zeros. The operator did not say this sample
+was after the post-probe reboot, so it does not close that reboot. It is the
+same idle tach band as the isolated probe. No further Atarime write is
+requested. `interpreter_ok` is still only the AML interpreter. The captured
+`WRB` method does not test the SMC response, and the research caller discards
+it. These tach readings do not separate an EC rejection from a write the EC
+accepted and did not apply.
+
 ## Kensaki continuation from 160, not yet run
 
 **UNRUN.** The module list now starts at 160 and still ends at 237
