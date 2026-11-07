@@ -79,7 +79,7 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.6"
+#define DGX_EC_DRIVER_VERSION		"0.1.8"
 /* Family-7 mailbox status byte: success is 0x00, unsupported is 0xFF. */
 #define DGX_EC_STATUS_UNSUPPORTED	0xffU
 /* ACPI level 20 stalled a fan near 1620 RPM. Do not request below this. */
@@ -671,6 +671,25 @@ static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *flo
 	struct ffa_device *oem;
 	u64 started;
 	int ret;
+
+	/*
+	 * EC 3.5.8 keeps one idle-mailbox floor read. Live status 0x08 was
+	 * read on both Sparks while the packet poll stayed 2, and one
+	 * GET_LOWER_LIMIT recovered that case. The setter is not replayed.
+	 * A later timeout with this path already off does not show that the
+	 * read caused the wedge, and it does not show the OEM status.
+	 * EC 3.13.7 does not take floor commands, so a telemetry timeout
+	 * stays -ETIMEDOUT and does not submit operation 0x04.
+	 */
+	if (!data->profile ||
+	    (data->profile->telemetry_if_floor_unsupported &&
+	     !allow_unverified_writes)) {
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"timeout stays -110; %s gets no floor read\n",
+			data->profile ? data->profile->name : "unmatched profile");
+		data->recovery_unverified = false;
+		return -ETIMEDOUT;
+	}
 
 	if (data->recovery_attempted && time_before(jiffies, data->next_recovery)) {
 		data->telemetry_valid = false;

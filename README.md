@@ -235,7 +235,7 @@ back, are in
 ## Module off
 
 `module disable` unloads the driver and does not write an ACPI fan level.
-Full removal is `sudo dkms remove dgx-spark-fan-control/0.1.6 --all` (the
+Full removal is `sudo dkms remove dgx-spark-fan-control/0.1.8 --all` (the
 version in `dkms.conf`).
 
 ```sh

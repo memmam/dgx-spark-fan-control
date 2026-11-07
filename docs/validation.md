@@ -21,6 +21,22 @@ That write is removed and nothing is substituted for it. The alert, the one
 reboot when no work is running, and the true-zero poweroff at 85 °C remain.
 Those actions were not re-measured on hardware for this commit.
 
+Carry-forward, decided on this branch:
+
+- EC 3.5.8 keeps the one idle-mailbox floor read. Status `0x08` with the
+  packet poll still 2 was measured, and one `GET_LOWER_LIMIT` recovered
+  that case. The floor write is not replayed.
+- The 6 Nov timeout happened while that read was already disabled. Its OEM
+  status was not captured. That log does not make the read unsafe, and it
+  does not show the read would have cleared that wedge.
+- EC 3.13.7 still gets no floor command, including after a telemetry
+  timeout. There is no module parameter for this. `allow_unverified_writes`
+  stays off.
+- No ACPI `cur_state` writes. No fault latch. Curves and the 85 °C
+  true-zero cutoff are unchanged.
+- The module version is 0.1.8 so it is not labeled as stock 0.1.6 or as
+  the loaded 0.1.7. Do not install it on the Sparks from this pass.
+
 Older sections below are the record as it stood at this commit, including
 commands this tree no longer provides.
 
