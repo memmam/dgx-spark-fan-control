@@ -250,8 +250,11 @@ MODULES_LOAD_DISABLED_TEXT = (
     "# dgx_ec_fan_control\n"
 )
 MAX_STATE = 12
-# Same RPM-mode tables as the kernel profiles. State 0 is unset and is not
-# an owned floor. The raw value is what the EC register holds.
+# Common lower-floor words, one per cooling state. These are not tachometer
+# pairs. On EC 3.5.8, state 0 is the stock curve (idle tachometers about
+# 2700/4050). State 1's word is 2700. The EC 3.13.7 row is
+# 2000 + (4350 - 2000) * (state - 1) / 11. That profile is not written
+# unless allow_unverified_writes is set at load.
 FLOOR_TABLES = {
     "EC 3.5.8": (
         None, 2700, 3600, 4500, 5400, 6300, 7200, 8100, 9000,
@@ -287,12 +290,15 @@ RETRYABLE_ERRNOS = frozenset((
     errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
 ))
 
-# Temperatures are unchanged. State indexes are shared by every capability
-# profile: the kernel maps them to that profile's floor table. State 0 is
-# NVIDIA's curve and is never selected while this process is running. A lower
-# clamp of 0 has been observed to latch with the fans stopped. State 1 is the
-# first additive floor of the active profile. State 12 is that profile's
-# reported maximum. Stopping the daemon still writes state 0.
+# Temperature to cooling state while the daemon is running. The kernel maps
+# the state index through the active profile's floor table. This table is
+# not an ACPI level and not the EC duty steps.
+#
+# The September breakpoints are unchanged: 50→3, 55→5, 60→8, 65→10, 70→12.
+# a594c98 adds only the state-1 pin, because a lower clamp of 0 has latched
+# with the fans stopped. Below 50 °C the daemon stays at state 1. State 0
+# is NVIDIA's curve and is never selected here. Stopping the daemon still
+# writes state 0.
 PERFORMANCE_CURVE = (
     (0.0, 1),
     (50.0, 3),
@@ -302,10 +308,11 @@ PERFORMANCE_CURVE = (
     (70.0, 12),
 )
 
-# Opt-in quieter curve from tenhkspark, upstream PR #2 and
-# tenhkspark/dgx-spark-fan-tuning patch/0001-performance-curve.patch.
-# For EC 3.5.8 with the pre-October SoC (validation image 2.155.11) when
-# less noise is worth higher temperatures. State 1 is still the floor.
+# Opt-in. The default table above stays in place. Rows are
+# tenhkspark/dgx-spark-fan-tuning patch/0001-performance-curve.patch,
+# copied at 012f671, not those breakpoints plus 7 °C. For EC 3.5.8 with
+# the pre-October SoC (validation image 2.155.11) when less noise is worth
+# higher temperatures. State 1 is still the floor.
 QUIET_CURVE = (
     (0.0, 1),
     (52.0, 2),
