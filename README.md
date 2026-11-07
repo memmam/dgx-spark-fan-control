@@ -1,27 +1,13 @@
 # DGX Spark Fan Control
 
-> **EC 3.5.8 ACPI warning:** any ACPI hold replaces the EC curve until
-> reboot; level 100 is only about 48%/32% duty, not full fan speed. On
-> kensaki (rig off), 100 held 4320/4320 RPM at a hottest zone of 95–97.7 C
-> and SoC 96–97 C, versus the stock curve's 4860/7290 by about 94.5 C,
-> 6660/9990 at about 95 C, and 88.8–89.7 C settled. Do not hold ACPI under
-> sustained full load. The independent watchdog advises at 70 C and does
-> not stop anything for holding 70–79 C. At 80 C it starts a configured
-> stop hook and, while an ACPI hold is active, forces level 100. With no
-> hook, it does not send SIGTERM until 85 C. It sends SIGKILL at 90 C.
-> A confirmed stop reboots immediately to restore the EC curve. Poweroff
-> does not replace that reboot. The next boot only monitors the stock EC
-> curve: no ACPI writes, no second reboot. If heat returns, it stops the
-> job again and shuts down only when heat persists after that stop. An
-> optional resume hook is off until configured and runs at most once.
-> An incident stays latched across reboot until explicit manual reset.
-> Read [escalation, recovery, configuration, and safeguards](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
-> The burn view's GPU temperature can read about 10 C below the hottest
-> zone. The checkout diagnostic `research/acpi-floor-sweep/acpi-floor-sweep`
-> is not installed by `scripts/install-userland`. Its `--max-temp` defaults to 60 C;
-> supervised burns must raise it (for example `--max-temp 95`), without
-> bypassing escalation. Finishing at level 100 does not restore the EC curve.
-> The 85 C true-zero fan poweroff remains separate and unchanged.
+> **ACPI on EC 3.5.8 replaces NVIDIA's fan curve until reboot.** Level 100
+> is not full speed. On the measured machine it held about 4320 RPM, well
+> below the stock curve at the same temperature. Do not hold ACPI under a
+> sustained full load. Never write a level below 35, and never write 0.
+> Thresholds, the stop hook, reboot, and poweroff are in
+> [ACPI holds](docs/ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
+> The 85°C poweroff for fans that read 0 RPM is a separate rule:
+> [stopped fans](docs/usage.md#watch-for-stopped-fans).
 
 
 **Pre-cool your Spark, run your job, return to NVIDIA's fan curve.**
@@ -81,137 +67,25 @@ policy. See the [state table and performance curve](docs/usage.md#choose-a-fan-f
 
 ## Compatibility
 
-Fan-floor **control** was tested on **NVIDIA DGX Spark, board P4242**, with
-**EC 3.5.8** and the pre-October SoC firmware, DGX OS 7.5.0, and kernel
-`6.17.0-1029-nvidia`. Later checks used kernel `7.0.0-1019-nvidia`. Upstream
-does not pin one SoC build in the compatibility statement. The validation
-record for this tree used SoC 2.155.11 (`0x02009b0b`). **EC 3.5.8 with October
-SoC firmware 2.158.15** (`0x02009e0f`) has done both of the following on DGX
-Spark: completed probe (`pinned EC 3.5.8 capabilities fan0=1260..9000
-fan1=1890..13500`, cooling device registered) and, on other boots, timed
-out the first read-only query so the driver did not bind.
-A timeout is still a reason to use the ACPI fan devices. It is not proof that
-this pair can never bind.
+| Firmware | What this does |
+| --- | --- |
+| **EC 3.5.8** on DGX Spark, board P4242 | Fan-floor control. State 0 is NVIDIA's curve. Checked on DGX OS 7.5.0 and kernels `6.17.0-1029-nvidia` and `7.0.0-1019-nvidia`. The validation image is SoC 2.155.11. October SoC 2.158.15 has both bound and timed out the first read. A timeout is a reason to use ACPI while the module is unloaded. It is not proof that this pair can never bind. |
+| **EC 3.13.7** | Telemetry only. Probe does not send a floor command and does not create a cooling device, including after a timeout. `status` prints `control unsupported on this firmware`. Floor writes fail because the EC no longer lets the host enable them. `allow_unverified_writes=1` is unqualified. Do not turn it on to test a machine whose fans have stopped. |
+| Anything else | Rejected. An unknown capability reply does not bind. |
 
-**EC 3.13.7** (`fwupdmgr` `0x03000d07`) has been observed on the same board,
-including kernel `7.0.0-1024-nvidia`. The capability reply is still revision 1,
-unit mode 0, but both fans report **975–4350** instead of 1260–9000 and
-1890–13500. Those figures match the ACPI tach target `975 + 33.75 × level`
-(level 100 is 4350). They are not a rescaling of the older RPM-mode control
-ranges, which the EC converts to PWM. A public diff of the EC images found the
-override handlers and their dispatch table byte-identical between 3.5.8 and
-3.13.7. They return **-5 (unsupported)** or **-116 (timeout)** when an enable
-bit is clear. What changed is host command **0xEB**: it now honors a permission
-table that marks the fan/thermal register block read-only, so the host can no
-longer set that enable bit. This is deliberate access control. Floor writes on
-3.13.7 are therefore expected to fail. Version 0.1.6 still accepts the exact
-capability reply. Probe on that profile reads capabilities and telemetry only.
-It does not send a floor command, and it does not create a cooling device.
-`dgx-fan-control status` then prints `control unsupported on this firmware` once,
-followed by an advisory `clock-cap:` line ([why](docs/ec-curve.md)).
-Floor writes require `allow_unverified_writes=1` at module load, which logs a
-warning. The 3.13.7 state table behind that switch is **not qualified**. Do
-not enable it to test a machine whose fans have stopped.
+On EC 3.5.8, ACPI `cur_state` and this module write the same lower floor. This command refuses ACPI levels below 35. Level 0 stops both fans and does not clear a floor the module does not own. On EC 3.13.7 the same ACPI write is accepted and does not change RPM. An ACPI level does not survive reboot.
 
-On **EC 3.5.8**, ACPI `Fan` `cur_state` and this module's lower floor are the
-same EC register. The BIOS maps an ACPI level to `975 + 33.75 × level` RPM.
-Forum measurements: level 100 about 4320 RPM, level 30 about 1940, level 20
-about 1620 with the second fan stalling, and level 0 stops both fans. **Never
-write an ACPI level below 35, the lowest level measured to hold. Level 0 stops
-both fans immediately and they stay stopped; it also does not clear a foreign
-floor.** This command refuses levels below 35. `acpi-max` refuses while
-`dgx_ec_fan_control` is loaded or `dgx-fan-control.service` is active, unless
-`--force` is passed. On EC 3.13.7 the same ACPI write is accepted and does not change fan speed. An ACPI level
-does not survive reboot: these machines returned to about 2700/4050 RPM
-without another `acpi-max`.
+Version **0.1.7** leaves a mailbox timeout as that timeout. It does not submit a floor read afterward unless `automatic_floor_recovery=1`, and it never does so on EC 3.13.7 or before a profile is known. An unsupported floor reply is not retried. A timed-out floor write is not replayed. A floor this driver did not set stays in place; reboot is what restored the EC curve on the measured machines. Ranges, the 0xEB permission change, and older recovery behavior are in the [protocol](docs/protocol.md) and [troubleshooting](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 
-Other GB10 boards, generic kernels, and any capability reply other than the
-two profiles above are rejected. The driver does not relax validation to make
-an unknown reply succeed.
-
-You need Python 3.10+, matching NVIDIA kernel headers and build tools, and an
-enrolled local signing certificate when Secure Boot is enabled. DKMS is optional;
-systemd provides boot loading and the optional performance service.
-
-This is an independent, experimental project, unaffiliated with NVIDIA.
-Version **0.1.6** recognizes the EC 3.13.7 capability reply and binds telemetry
-only, with no floor command, unless `allow_unverified_writes=1`. It tells a
-probe timeout apart from that case. The default performance curve never requests state 0 while the daemon is
-running. `--curve quiet` or `DGX_FAN_CURVE=quiet` selects the quieter opt-in
-curve from tenhkspark (upstream pull request 2). It is for EC 3.5.8 with the
-pre-October SoC, including the 2.155.11 image in the validation record, when
-less noise is preferred over lower temperatures. It also never selects state 0.
-A reply-guard recovery refusal is retried after the 30-second cooldown; a
-foreign floor remains fatal. Version **0.1.4** keeps a loaded module on NVIDIA's
-curve when the performance service is not running. State 0 is that curve. A
-latched lower clamp of 0, which stops both fans and survives a warm reboot, is
-cleared on load and on every automatic restore when floor writes still work.
-Version **0.1.3** includes bounded in-driver recovery for the observed stale-pending,
-idle-mailbox failure. It validates physical mailbox observations, submits one
-read-only recovery request, checks the reply, and reconciles floor ownership
-before continuing. Timed-out setters are never blindly replayed. Recovery
-attempts have a shared 30-second cooldown; busy, unreadable, or inconsistent
-mailboxes remain errors. The underlying firmware defect remains, and long-term
-unattended reliability is not yet qualified. See
-the [incident logs](docs/incident-logging.md), which retain recent transaction
-timing and recovery observations without extra EC traffic, and the
-[recovery instructions](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
-Orderly stop, suspend, reboot, and module removal request and verify automatic
-control. A hard crash or transport failure can prevent restoration; manual
-floors have no expiry timer. Read the [validation and limitations](docs/validation.md).
+You need Python 3.10+, matching NVIDIA kernel headers, and a signing key when Secure Boot is on. This project is independent of NVIDIA. The quieter opt-in curve is under [Quiet curve](#quiet-curve).
 
 ## Known issues
 
-Reported by the user on two DGX Sparks on 5 Nov 2026 (EC `0x03000d07`, kernel
-`7.0.0-1024-nvidia`, BIOS `5.36_0ACUM028`). These are observations, not a
-verified cause.
+**Both fans read 0 RPM.** Seen twice on EC 3.13.7 on 5 Nov 2026 (kernel `7.0.0-1024-nvidia`, BIOS `5.36_0ACUM028`): once idle at 79°C, once on a cold boot near 42°C. The loaded module's probe had already failed after the capability read, so no fan command had been sent. A shutdown and a 30-second power pull cleared both. External fans (front and rear) lowered this machine's own RPM by about 400–500 total, and rear fans alone by about 100, without a 0 RPM reading while it was already up. Boot-time airflow has not been tested. After every boot, read `fan1_input`. The watchdog alerts after 15 seconds at 0 RPM and reboots once if no work is running; a second boot that is still at 0 RPM powers off. What it will and will not do is in [stopped fans](docs/usage.md#watch-for-stopped-fans).
 
-Twice, a Spark's ACPI fans (`acpi_fan` hwmon `fan1_input`) read a flat 0 RPM.
-Once the machine was idle, the external fan rig was off, and the SoC reached
-79°C. Once it was a cold boot, about 42°C. The stock 0.1.4 module was loaded
-through DKMS but probe had already failed with `-EBADMSG` after the capability
-read only, so no fan command had been sent. It is not believed to be the
-cause. A shutdown and a 30-second power pull cleared both events.
+**The mailbox stays pending.** On one EC 3.5.8 boot (6 Nov 2026), operation 0x04 stayed pending (`-110`) after about 99 reads and stayed that way until reboot. Version 0.1.7 does not send another floor command for that. It is not fixed in firmware. See [persistent pending](docs/troubleshooting.md#persistent-pending-and-service-exit-69).
 
-External chassis fans (a front and rear rig) blowing through the unit lower
-the Spark's own fan RPM by about 400–500 total. Rear fans alone are about
-100 RPM. The change is smooth and reversible. Toggling the rig on and off
-repeatedly while the machine was running never produced a 0 RPM reading. The
-suspected trigger is boot-time state: boot order against external airflow, or
-the EC stopping its own fans. That has not been tested.
-
-Anyone running external airflow should read `fan1_input` after every boot.
-`dgx-fan-watchdog.service` runs `dgx-fan-control watchdog` at boot. It does
-not depend on the performance daemon or this kernel module, so disabling
-`dgx-fan-control.service` leaves it running. `sudo ./scripts/install-userland`
-enables it, and also enables `dgx-fan-health.service` and
-`dgx-fan-manual.service`, and writes the boot-load entry when it is absent.
-`--no-watchdog` skips the watchdog only. See
-[startup modes](docs/installation.md#5-choose-your-startup-mode). Copying only
-the performance unit leaves `status` at `watchdog-enabled: not-found`. The
-watchdog reads `acpi_fan` and the hottest thermal zone. If every fan stays
-at 0 RPM for 15 seconds it alerts and tries one repair: ACPI level 100 if
-the module is unloaded, or the module's maximum state if it is loaded. It
-never writes level 0. About 60 seconds after the zeros began, with no work
-in progress, it reboots once. The default signal is an `nvidia-smi` compute
-process, and only when `BUSY_CHECK` is unset. A persistent server keeps that
-default busy, so the legacy stall reboot stays deferred; its 85°C poweroff
-requires a true zero. ACPI holds additionally arm the separate escalation
-policy described above. A second boot that is still at 0 RPM powers off.
-Work in progress waits, and a true zero at 85°C still powers off. Spinning
-fans on an unarmed stock curve are not powered off for temperature. A foreign floor reboots once the
-same way, without the repair; the next boot records needs-intervention
-instead of powering off. `dgx-fan-health.service` checks
-fans and thermals after boot and retries for 45 seconds.
-`sudo dgx-fan-control health` prints the same checks in one pass. Without
-root, some checks read `unknown (needs root)`. Userspace cannot beat a rise
-of about 4°C/s to the kernel
-critical trip near 104°C. Keeping the fans running, and pre-cooling, are
-the defenses. See [usage](docs/usage.md#watch-for-stopped-fans). The same command
-also logs and broadcasts
-when `dgx-fan-control.service` is not `active`, before it looks at
-temperature. That alert does not power the machine off. The cold alert and
-the level-100 write have not been run on hardware yet.
+**Status or unload reports `-ESTALE` (`-116`).** The floor is not a value this driver set. That is an ownership change, not a mailbox timeout. Only 4350 RPM (`0x10fe`) is the known ACPI level-100 value. Another number is not proof of who wrote it. Reboot restores the EC curve. Do not write ACPI level 0. See [an ACPI floor](docs/troubleshooting.md#daemon-restarts-forever-after-an-acpi-floor).
 
 ## Quiet curve
 
@@ -261,7 +135,7 @@ back, are in
 
 Use this when fans should be driven with `acpi-max` and the kernel module
 should stay unloaded. `disable` does not uninstall the driver. Full removal
-is `sudo dkms remove dgx-spark-fan-control/0.1.6 --all` (the version in
+is `sudo dkms remove dgx-spark-fan-control/0.1.7 --all` (the version in
 `dkms.conf`).
 
 ```sh

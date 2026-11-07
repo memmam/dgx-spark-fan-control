@@ -3649,18 +3649,22 @@ def latest_floor_mismatch(log_text: str) -> tuple[int | None, int | None]:
 
 def floor_changed_message(observed: int | None = None,
                           expected: int | None = None) -> str:
-    """ESTALE is the EC floor moving under this driver, usually from ACPI."""
+    """ESTALE (-116) means the floor value changed, not that the mailbox timed out."""
     if observed is not None and expected is not None:
         numbers = f"observed {observed} RPM, expected {expected}"
     elif observed is not None:
         numbers = f"observed {observed} RPM"
     else:
         numbers = "the EC floor does not match the floor this driver set"
+    if observed == 4350:
+        owner = "4350 RPM is 0x10fe, ACPI level 100."
+    else:
+        owner = "This value is not proof of which client owns the floor."
     return (
-        f"floor was changed outside this driver ({numbers}); likely ACPI cur_state. "
-        "Recovery: stop the daemon and unload the module with "
-        "'dgx-fan-control module disable' before any ACPI write. "
+        f"floor was changed outside this driver ({numbers}); -ESTALE is an ownership change, not a mailbox timeout. "
+        f"{owner} "
         "This driver will not clear a floor it does not own. "
+        "Reboot restores the EC curve. "
         "Do not write ACPI level 0; it stops both fans and does not clear the floor."
     )
 

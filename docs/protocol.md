@@ -204,7 +204,9 @@ shared by all callers, including lifecycle cleanup. Both successful and failed
 attempts are paced. After successful recovery, ordinary healthy transactions
 can continue during cooldown. A failed recovery fences all subsequent
 transactions until another verified recovery succeeds, even if the cached
-pending flag clears in the meantime. This prevents cleanup or another sysfs
+pending flag clears in the meantime, except an unsupported floor reply
+(`-EOPNOTSUPP`), which clears that fence and is not retried. This prevents
+cleanup or another sysfs
 caller from accepting a reply whose physical cross-check failed. No further
 OEM diagnosis or recovery submission starts until cooldown expires.
 Failure retains an error and cannot claim restoration. Successful
@@ -217,6 +219,16 @@ specific to recovery; this version does not add OEM reads to healthy polling.
 Version 0.1.3 adds [incident evidence](incident-logging.md) around the same
 recovery path, including the triggering transaction history and the existing
 physical observations, without additional EC requests.
+Version 0.1.7 does not enter this path after a timeout unless
+`automatic_floor_recovery=1`. A profile that has not been matched, and the
+EC 3.13.7 telemetry profile, never enter it. There is no captured incident
+in which mailbox status bits 0–1 were clear while the packet poll stayed
+pending, which is the guard this path requires before it submits operation
+0x04. The call into secure firmware is not given a host timeout: the
+one-second figure is the poll loop only, and a call that never returns holds
+the transaction mutex. Another FF-A client can still own the floor. A reply
+that matches in both places can still be stale; the host cannot prove it was
+produced by this attempt.
 
 ## Related primary documentation
 

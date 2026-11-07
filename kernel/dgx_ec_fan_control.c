@@ -79,7 +79,7 @@
 #define DGX_EC_MAILBOX_RESPONSE		0x06000800U
 #define DGX_EC_RTC			0x06000788U
 #define DGX_EC_TRACE_LENGTH		16U
-#define DGX_EC_DRIVER_VERSION		"0.1.6"
+#define DGX_EC_DRIVER_VERSION		"0.1.7"
 /* Family-7 mailbox status byte: success is 0x00, unsupported is 0xFF. */
 #define DGX_EC_STATUS_UNSUPPORTED	0xffU
 /* ACPI level 20 stalled a fan near 1620 RPM. Do not request below this. */
@@ -187,6 +187,16 @@ static bool allow_unverified_writes;
 module_param(allow_unverified_writes, bool, 0444);
 MODULE_PARM_DESC(allow_unverified_writes,
 		 "Allow unverified floor writes on EC 3.13.7 (default N)");
+/*
+ * No captured incident shows mailbox status bits 0-1 clear while the packet
+ * poll stays pending. Until that evidence exists, a timeout stays the
+ * original error and does not submit GET_LOWER_LIMIT (operation 0x04).
+ * Telemetry-only and not-yet-matched profiles never take this path.
+ */
+static bool automatic_floor_recovery;
+module_param(automatic_floor_recovery, bool, 0444);
+MODULE_PARM_DESC(automatic_floor_recovery,
+		 "After a timeout, observe the mailbox and submit one floor read (default N)");
 
 /*
  * Set by modprobe from the userspace last-set record before this module
@@ -237,6 +247,7 @@ struct dgx_ec_fan_control_data {
 	bool telemetry_valid;
 	bool recovery_attempted;
 	bool recovery_unverified;
+	bool floor_recovery_unsupported;
 	unsigned long next_recovery;
 	u32 recovery_count;
 	u64 incident, trace_seq, submissions[8], last_write_ns;
@@ -666,12 +677,36 @@ out:
 	return ret;
 }
 
+static bool dgx_ec_floor_recovery_allowed(struct dgx_ec_fan_control_data *data)
+{
+	if (!automatic_floor_recovery || !data->profile || data->floor_recovery_unsupported)
+		return false;
+	/* EC 3.13.7 is telemetry unless the operator opted into floor writes.
+	 * Even then, do not recover by submitting operation 0x04: that command
+	 * is the one this profile is expected to reject.
+	 */
+	if (data->profile->telemetry_if_floor_unsupported)
+		return false;
+	return true;
+}
+
+static void dgx_ec_log_recovery_skipped(struct dgx_ec_fan_control_data *data)
+{
+	dev_warn_ratelimited(&data->ffa_dev->dev,
+		"timeout left as -110; not submitting a floor read (profile=%s)\n",
+		data->profile ? data->profile->name : "unknown");
+}
+
 static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *floor)
 {
 	struct ffa_device *oem;
 	u64 started;
 	int ret;
 
+	if (!dgx_ec_floor_recovery_allowed(data)) {
+		data->recovery_unverified = false;
+		return -ETIMEDOUT;
+	}
 	if (data->recovery_attempted && time_before(jiffies, data->next_recovery)) {
 		data->telemetry_valid = false;
 		return -ETIMEDOUT;
@@ -698,7 +733,15 @@ static int dgx_ec_recover_pending(struct dgx_ec_fan_control_data *data, u16 *flo
 	dev_warn(&data->ffa_dev->dev,
 		"incident=%llu end ret=%d elapsed_us=%llu\n",
 		data->incident, ret, (ktime_get_ns() - started) / 1000);
-	if (ret)
+	if (ret == -EOPNOTSUPP) {
+		/* One unsupported floor reply is enough for this load. Do not
+		 * fence hwmon, and do not submit operation 0x04 again after cooldown.
+		 */
+		data->recovery_unverified = false;
+		data->floor_recovery_unsupported = true;
+		dev_warn_ratelimited(&data->ffa_dev->dev,
+			"pending recovery got an unsupported floor reply; not retrying\n");
+	} else if (ret)
 		dev_warn_ratelimited(&data->ffa_dev->dev,
 			"pending recovery refused/failed: %d; cooldown %u ms\n",
 			ret, DGX_EC_RECOVERY_COOLDOWN_MS);
@@ -719,15 +762,26 @@ static int dgx_ec_preflight(struct dgx_ec_fan_control_data *data, u8 operation)
 
 	data->requested_operation = operation;
 	data->request_phase = "blocked";
-	if (data->recovery_unverified)
+	if (data->recovery_unverified) {
+		if (!dgx_ec_floor_recovery_allowed(data)) {
+			data->recovery_unverified = false;
+			dgx_ec_log_recovery_skipped(data);
+			return -ETIMEDOUT;
+		}
 		return dgx_ec_recover_pending(data, &floor);
+	}
 
 	data->request_phase = "preflight";
 	dgx_ec_trace_begin(data, operation, false);
-	/* Drain a late completion before another request can reuse the relay. */
+	/* Drain a late completion before another request can reuse the relay.
+	 * The 1-second bound is this poll loop only. sync_send_receive2 itself
+	 * is not interruptible here; a call that never returns holds data->lock.
+	 */
 	ret = dgx_ec_wait_for_completion(data, NULL, 0);
-	if (ret == -ETIMEDOUT)
+	if (ret == -ETIMEDOUT && dgx_ec_floor_recovery_allowed(data))
 		ret = dgx_ec_recover_pending(data, &floor);
+	else if (ret == -ETIMEDOUT)
+		dgx_ec_log_recovery_skipped(data);
 	if (ret)
 		dev_warn_ratelimited(&data->ffa_dev->dev,
 			"operation=%#x preflight failed: %d; original request not submitted\n",
@@ -763,6 +817,10 @@ static int dgx_ec_read_operation(struct dgx_ec_fan_control_data *data, u8 operat
 	ret = dgx_ec_submit_read(data, operation, output_length, output);
 	if (ret != -ETIMEDOUT)
 		return ret;
+	if (!dgx_ec_floor_recovery_allowed(data)) {
+		dgx_ec_log_recovery_skipped(data);
+		return ret;
+	}
 	ret = dgx_ec_recover_pending(data, &floor);
 	if (ret)
 		return ret;
@@ -811,6 +869,10 @@ static int dgx_ec_write_lower_floor(struct dgx_ec_fan_control_data *data,
 	ret = dgx_ec_wait_for_completion(data, NULL, 0);
 	if (ret != -ETIMEDOUT)
 		return ret;
+	if (!dgx_ec_floor_recovery_allowed(data)) {
+		dgx_ec_log_recovery_skipped(data);
+		return ret;
+	}
 	ret = dgx_ec_recover_pending(data, &floor);
 	if (ret)
 		return ret;

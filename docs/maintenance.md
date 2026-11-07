@@ -19,7 +19,7 @@ Before rebooting into a new kernel, set its **exact installed release name**
 # Replace the example with the kernel you are about to boot.
 new_kernel="6.17.0-1029-nvidia"
 sudo apt-get install "linux-headers-$new_kernel"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$new_kernel"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.7 -k "$new_kernel"
 dkms status -m dgx-spark-fan-control
 modinfo -k "$new_kernel" -F vermagic dgx_ec_fan_control
 modinfo -k "$new_kernel" -F signer dgx_ec_fan_control
@@ -120,7 +120,7 @@ modinfo dgx_ec_fan_control | grep ^version:
 ```
 
 Compare that with `DGX_EC_DRIVER_VERSION` in `kernel/dgx_ec_fan_control.c`
-(currently `0.1.6`). If they already match and `kernel/` did not change,
+(currently `0.1.7`). If they already match and `kernel/` did not change,
 stop here. Otherwise use the same module route you installed with:
 [DKMS](#update-the-module-with-dkms) or
 [by hand](#update-the-module-by-hand).
@@ -146,7 +146,7 @@ DKMS signs with the enrolled MOK already configured in
 `/etc/dkms/framework.conf`. It does not run `scripts/build-sign`.
 
 `git pull` alone does not refresh DKMS's stored source. Use the version in
-the new checkout's `dkms.conf` (currently `0.1.6`) wherever a command names a
+the new checkout's `dkms.conf` (currently `0.1.7`) wherever a command names a
 version. When `dkms status` still shows an older registered version, remove
 that version before registering the new one. Upgrading from 0.1.4:
 `sudo dkms remove dgx-spark-fan-control/0.1.4 --all`
@@ -159,11 +159,11 @@ version. If this version is not registered yet, the add/build/install steps
 in the DKMS installation route are the first-time form of the same copy:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.6/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.6/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.7/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.7/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.6/kernel/
-sudo dkms install -m dgx-spark-fan-control -v 0.1.6 -k "$(uname -r)" --force
+  /usr/src/dgx-spark-fan-control-0.1.7/kernel/
+sudo dkms install -m dgx-spark-fan-control -v 0.1.7 -k "$(uname -r)" --force
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
@@ -283,7 +283,7 @@ inspect and restore a failed state.
 For DKMS (substitute your installed version if different):
 
 ```sh
-sudo dkms remove -m dgx-spark-fan-control -v 0.1.6 --all
+sudo dkms remove -m dgx-spark-fan-control -v 0.1.7 --all
 dkms status -m dgx-spark-fan-control
 ```
 
@@ -295,7 +295,7 @@ sudo depmod -a
 ```
 
 Repeat manual removal for other kernels where you installed it. DKMS source
-under `/usr/src/dgx-spark-fan-control-0.1.6` can be removed separately once no
+under `/usr/src/dgx-spark-fan-control-0.1.7` can be removed separately once no
 registered version uses it.
 
 ### 3. Remove startup entries and the userland command

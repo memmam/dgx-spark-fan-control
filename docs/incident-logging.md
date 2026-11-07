@@ -1,7 +1,11 @@
 # Investigating a pending-state incident
 
 Version **0.1.3** records a small history in the driver and prints it when a
-pending timeout admits a recovery attempt. Successful polling adds no journal
+pending timeout admits a recovery attempt. Version 0.1.7 admits that attempt
+only when `automatic_floor_recovery=1` and the matched profile is allowed to
+write a floor. EC 3.13.7, and a probe that has not matched a profile, do not.
+A skipped timeout logs `not submitting a floor read` and does not open an
+incident. Successful polling adds no journal
 messages. The history is fixed at 16 entries per driver instance; it allocates
 no memory per request and adds no EC/FF-A calls. Existing state-change messages
 remain unchanged.

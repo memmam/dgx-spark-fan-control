@@ -127,6 +127,7 @@ static int oem_zero, oem_fail_at, retry_stuck, wedge_operation, ignore_write, re
 static int stale_reply, overwrite_reply, reply_error, sender_busy, complete_on_oem;
 static int unsupported_after_write;
 static bool allow_unverified_writes;
+static bool automatic_floor_recovery;
 static int last_operation = 4;
 static u16 physical_floor, reply_floor;
 static int pending_polls, stuck, submit_count, get_count, write_count;
@@ -213,6 +214,7 @@ int main(int argc, char **argv) {
  unsigned long state = 999;
  physical_floor = reply_floor = 4500;
  if (!strncmp(argv[1], "logging_", 8)) {
+  automatic_floor_recovery = 1;
   if (!strcmp(argv[1], "logging_history")) {
    for (int i = 0; i < 20; i++) {
     assert(dgx_ec_get_cur_state(&cdev, &state) == 0);
@@ -258,6 +260,7 @@ int main(int argc, char **argv) {
   return 0;
  }
  if (!strncmp(argv[1], "recovery_", 9)) {
+  automatic_floor_recovery = 1;
   recovery_enabled = 1; stuck = 1; data.telemetry_valid = true;
   int expected = 0;
   if (!strcmp(argv[1], "recovery_address_guard")) {
@@ -275,7 +278,18 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[1], "recovery_stale_reply")) { stale_reply = 1; expected = -EPROTO; }
   if (!strcmp(argv[1], "recovery_overwritten_reply")) { overwrite_reply = 1; expected = -EPROTO; }
   if (!strcmp(argv[1], "recovery_response_error")) { reply_error = 1; expected = -EPROTO; }
-  if (!strcmp(argv[1], "recovery_unsupported")) { reply_error = 0xff; expected = -EOPNOTSUPP; }
+  if (!strcmp(argv[1], "recovery_unsupported")) {
+   reply_error = 0xff;
+   assert(dgx_ec_get_cur_state(&cdev, &state) == -EOPNOTSUPP);
+   assert(get_count == 1 && !data.recovery_unverified && data.floor_recovery_unsupported);
+   stuck = 0;
+   assert(dgx_ec_get_cur_state(&cdev, &state) == 0 && state == 3);
+   int submitted = submit_count, gets = get_count;
+   stuck = 1;
+   assert(dgx_ec_get_cur_state(&cdev, &state) == -ETIMEDOUT);
+   assert(submit_count == submitted && get_count == gets && !data.recovery_unverified);
+   return 0;
+  }
   if (!strcmp(argv[1], "recovery_sender_busy")) { sender_busy = 1; expected = -EBUSY; }
   if (!strcmp(argv[1], "recovery_retry_stuck")) { retry_stuck = 1; expected = -ETIMEDOUT; }
   if (!strcmp(argv[1], "recovery_foreign_floor")) { physical_floor = 7777; expected = -ESTALE; }
@@ -406,6 +420,29 @@ int main(int argc, char **argv) {
   poll_state_override = -1; transport_error_once = -EAGAIN;
   assert(dgx_ec_set_cur_state(&cdev, 5) == -EAGAIN);
   assert(submit_count == 0 && write_count == 0);
+ } else if (!strcmp(argv[1], "telemetry_timeout_no_floor_submit")) {
+  data.profile = &dgx_ec_profiles[1];
+  automatic_floor_recovery = 1;
+  allow_unverified_writes = 0;
+  stuck = 0; wedge_operation = 7; repeat_wedge = 1;
+  u8 output[64]; memset(output, 0xff, sizeof(output));
+  assert(dgx_ec_read_operation(&data, 7, output) == -ETIMEDOUT);
+  assert(get_count == 0 && oem_calls == 0 && !data.recovery_unverified);
+  assert(dgx_ec_read_operation(&data, 7, output) == -ETIMEDOUT);
+  assert(get_count == 0 && oem_calls == 0 && !data.recovery_unverified);
+ } else if (!strcmp(argv[1], "unknown_profile_capability_timeout")) {
+  data.profile = NULL;
+  automatic_floor_recovery = 1;
+  stuck = 0; wedge_operation = 1;
+  u8 output[16]; memset(output, 0xff, sizeof(output));
+  assert(dgx_ec_read_operation(&data, 1, output) == -ETIMEDOUT);
+  assert(get_count == 0 && oem_calls == 0 && !data.recovery_unverified);
+ } else if (!strcmp(argv[1], "control_timeout_no_auto_submit")) {
+  automatic_floor_recovery = 0;
+  stuck = 1;
+  assert(dgx_ec_get_cur_state(&cdev, &state) == -ETIMEDOUT);
+  assert(get_count == 0 && oem_calls == 0 && submit_count == 0);
+  assert(!data.recovery_unverified && state == 999);
  } else if (!strcmp(argv[1], "profile_3137_writes_require_opt_in")) {
   data.profile = &dgx_ec_profiles[1];
   data.current_state = 0;
@@ -439,7 +476,8 @@ class KernelTransactionTests(unittest.TestCase):
             "dgx_ec_trace_begin", "dgx_ec_log_trace", "dgx_ec_log_incident",
             "dgx_ec_packet_poll", "dgx_ec_submit_status", "dgx_ec_wait_for_completion",
             "dgx_ec_reconcile_floor", "dgx_ec_read_fixed", "dgx_ec_valid_rtc",
-            "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_recover_pending",
+            "dgx_ec_submit_read", "dgx_ec_recover_idle", "dgx_ec_floor_recovery_allowed",
+            "dgx_ec_log_recovery_skipped", "dgx_ec_recover_pending",
             "dgx_ec_preflight", "dgx_ec_read_operation", "dgx_ec_write_lower_floor",
             "dgx_ec_read_lower_floor",
             "dgx_ec_restore_automatic_locked", "dgx_ec_restore_automatic",
@@ -461,6 +499,9 @@ class KernelTransactionTests(unittest.TestCase):
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
             "profile_3137_writes_require_opt_in",
+            "telemetry_timeout_no_floor_submit",
+            "unknown_profile_capability_timeout",
+            "control_timeout_no_auto_submit",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):

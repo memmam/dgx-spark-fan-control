@@ -23,7 +23,7 @@ capability response. Read the kernel log; do not remove validation checks.
 This implementation matches the NVIDIA P4242 platform only. Other GB10 boards
 have not been qualified.
 
-Version 0.1.6 accepts exactly two capability replies: EC 3.5.8
+Version 0.1.7 accepts exactly two capability replies: EC 3.5.8
 (1260–9000 / 1890–13500) and EC 3.13.7 (975–4350 / 975–4350), both revision 1
 and unit mode 0. Anything else is still `-EBADMSG` (`-74`), including a
 one-count difference. The kernel log prints the unrecognized parsed ranges.
@@ -279,17 +279,20 @@ maintenance shutdown and cold power cycle. Do not repeatedly load competing
 probes or access controller MMIO: even a normal-world read of the secure-owned
 eSPI controller caused a watchdog reboot during the original investigation.
 
-An ownership mismatch (`ESTALE`) causes failure: the driver
-will not overwrite an unknown existing floor. ACPI `cur_state` writes that
+An ownership mismatch (`ESTALE`, `-116`) causes failure: the driver
+will not overwrite an unknown existing floor. `-116` here is that mismatch,
+not a mailbox timeout (`-110`). ACPI `cur_state` writes that
 same register, so `acpi-max` while the module is loaded can move the floor
 (level 100 was observed as `0x10fe`, 4350 RPM, over a module state-12 floor
-of `0x34bc`). `status` then says the floor was changed outside this driver,
+of `0x34bc`). Only that `0x10fe` value is the known ACPI level-100 floor.
+Another observed number is not proof of which client wrote it. `status` then says the floor was changed outside this driver,
 with the observed and expected RPM when the kernel log still has them.
 Probe logs `refusing to replace existing lower floor` with the RPM and
-returns `-EBUSY`. It does not clear the floor. Do not write ACPI level 0 to
-recover; that stops both fans and leaves the floor in place. Unload the
-module before any ACPI write. A cold power cycle is the recovery that does
-not write a fan level. Avoid concurrent writers. Version
+returns `-EBUSY`. It does not clear the floor, including `0x10fe`. Do not write ACPI level 0 to
+recover; that stops both fans and leaves the floor in place. On the measured
+machines a reboot restored the EC curve, near 2700/4050 RPM, without another
+fan-level write. Unload the
+module before any ACPI write. Avoid concurrent writers. Version
 0.1.5 uses `ESTALE` only for that mismatch. A reply-guard refusal, where
 recovery will not trust the shared response, returns `EPROTO`. The daemon
 retries `EPROTO` after 31 seconds, past the driver's 30-second cooldown, at
@@ -358,6 +361,20 @@ and `uptime=` (`CLOCK_BOOTTIME`) so the next one can be compared with those
 tools. The driver still does not clear a foreign floor and does not treat
 this wedge as solved.
 
+Version 0.1.7 does not start that recovery after a timeout unless the module
+parameter `automatic_floor_recovery=1` is set. EC 3.13.7 and a probe that has
+not matched a profile never start it, even with the parameter. An unsupported
+floor reply (`-EOPNOTSUPP`) clears the recovery fence and is not submitted
+again on the next read. The default is off because no captured incident shows
+mailbox status bits 0–1 clear while the packet poll stays pending. The 6 Nov
+wedge was already operation 0x04. Submitting another one is not a demonstrated
+fix. The one-second bound is only the poll loop. `sync_send_receive2` is a
+secure-firmware call this driver does not wrap in a timeout; a call that never
+returns holds the transaction mutex, and with it remove, suspend, and the
+reboot notifier. A matching reply in both the packet cache and the OEM image
+can still be stale. The host has no sequence number that proves the EC
+produced it for this attempt.
+
 ## Daemon restarts forever after an ACPI floor
 
 On one Spark the performance service restarted 196 times, every 30 seconds,
@@ -365,7 +382,9 @@ logging `no dgx_ec_fan_floor cooling device: probe did not register one`.
 `status` on that machine said the probe had refused a foreign lower floor,
 left by an earlier ACPI `cur_state` write. Starting the service again cannot
 clear that floor. The daemon now exits 78 and systemd does not restart it.
-The journal line says a reboot clears the ACPI floor. Do not toggle the
+The journal line says a reboot clears the ACPI floor. `-116` on unload is the
+ownership mismatch above, not a mailbox timeout, and it is proof of ACPI only
+when the value is the known `0x10fe`. Do not toggle the
 service, and do not write ACPI level 0. The fans are held high, so this is
 not a true-zero stall and the watchdog does not run the repair. It does
 reboot once, after the same hold and the same deferral as a true zero. If
