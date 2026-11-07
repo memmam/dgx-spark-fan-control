@@ -456,7 +456,7 @@ parameters at `N`.
 | saved floor 6 reapplied after reboot | kensaki | boot | **PASS** | `applied manual floor state 6 from last-set` at 19:28:27 PST | already shown; not notifier proof |
 | shutdown reboot notifier | kensaki | boot | **UNVERIFIED** | previous-boot grep had neither success nor failure line. Not a recorded failure | a log that survives shutdown |
 | suspend | kensaki | blocked | **BLOCKED** | `systemctl suspend` refused; no sleep occurred | the NVIDIA drop-in is removed on purpose |
-| sustained load of this module's control path | kensaki | not run | **NOT RUN** | older `gpu_burn` notes are a different EC-curve record | a real session under this module |
+| sustained load of this module's control path | kensaki | not run | **NOT RUN** | 19:49 PST preflight only: state 0, manual none, 41.8°C, watchdog active, performance service inactive, no GPU job. Not a load pass. Older `gpu_burn` notes are a different EC-curve record | a real session under this module |
 | natural mailbox timeout on 0.1.7 | either | not run | **UNOBSERVED** | do not induce one | one appears in ordinary use |
 | foreign floor `0x10fe` | kensaki | earlier live | **PASS** refuse | module did not clear it; reboot cleared it. Date not recorded | source or regression |
 | state 6 then `automatic` | kensaki | earlier live | **PASS** | returned to the EC curve. Date not recorded | source or regression |
@@ -521,6 +521,14 @@ reports version `25.06-1`, maintainer `dgx-dev@nvidia.com`, description
 suspend is disabled. Leave the drop-in in place. This is a host
 configuration block, not a module failure.
 
+### 6 Nov 2026, 19:49 PST preflight
+
+Checkout `5e7cf1f`. Module 0.1.7. Kensaki, before any workload: state 0,
+manual floor none, 41.8°C, watchdog active and enabled, performance service
+inactive, `nvidia-smi --query-compute-apps` empty, parameters `N`/`N`.
+No workload was started. This is not a load pass. Fan RPM was not in this
+reading, so the external rig is not taken from the earlier 2700/4050 sample.
+
 ### Earlier 0.1.7 observations
 
 The calendar date of these runs was not recorded. They are earlier than
@@ -545,8 +553,9 @@ These are the open hardware rows. This list is not a request to run them
 from this commit.
 
 - Sustained load while this module is the floor controller on EC 3.5.8.
-  Older `gpu_burn` notes in this file describe the stock EC curve and an
-  ACPI hold. They are not this row.
+  The 19:49 PST reading is preflight only. The passed `service-start-stop`
+  stopped the service and is not this row. Older `gpu_burn` notes describe
+  the stock EC curve and an ACPI hold. They are not this row.
 - A natural mailbox timeout on 0.1.7, only if ordinary use produces one.
   Do not induce it. The open question is still a log line that a floor read
   was not submitted, and that the next read is not operation `0x04`.
