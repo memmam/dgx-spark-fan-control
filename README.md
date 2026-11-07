@@ -86,8 +86,8 @@ does not pin one SoC build in the compatibility statement. The validation
 record for this tree used SoC 2.155.11 (`0x02009b0b`). **EC 3.5.8 with October
 SoC firmware 2.158.15** (`0x02009e0f`) has done both of the following on DGX
 Spark: completed probe (`pinned EC 3.5.8 capabilities fan0=1260..9000
-fan1=1890..13500`, cooling device registered) and, on other boots reported
-earlier, timed out the first read-only query so the driver did not bind.
+fan1=1890..13500`, cooling device registered) and, on other boots, timed
+out the first read-only query so the driver did not bind.
 A timeout is still a reason to use the ACPI fan devices. It is not proof that
 this pair can never bind.
 
@@ -253,7 +253,7 @@ are real. If probe times out, `acpi-max` is the fallback, and only while
 this module is not loaded. The two writers share one lower-floor register.
 Downgrading EC 3.13.7 to 3.5.8, and blocking fwupd from putting 3.13.7
 back, are in
-[EC firmware pairing and downgrade](docs/installation.md#7-ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](docs/installation.md#6-ec-firmware-pairing-and-downgrade).
 
 ## ACPI-only mode
 

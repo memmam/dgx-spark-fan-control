@@ -77,10 +77,11 @@ validator rejects any EC 3.13.7 state 1–12 entry below 2000. The numbers are
 still unverified as floor-register values.
 
 EC 3.5.8 fan-floor support was first validated with pre-October SoC firmware.
-Upstream's README does not name one SoC build. This tree's earlier record used
-**2.155.11** (`0x02009b0b`). October SoC **2.158.15** (`0x02009e0f`) has both
-completed probe on DGX Spark and timed out the first read-only query on other
-boots. `-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan`
+Upstream's README does not name one SoC build. Those original notes, in
+[Original hardware work](validation.md#original-hardware-work), record SoC
+**2.155.11** (`0x02009b0b`) on board P4242. October SoC **2.158.15**
+(`0x02009e0f`) has both completed probe on DGX Spark and timed out the
+first read-only query on other boots. `-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan`
 cooling device as the fallback. This driver does not write that ACPI device,
 and it does not clear a non-zero floor it does not own.
 

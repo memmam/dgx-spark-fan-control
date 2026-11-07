@@ -68,7 +68,8 @@ After reboot, perform the status checks above.
 ## Update this project's source
 
 Do this between jobs. Update the userspace on every update. Rebuild the kernel
-module only when the version check below says `kernel/` changed. A persistently
+module only when the version check below says to: the installed version
+differs from `DGX_EC_DRIVER_VERSION`, or `kernel/` changed. A persistently
 pending relay needs
 [maintenance recovery](troubleshooting.md#persistent-pending-and-service-exit-69)
 before the new module can be loaded safely.
@@ -110,7 +111,7 @@ Why that refresh is required, and what `--record` clears, is in
 [Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
 result. The exception after an EC downgrade is in
-[EC firmware pairing and downgrade](installation.md#7-ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](installation.md#6-ec-firmware-pairing-and-downgrade).
 
 ### Decide whether the kernel module changed
 
@@ -233,7 +234,7 @@ Why that refresh is required, and what `--record` clears, is in
 [Install the command, then load the driver](installation.md#4-install-the-command-then-load-the-driver).
 Do not write an ACPI level to make this health check pass or to provoke a
 result. The exception after an EC downgrade is in
-[EC firmware pairing and downgrade](installation.md#7-ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](installation.md#6-ec-firmware-pairing-and-downgrade).
 
 ## Switch from manual installation to DKMS
 

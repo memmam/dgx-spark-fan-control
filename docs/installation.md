@@ -218,7 +218,7 @@ probing can still reject the firmware contract. See
 [troubleshooting](troubleshooting.md) if needed. Fan-floor control needs
 EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
 back, are in
-[EC firmware pairing and downgrade](#7-ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](#6-ec-firmware-pairing-and-downgrade).
 
 Finish by refreshing the stored health record. Installing a different
 build marks the old record stale, so the first `health` run after an
@@ -526,8 +526,8 @@ sudo dgx-fan-control health --record
 
 ## 7. Updating
 
-Update the userspace on every update. Rebuild the kernel module only when
-the version check on
+Update the userspace on every update. Rebuild the kernel module only after
+`git pull` and that userspace update, and only when the version check on
 [Updates and removal](maintenance.md#update-this-projects-source)
-says `kernel/` changed, and only after `git pull` and that userspace update.
-The DKMS and by-hand rebuilds stay on that page.
+says to: the installed module version differs from `DGX_EC_DRIVER_VERSION`,
+or `kernel/` changed. The DKMS and by-hand rebuilds stay on that page.

@@ -145,7 +145,7 @@ file. The watchdog does not read it either.
 
 fwupd can install EC 3.13.7 over 3.5.8 and remove fan-floor control. The
 steps below match
-[EC firmware pairing and downgrade](installation.md#7-ec-firmware-pairing-and-downgrade).
+[EC firmware pairing and downgrade](installation.md#6-ec-firmware-pairing-and-downgrade).
 
 In `fwupdmgr get-devices` the EC row is titled **Embedded Controller**
 (seen on both 3.5.8 and 3.13.7). fwupd's verbose log calls it

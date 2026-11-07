@@ -9,10 +9,10 @@ Kernel `7.0.0-1024-nvidia`. Module 0.1.5.
 Probe bound. The kernel log showed `pinned EC 3.5.8 capabilities
 fan0=1260..9000 fan1=1890..13500`, baseline 2700/4050 RPM, a cooling device,
 and state 1 floor `0xa8c`. With the daemon stopped, `set-state 6` measured
-about 7560/7155 RPM. State 12 wrote floor `0x34bc`. This is the opposite of
-the earlier report that this pair always times out the mailbox. That timeout
-has also been seen, on other boots, so it stays the fallback when probe
-fails. It is not the only outcome.
+about 7560/7155 RPM. State 12 wrote floor `0x34bc`. On these boots the
+mailbox query completed and the driver bound. The same EC 3.5.8 and October
+SoC pair has also timed out that first read-only query on other boots, so a
+timeout remains the fallback when probe fails. It is not the only outcome.
 
 One mailbox wedge is open. The daemon, enabled at boot, read the floor about
 99 times at a 2-second interval, then near 188 seconds of uptime operation
@@ -34,9 +34,9 @@ ACPI level 100 measured about 4320 RPM and was quieter than module state 12.
 After reboot, both machines were back near 2700/4050 RPM without another
 `acpi-max`.
 
-The fan service was enabled and started at boot even though an earlier step
-had left it disabled. `module enable` had been enabling it whenever fan
-control was supported. It no longer does that.
+On that boot the performance service was enabled and started. `module enable`
+leaves `dgx-fan-control.service` disabled unless `--start-service` or
+`--force-service` is passed.
 
 Not observed on these boots: the quiet curve, a watchdog trip, the
 true-zero repair, the one-reboot-then-poweroff sequence, and a repeated
@@ -401,8 +401,12 @@ On kensaki with EC 3.5.8, rig off, and `gpu_burn` (1:18–1:27 PM PST), ACPI
 100 held 4320/4320 RPM through hottest-zone readings of 95–97.7 C. Fanwatch
 read SoC 96–97 C for about 15 seconds with no fan override. The stock EC
 curve had reached 4860/7290 by about 94.5 C and 6660/9990 at about 95 C,
-then settled at 88.8–89.7 C. Stopping writes did not restore that curve;
-see the earlier failed restoration/reboot observations above. Level 100 is
+then settled at 88.8–89.7 C. Stopping the ACPI writes did not restore that
+stock curve. On the 0.1.5 boots the same day, ACPI level 100 replaced a
+module state-12 floor with `0x10fe`, unload logged `failed to restore
+automatic fan policy for module removal: -116`, and the next probe refused
+that floor. After reboot, both machines were back near 2700/4050 RPM
+without another `acpi-max`. Level 100 is
 about 48%/32% of 9000/13500 RPM. The burn view's GPU reading was about 10 C
 below the hottest zone. These observations motivated the separate
 [ACPI thermal escalation and recovery policy](ec-curve.md#ec-358-acpi-holds-replace-the-stock-curve).
