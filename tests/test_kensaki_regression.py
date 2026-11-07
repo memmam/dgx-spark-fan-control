@@ -117,6 +117,79 @@ class Script(unittest.TestCase):
         )
         self.assertEqual(code, 1)
 
+    def test_service_reaches_state_one_then_returns_to_automatic(self):
+        fans = [["/sys/class/thermal/cooling_device1/Fan", "40"]]
+        phase = {"n": 0}
+        stopped = {"n": 0}
+
+        def runner(argv):
+            if argv == ["hostname"]:
+                return result(out="kensaki\n")
+            if argv == ["systemctl", "is-active", REG.DAEMON_UNIT]:
+                if phase["n"] == 1:
+                    return result(out="active\n")
+                return result(code=3, out="inactive\n")
+            if argv == ["modinfo", "-F", "version", "dgx_ec_fan_control"]:
+                return result(out="0.1.8\n")
+            if argv == ["sudo", "systemctl", "start", REG.DAEMON_UNIT]:
+                phase["n"] = 1
+                return result()
+            if argv == ["sudo", "systemctl", "stop", REG.DAEMON_UNIT]:
+                stopped["n"] += 1
+                phase["n"] = 0
+                return result()
+            if argv == ["dgx-fan-control", "status"]:
+                if phase["n"] == 1 and stopped["n"] == 0:
+                    text = GOOD_STATUS.replace("state=0/12", "state=1/12", 1)
+                    text = text.replace(
+                        " (daemon not setting a floor; EC's own curve)", "")
+                    return result(out=text)
+                return result(out=GOOD_STATUS)
+            raise AssertionError(argv)
+
+        code = REG.main(
+            ["service"], env={REG.OPT_IN: "1"}, runner=runner,
+            reader=lambda path: "same-bytes", fans=lambda: list(fans),
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stopped["n"], 1)
+        self.assertEqual(fans, [["/sys/class/thermal/cooling_device1/Fan", "40"]])
+
+    def test_service_stops_the_unit_if_the_daemon_leaves_state_one(self):
+        stopped = {"n": 0}
+        polls = {"n": 0}
+
+        def runner(argv):
+            if argv == ["hostname"]:
+                return result(out="kensaki\n")
+            if argv == ["systemctl", "is-active", REG.DAEMON_UNIT]:
+                return result(code=3, out="inactive\n")
+            if argv == ["modinfo", "-F", "version", "dgx_ec_fan_control"]:
+                return result(out="0.1.8\n")
+            if argv == ["sudo", "systemctl", "start", REG.DAEMON_UNIT]:
+                return result()
+            if argv == ["sudo", "systemctl", "stop", REG.DAEMON_UNIT]:
+                stopped["n"] += 1
+                return result()
+            if argv == ["dgx-fan-control", "status"]:
+                polls["n"] += 1
+                if polls["n"] == 1:
+                    return result(out=GOOD_STATUS)
+                text = GOOD_STATUS.replace("state=0/12", "state=12/12", 1)
+                text = text.replace(
+                    " (daemon not setting a floor; EC's own curve)", "")
+                return result(out=text)
+            raise AssertionError(argv)
+
+        code = REG.main(
+            ["service"], env={REG.OPT_IN: "1"}, runner=runner,
+            reader=lambda path: "same-bytes", fans=lambda: [],
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stopped["n"], 1)
+
     def test_install_commands_remove_only_other_versions(self):
         commands = REG.install_commands("7.0.0-1024-nvidia", ["0.1.7", "0.1.8"])
         flat = [" ".join(item) for item in commands]

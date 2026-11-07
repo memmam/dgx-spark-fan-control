@@ -9,12 +9,15 @@ command or open /sys. It never writes an ACPI Fan cur_state.
     sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression preflight
     sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression install
     sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression floor
+    sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression service
 
 preflight is read-only. install is the DKMS 0.1.8 build from
 docs/installation.md section 3A, then one module reload. It does not
 start the performance service and does not restart the manual unit.
 floor requires the installed command to match this checkout, refuses
 acpi-max without writing, then does set-state 6 and automatic.
+service starts dgx-fan-control.service, waits for the idle state-1 pin,
+then stops it and requires state 0 again.
 
 Stop on the first failure. Atarime is refused. No GPU load.
 """
@@ -22,8 +25,10 @@ Stop on the first failure. Atarime is refused. No GPU load.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 OPT_IN = "DGX_FAN_SUPERVISED"
@@ -31,6 +36,7 @@ PACKAGE = "dgx-spark-fan-control"
 VERSION = "0.1.8"
 CHECKOUT = Path(__file__).resolve().parents[1]
 CLI_NAME = "dgx-fan-control"
+DAEMON_UNIT = "dgx-fan-control.service"
 INSTALLED_CLI = Path("/usr/local/sbin") / CLI_NAME
 SOURCE_CLI = CHECKOUT / "userspace" / "dgx_fan_control.py"
 
@@ -134,7 +140,7 @@ def _ok(result: subprocess.CompletedProcess[str], what: str) -> str:
 def preflight(runner, reader) -> str:
     require_kensaki(_ok(runner(["hostname"]), "hostname"))
     # is-active exits 3 when the unit is inactive. The text is the check.
-    performance = runner(["systemctl", "is-active", "dgx-fan-control.service"])
+    performance = runner(["systemctl", "is-active", DAEMON_UNIT])
     performance_inactive(performance.stdout or "")
     status = _ok(runner([CLI_NAME, "status"]), "status")
     parse_status(status)
@@ -144,6 +150,76 @@ def preflight(runner, reader) -> str:
 def assert_same_fans(before: list[tuple[str, str]], after: list[tuple[str, str]]) -> None:
     if before != after:
         raise Stop(f"ACPI Fan cur_state changed from {before} to {after}")
+
+
+def hottest_c(status: str) -> float:
+    match = re.search(r"hottest=([0-9]+(?:\.[0-9]+)?)C", status)
+    if match is None:
+        raise Stop("status has no hottest zone; not starting the daemon")
+    return float(match.group(1))
+
+
+def daemon_state_line(status: str) -> str:
+    for line in status.splitlines():
+        if line.startswith("state="):
+            return line
+    raise Stop("status has no state line")
+
+
+def service_check(runner, reader, fans, sleep) -> None:
+    """Start the performance unit, require the idle state-1 pin, then stop.
+
+    The first status can still be state 0. State 1 is the pin below 50 °C.
+    Anything else stops the unit and fails. ACPI Fan levels are only read.
+    """
+    status = preflight(runner, reader)
+    if hottest_c(status) >= 50.0:
+        raise Stop("hottest zone is at or above 50 C; idle state-1 check does not apply")
+    version = _ok(runner(
+        ["modinfo", "-F", "version", "dgx_ec_fan_control"]), "modinfo").strip()
+    if version != VERSION:
+        raise Stop(f"loaded module is {version!r}, not {VERSION}")
+    if reader(INSTALLED_CLI) != reader(SOURCE_CLI):
+        raise Stop("installed command does not match this checkout; not starting it")
+    before = fan_levels(fans())
+    started = False
+    try:
+        _ok(runner(["sudo", "systemctl", "start", DAEMON_UNIT]), "systemctl start")
+        started = True
+        last = ""
+        for _ in range(8):
+            sleep(2)
+            last = _ok(runner([CLI_NAME, "status"]), "status during service")
+            line = daemon_state_line(last)
+            if line.startswith("state=1/12"):
+                break
+            if line.startswith("state=0/12"):
+                continue
+            raise Stop(f"daemon left the idle pin: {line}")
+        else:
+            raise Stop("daemon did not reach state 1 within 16s; stopping the service")
+        active = runner(["systemctl", "is-active", DAEMON_UNIT])
+        if (active.stdout or "").strip() != "active":
+            raise Stop(f"service is {(active.stdout or '').strip()!r} after state 1")
+        assert_same_fans(before, fan_levels(fans()))
+    finally:
+        if started:
+            stopped = runner(["sudo", "systemctl", "stop", DAEMON_UNIT])
+            if stopped.returncode != 0:
+                raise Stop(
+                    "systemctl stop failed "
+                    f"({stopped.returncode}): {_text(stopped).strip()}"
+                )
+    for _ in range(8):
+        sleep(1)
+        status = _ok(runner([CLI_NAME, "status"]), "status after stop")
+        active = runner(["systemctl", "is-active", DAEMON_UNIT])
+        if ((active.stdout or "").strip() == "inactive" and
+                "state=0/12 (daemon not setting a floor; EC's own curve)" in status and
+                "manual-floor: none" in status):
+            assert_same_fans(before, fan_levels(fans()))
+            return
+    raise Stop("service stop did not restore state 0 with the unit inactive")
 
 
 def floor_check(runner, reader, fans) -> None:
@@ -192,13 +268,13 @@ def install(runner, reader) -> None:
 
 
 def main(argv: list[str] | None = None, env: dict | None = None,
-         runner=None, reader=None, fans=None) -> int:
+         runner=None, reader=None, fans=None, sleep=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     environment = os.environ if env is None else env
     if environment.get(OPT_IN) != "1":
         print(
             "kensaki-regression: not touching services, sysfs, or the module. "
-            f"Set {OPT_IN}=1 and pass preflight, install, or floor.",
+            f"Set {OPT_IN}=1 and pass preflight, install, floor, or service.",
             file=sys.stderr,
         )
         return 2
@@ -208,6 +284,8 @@ def main(argv: list[str] | None = None, env: dict | None = None,
         reader = lambda path: read_file(Path(path))
     if fans is None:
         fans = live_fans
+    if sleep is None:
+        sleep = time.sleep
     case = args[0] if args else ""
     try:
         if case == "preflight":
@@ -216,8 +294,10 @@ def main(argv: list[str] | None = None, env: dict | None = None,
             install(runner, reader)
         elif case == "floor":
             floor_check(runner, reader, fans)
+        elif case == "service":
+            service_check(runner, reader, fans, sleep)
         else:
-            raise Stop("choose preflight, install, or floor")
+            raise Stop("choose preflight, install, floor, or service")
     except Stop as stopped:
         print(f"STOP {stopped.reason}", file=sys.stderr)
         return 1

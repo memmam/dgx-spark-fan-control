@@ -41,7 +41,17 @@ Carry-forward, decided on this branch:
   set-state 6 then automatic, and it checks that ACPI Fan `cur_state`
   does not change. Atarime is refused. No GPU load.
 
-Older sections below are the record as it stood at this commit, including
+## Kensaki script, 6 Nov 2026 23:22 PST
+
+Checkout `0d9b49e` on Kensaki, EC 3.5.8. The operator ran
+`scripts/kensaki-regression` with `DGX_FAN_SUPERVISED=1`. The script
+printed `PASS preflight`, `PASS install`, and `PASS floor`. No status
+text, RPM, temperature, or kernel log was supplied with those lines, so
+this row is the script result only. Atarime was not run. No GPU load was
+run. Do not repeat these three cases unless this command or the installed
+module changes, or a regression is being checked.
+
+Older sections below are the record as it stood at `e57001b`, including
 commands this tree no longer provides.
 
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
