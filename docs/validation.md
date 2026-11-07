@@ -295,9 +295,20 @@ current `0x02009e0f` minimum `0x02007300`, and
 `0x00000400`. `/boot/efi` is vfat on `/dev/nvme0n1p1`. That node is not to
 be read. `/lib/firmware` contains `nvidia/`, `7.0.0-1019-nvidia/`, and
 `7.0.0-1024-nvidia/` among ordinary Linux firmware. `nvidia_ffa_ec` is
-builtin, `drivers/platform/arm64/nvidia-ffa-ec`, softdep `arm-ffa`. No EFI
-directory listing was received. These capsules are update images, not the
-running SMC handler.
+builtin, `drivers/platform/arm64/nvidia-ffa-ec`, softdep `arm-ffa`.
+
+The EFI listing is now in. `/boot/efi/EFI` has `BOOT`, `ubuntu`, and
+`UpdateCapsule`. `UpdateCapsule` is empty. `ubuntu/fw` is empty. `ubuntu`
+holds `grubaa64.efi`, `grub.cfg`, `shimaa64.efi`, `mmaa64.efi`,
+`BOOTAA64.CSV`, and `fw/`. `BOOT` holds `BOOTAA64.EFI`, `fbaa64.efi`, and
+`mmaa64.efi`. The name filter on the three firmware directories above
+matched GPU microcode and unrelated device-tree board files. It did not
+match a name containing `ffa` or `socfw`. `/usr/src` has no
+`nvidia-ffa-ec*` file. These are filename results, not a content search, so
+they do not prove the SMC handler is missing from the machine. Empty
+capsule directories mean nothing is staged now. They do not identify the
+monitor that answered the earlier SMC. No further listing is requested.
+Acceptance of the setpoint remains unshown. The Kensaki sweep stays blocked.
 
 ## Kensaki continuation from 160, not yet run
 

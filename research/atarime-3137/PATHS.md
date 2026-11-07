@@ -59,15 +59,67 @@ is builtin at `drivers/platform/arm64/nvidia-ffa-ec`. A capsule on disk is
 the update image fwupd staged. It is not the SMC handler that is running.
 The builtin driver is the host side of FF-A. It is not that handler either.
 
-## Next listing, still missing
+## ESP and firmware names, 7 Nov 2026
 
-The EFI directory names were not listed. One level of `/boot/efi/EFI`,
-then one more level only if a name is `fwupd`, `UpdateCapsule`, or
-`NVIDIA`, with sizes and no file contents. Under `/lib/firmware`, only
-`nvidia`, `7.0.0-1019-nvidia`, and `7.0.0-1024-nvidia`, and only names
-matching `ffa`, `ec`, or `soc`. Under `/usr/src`, only a file whose name
-contains `nvidia-ffa-ec`. Stop when those listings are in hand. Do not
-read `/dev/nvme0n1p1`, do not dump EFI variables, and do not install or
-update firmware. If the listings are boot loaders plus the capsules
-already identified, the running SMC handler is still not a file on this
-machine.
+`/boot/efi/EFI` contains `BOOT`, `ubuntu`, and `UpdateCapsule`.
+`UpdateCapsule` is empty. `ubuntu/fw` is empty. `ubuntu` contains
+`grubaa64.efi`, `grub.cfg`, `shimaa64.efi`, `mmaa64.efi`, `BOOTAA64.CSV`,
+and `fw/`. `BOOT` contains `BOOTAA64.EFI`, `fbaa64.efi`, and `mmaa64.efi`.
+No further EFI listing.
+
+Under `/lib/firmware/nvidia`, `7.0.0-1019-nvidia`, and
+`7.0.0-1024-nvidia`, the name filter `*ffa*`, `*ec*`, `*socfw*` matched
+NVIDIA GPU firmware (`sec2`, `nvdec`, and `fecs` blobs for the `ga`, `gm`,
+`gp`, `gv`, and `tu` families, plus `tu10x/typec/ccg_secondary.cyacd.zst`)
+and kernel device-tree board files whose names contain those letters. No
+name matched `ffa` or `socfw`. `/usr/src` has no `nvidia-ffa-ec*` file.
+That is a filename filter, not a search of file contents. It does not show
+that the SMC handler is absent from the machine.
+
+An empty `UpdateCapsule` and an empty `ubuntu/fw` mean no capsule is staged
+for a later boot. The fwupd history line "capsule-on-disk" names the method
+of an update that already succeeded. Those directories do not still hold
+the image. These UEFI capsule devices report the running version. They do
+not export the resident firmware. A cabinet left in fwupd's cache would be
+another copy of an update payload. The public EC 3.13.7 and SoC 2.158.15
+capsules already studied do not contain this SMC handler in the fan-relay
+slice, and the SoC capsule's UEFI slot is padding. A matching checksum
+would not add the handler. A different checksum would name a file that is
+not in the ESP directories above.
+
+The host side is already known and does not need a kernel source download.
+`drivers/acpi/arm64/ffh.c` issues the SMC, copies the result registers back,
+and returns success without consulting them. `nvidia_ffa_ec` is the builtin
+FF-A driver, a different service from SMC `0xC400008D`. Neither file is the
+monitor that decides whether the setpoint is kept.
+
+## What would move the write
+
+Another directory listing does not show whether EC 3.13.7 kept the
+setpoint. Unchanged tach, `interpreter_ok`, and cached control 0 still do
+not separate a rejected write from a write the EC stored and did not apply.
+
+`_FST` published both speeds, and they matched `fan1_input`. In the captured
+DSDT that speed word is published only when the read SMC returns
+`XX0 == 0xC400008E`. The read of `0x06000704` and `0x06000706` cleared that
+check. The write is opcode `0x09` on `0x06000790` through `0x06000793`.
+`WRB` does not make that comparison, and the research caller drops the
+buffer. The read result does not transfer to the write.
+
+Two later observations would move it. Neither is requested from this
+listing, and neither is a new fan level.
+
+1. The result registers of one existing `WRB` call, and whether `XX0` is
+   `0xC400008E`. That is the sentinel the read path already returned. It is
+   not a replacement of `acpi_ffh_address_space_arch_handler`. A success
+   sentinel would still not prove the fan loop uses the stored bytes.
+2. The image that implements SMC `0xC400008D`. The saved captures place that
+   image outside the public EC immediates, outside the fan-relay slice, and
+   outside the SoC capsule's UEFI slot. The recovery manifest names the
+   internal AMI UEFI tree tag `1.111.17` and a coreboot artifact on
+   `artifactory.nvidia.com`. Those are not the Ubuntu boot files listed
+   above. Until one of those images is available, static inspection cannot
+   show a consumer of `0x06000790`.
+
+The Kensaki continuation stays blocked on the 2610/3915 baseline. No new
+module follows from this inventory.
