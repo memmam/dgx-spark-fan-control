@@ -144,7 +144,7 @@ the lowest level measured to hold here: on EC 3.5.8 at idle, with the module
 unloaded, a 30-minute hold at 35 kept the fans at 2070/2025 RPM, and the
 hottest zone peaked at 53.7 C and settled at 52.8 C. In an earlier run at 35,
 fan1 read 2160, one EC step higher. The checkout diagnostic
-`extras/acpi-floor-sweep` can repeat that idle measurement. It is not
+`research/acpi-floor-sweep/acpi-floor-sweep` can repeat that idle measurement. It is not
 installed by `scripts/install-userland`. Run it as root on EC 3.5.8, at
 idle, with the module unloaded and `dgx-fan-control.service` stopped:
 
@@ -152,7 +152,7 @@ idle, with the module unloaded and `dgx-fan-control.service` stopped:
 sudo systemctl stop dgx-fan-control.service
 sudo modprobe -r dgx_ec_fan_control
 sudo systemctl start dgx-fan-watchdog.service
-sudo extras/acpi-floor-sweep 40 35
+sudo research/acpi-floor-sweep/acpi-floor-sweep 40 35
 ```
 
 It holds each level for 180 seconds and logs both fans and the hottest zone
@@ -188,7 +188,7 @@ about **10 C below the hottest thermal zone**.
 
 The independent `dgx-fan-watchdog.service` now monitors this project's ACPI
 holds even after the writing command exits. Both `acpi-max` (including
-stall repair) and `extras/acpi-floor-sweep` arm a boot-scoped hold record
+stall repair) and `research/acpi-floor-sweep/acpi-floor-sweep` arm a boot-scoped hold record
 **before** writing. They refuse without an active watchdog, with invalid
 thermal configuration, or without positive EC 3.5.8 identification from the
 kernel's pinned version or the EC's ESRT GUID/version. EC 3.13.7 remains
@@ -514,7 +514,7 @@ file blocks later ACPI writes from this project. It does not block a
 workload manager from starting work again under the restored EC curve. The
 file is retried until this boot's copy has been synced to disk.
 
-`extras/acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
+`research/acpi-floor-sweep/acpi-floor-sweep --max-temp` defaults to **60 C**. A supervised burn test
 must explicitly raise it, for example `--max-temp 95`; that changes only
 the sweep abort, **not** the thermal escalation thresholds. The sweep's
 exit or abort writes level 100, which is still an ACPI hold until reboot.

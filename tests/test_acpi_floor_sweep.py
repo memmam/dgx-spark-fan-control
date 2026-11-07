@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 _loader = importlib.machinery.SourceFileLoader(
-    "acpi_floor_sweep", str(ROOT / "extras" / "acpi-floor-sweep"))
+    "acpi_floor_sweep", str(ROOT / "research" / "acpi-floor-sweep" / "acpi-floor-sweep"))
 _spec = importlib.util.spec_from_loader("acpi_floor_sweep", _loader)
 sweep_mod = importlib.util.module_from_spec(_spec)
 _loader.exec_module(sweep_mod)

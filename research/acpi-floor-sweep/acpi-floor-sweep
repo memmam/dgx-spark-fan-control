@@ -55,7 +55,7 @@ _CONTROLLER = None
 def controller():
     global _CONTROLLER
     if _CONTROLLER is None:
-        source = Path(__file__).resolve().parents[1] / "userspace/dgx_fan_control.py"
+        source = Path(__file__).resolve().parents[2] / "userspace/dgx_fan_control.py"
         if not source.is_file():
             source = Path("/usr/local/sbin/dgx-fan-control")
         loader = importlib.machinery.SourceFileLoader("dgx_acpi_controller", str(source))
