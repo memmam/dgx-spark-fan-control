@@ -417,7 +417,9 @@ power-action interfaces; it has not been hardware-validated by those tests.
 
 `./scripts/check` compiles the driver's transaction functions against a fake
 FF-A peer and refuses host systemd, module, and sysfs changes. That is not
-hardware readiness. The notes below are the operator's 7 Nov 2026 report.
+hardware readiness. `research/live-check` is a separate opt-in harness and
+has not been run on hardware. The notes below are the operator's 7 Nov 2026
+report.
 Items not listed there are still pending. This tree was not used to load the
 module or to run those steps.
 
