@@ -364,15 +364,7 @@ The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
 Continue to [pre-cooling and everyday usage](usage.md).
 
-## 6. Updating
-
-Update the userspace on every update. Rebuild the kernel module only when
-the version check on
-[Updates and removal](maintenance.md#update-this-projects-source)
-says `kernel/` changed, and only after `git pull` and that userspace update.
-The DKMS and by-hand rebuilds stay on that page.
-
-## 7. EC firmware pairing and downgrade
+## 6. EC firmware pairing and downgrade
 
 Fan-floor control needs **EC 3.5.8**. **EC 3.13.7** accepts the capability
 reply and then refuses floor writes. Downgrade to 3.5.8, then block EC
@@ -532,3 +524,10 @@ sudo dgx-fan-control health
 sudo dgx-fan-control health --record
 ```
 
+## 7. Updating
+
+Update the userspace on every update. Rebuild the kernel module only when
+the version check on
+[Updates and removal](maintenance.md#update-this-projects-source)
+says `kernel/` changed, and only after `git pull` and that userspace update.
+The DKMS and by-hand rebuilds stay on that page.
