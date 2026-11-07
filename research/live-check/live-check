@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Opt-in live checks for a loaded DGX Spark fan module.
+
+./scripts/check does not run this file. It stays out of the normal install.
+Set DGX_FAN_LIVE=1 for the read-only pass. A mutating case also needs the
+same name in --case and --consent. DGX_FAN_CONTROL_OFFLINE refuses the run
+even if the live flag is set.
+
+The harness timeout stops the userspace command. It does not interrupt a
+sync_send_receive2 that never returns; that call holds the driver mutex.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CHECKOUT = Path(__file__).resolve().parents[2]
+KERNEL_SOURCE = CHECKOUT / "kernel" / "dgx_ec_fan_control.c"
+MODULE = "dgx_ec_fan_control"
+DAEMON = "dgx-fan-control.service"
+WATCHDOG = "dgx-fan-watchdog.service"
+MANUAL_UNIT = "dgx-fan-manual.service"
+MANUAL_STATE = Path("/var/lib/dgx-fan-control/manual-state")
+PARAM_DIR = Path("/sys/module") / MODULE / "parameters"
+# Idle bound for this harness only. It is not a thermal-policy threshold.
+COOL_C = 60.0
+COMMAND_TIMEOUT = 15
+# The daemon writes its first non-zero floor in the first loop, before the
+# 2s poll wait. systemd Type=simple returns as soon as that process starts.
+# Four samples, 2s apart, cover that startup. They do not wait for the
+# unit's 30s RestartSec.
+SERVICE_READY_POLLS = 4
+SERVICE_READY_INTERVAL = 2.0
+SAFE_PARAM = frozenset({"n", "0", "false", "off"})
+MUTATING = ("floor-automatic", "service-start-stop", "unload-reload")
+MANUAL = (
+    ("reboot-notifier", "previous journal had no reboot-notifier line; shutdown restore is unverified"),
+    ("saved-manual-reboot", "a reboot that reapplies a saved manual floor is not run from here"),
+    ("sustained-load", "no workload heat"),
+    ("natural-timeout", "do not induce a mailbox timeout"),
+    ("suspend", "suspend is not run"),
+    ("acpi-write", "no ACPI cur_state write"),
+    ("foreign-floor", "do not clear a foreign floor, including 0x10fe"),
+    ("wedge", "do not inject a stuck mailbox"),
+    (
+        "zero-clamp",
+        "a literal lower clamp of 0 stops both fans and is not written; "
+        "cooling state 0 stores the unset clamp 0xffff and is NVIDIA's curve, "
+        "which this harness also does not write",
+    ),
+)
+
+
+class Stop(Exception):
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+def gate(env: dict[str, str]) -> str | None:
+    if env.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+        return "refusing: DGX_FAN_CONTROL_OFFLINE is set, so this live check does not run"
+    if env.get("DGX_FAN_LIVE") != "1":
+        return "refusing: set DGX_FAN_LIVE=1 for read-only checks; mutating cases also need --case and --consent"
+    return None
+
+
+def checkout_version() -> str:
+    text = KERNEL_SOURCE.read_text(encoding="utf-8")
+    match = re.search(r'DGX_EC_DRIVER_VERSION\s+"([^"]+)"', text)
+    if not match:
+        raise Stop(f"checkout version missing from {KERNEL_SOURCE}")
+    return match.group(1)
+
+
+def parse_status(text: str) -> dict:
+    """Fields this harness understands. Missing fields stay empty."""
+    found = {
+        "telemetry_only": "telemetry only" in text,
+        "foreign": "floor was changed outside this driver" in text or "0x10fe" in text,
+        "state": None,
+        "hottest_c": None,
+        "watchdog_active": "",
+        "manual": "",
+    }
+    state = re.search(r"state=(\d+)/", text)
+    if state:
+        found["state"] = int(state.group(1))
+    hot = re.search(r"hottest=([0-9]+(?:\.[0-9]+)?)C", text)
+    if hot:
+        found["hottest_c"] = accepted_celsius(hot.group(1))
+    watch = re.search(r"watchdog-active:\s*(\S+)", text)
+    if watch:
+        found["watchdog_active"] = watch.group(1)
+    manual = re.search(r"manual-floor:\s*(.+)", text)
+    if manual:
+        found["manual"] = manual.group(1).strip()
+    return found
+
+
+def profile_of(status: dict, log_text: str) -> str:
+    pinned = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
+    if status.get("telemetry_only"):
+        name = "EC 3.13.7"
+    elif status.get("state") is not None:
+        name = "EC 3.5.8"
+    else:
+        name = "unknown"
+    if pinned and name not in ("unknown", pinned.group(1)):
+        raise Stop(
+            f"status looks like {name} but the kernel log says {pinned.group(1)}"
+        )
+    if name == "unknown" and pinned:
+        return pinned.group(1)
+    return name
+
+
+def accepted_celsius(text: str) -> float | None:
+    """A zone reading this harness will trust. Anything else is not a temperature."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or not 0 < value <= 200:
+        return None
+    return value
+
+
+def parse_health_temperature(text: str) -> tuple[float | None, str]:
+    """Health's temperature line. EC 3.13.7 status does not print one.
+
+    ``pass (42.5C)`` and ``warn (hot under load, 70.0C)`` are readings.
+    A missing, unreadable, or malformed line is not a reading.
+    """
+    match = re.search(r"^temperature:\s*(.+)$", text, re.M)
+    if not match:
+        return None, "absent"
+    line = match.group(1).strip()
+    if "not readable" in line or "needs root" in line or line == "unknown":
+        return None, "unreadable"
+    number = re.search(r"([0-9]+(?:\.[0-9]+)?)C\)\s*$", line)
+    if number and (line.startswith("pass (") or line.startswith("warn (")):
+        value = accepted_celsius(number.group(1))
+        if value is None:
+            return None, "malformed"
+        return value, "health"
+    return None, "malformed"
+
+
+def read_zone_temperature(thermal_root: Path) -> tuple[float | None, str]:
+    """Hottest kernel thermal zone, the same files health reads.
+
+    Millidegree 0 and values above 200C are ignored, matching the controller.
+    This only reads ``temp`` files. It does not write a cooling device.
+    """
+    if not thermal_root.is_dir():
+        return None, "missing"
+    saw_malformed = False
+    readings = []
+    for zone in sorted(thermal_root.glob("thermal_zone*")):
+        path = zone / "temp"
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="ascii").strip()
+            millidegrees = int(raw)
+        except (OSError, UnicodeError, ValueError):
+            saw_malformed = True
+            continue
+        if 0 < millidegrees <= 200_000:
+            readings.append(millidegrees / 1000.0)
+        else:
+            saw_malformed = True
+    if readings:
+        return max(readings), "thermal-zone"
+    return None, "malformed" if saw_malformed else "missing"
+
+
+def choose_temperature(status_c: float | None, health_text: str,
+                       zone: tuple[float | None, str]) -> tuple[float | None, str]:
+    """Pick one trustworthy reading and name its source.
+
+    Health is first because EC 3.13.7 status does not print a temperature.
+    Status is next. Kernel zones are the same source health uses when the
+    health line itself has no number. A missing or malformed value is not
+    turned into a number.
+    """
+    health_c, health_note = parse_health_temperature(health_text)
+    if health_c is not None:
+        return health_c, "health"
+    if status_c is not None:
+        return status_c, "status"
+    zone_c, zone_note = zone
+    if zone_c is not None:
+        return zone_c, "thermal-zone"
+    return None, f"missing (health={health_note}, zones={zone_note})"
+
+
+def temperature_trusted(snap: dict) -> bool:
+    source = snap.get("temperature_source")
+    value = snap.get("hottest_c")
+    if source not in ("status", "health", "thermal-zone"):
+        return False
+    return accepted_celsius(value) is not None
+
+
+def param_ok(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in SAFE_PARAM
+
+
+def unmet(case: str, snap: dict) -> list[str]:
+    """Why a mutating case must not run. Empty means the preconditions hold."""
+    if case in ("floor-automatic", "service-start-stop") and snap["profile"] == "EC 3.13.7":
+        return ["EC 3.13.7 is telemetry only; no floor write and no controller start"]
+    reasons = []
+    if snap["profile"] not in ("EC 3.5.8", "EC 3.13.7"):
+        reasons.append(f"profile is {snap['profile']}, not a supported profile")
+    if not snap["root"]:
+        reasons.append("not root")
+    if not snap["module_loaded"]:
+        reasons.append("module is not loaded")
+    if snap["checkout_version"] != snap["loaded_version"]:
+        reasons.append(
+            f"loaded {snap['loaded_version']} differs from checkout {snap['checkout_version']}"
+        )
+    for name in ("automatic_floor_recovery", "allow_unverified_writes"):
+        if not param_ok(snap["params"].get(name)):
+            reasons.append(f"{name} is {snap['params'].get(name)!r}, not off")
+    if snap["service_active"] != "inactive":
+        reasons.append(f"{DAEMON} is {snap['service_active']}, not inactive")
+    if snap["watchdog_active"] != "active":
+        reasons.append(f"{WATCHDOG} is {snap['watchdog_active'] or 'unknown'}, not active")
+    if snap["gpu_job"] != "none":
+        reasons.append(f"GPU job is {snap['gpu_job']}; will not prove the machine is idle")
+    if not temperature_trusted(snap):
+        reasons.append(
+            "no trustworthy zone temperature "
+            f"({snap.get('temperature_source') or 'missing'}); "
+            "not treating the machine as cool"
+        )
+    elif snap["hottest_c"] >= COOL_C:
+        reasons.append(f"hottest zone is {snap['hottest_c']:.1f}C, not below {COOL_C:.0f}C")
+    if snap["foreign"]:
+        reasons.append("status shows a foreign floor; it will not be cleared")
+    if case == "floor-automatic" or (case == "unload-reload" and snap["profile"] == "EC 3.5.8"):
+        if snap["state"] != 0:
+            reasons.append(f"cooling state is {snap['state']}, not 0")
+        if snap["manual"] != "none":
+            reasons.append(f"manual floor is {snap['manual']!r}, not none")
+        if case == "floor-automatic" and snap["manual_unit"] not in ("disabled", "not-found"):
+            reasons.append(
+                f"{MANUAL_UNIT} is {snap['manual_unit']} while manual-floor is "
+                f"{snap['manual']!r}; automatic would disable that unit, and "
+                "this harness will not change that saved setting"
+            )
+    if case == "unload-reload" and snap["profile"] == "EC 3.13.7" and snap["cooling_device"]:
+        reasons.append("EC 3.13.7 is showing a cooling device")
+    if case == "service-start-stop":
+        if snap["profile"] != "EC 3.5.8":
+            reasons.append("service start is only for EC 3.5.8")
+        if snap["state"] != 0:
+            reasons.append(f"cooling state is {snap['state']}, not 0")
+        if snap["manual"] not in ("none", ""):
+            reasons.append(f"manual floor is {snap['manual']!r}")
+    return reasons
+
+
+def case_kind(case: str, snap: dict) -> tuple[str, list[str]]:
+    """manual, skip, or run."""
+    reasons = unmet(case, snap)
+    if reasons and reasons[0].startswith("EC 3.13.7 is telemetry only"):
+        return "manual", reasons
+    if reasons:
+        return "skip", reasons
+    return "run", []
+
+
+def commands_for(case: str) -> list[list[str]]:
+    if case == "floor-automatic":
+        return [
+            ["dgx-fan-control", "set-state", "6"],
+            ["dgx-fan-control", "status"],
+            ["dgx-fan-control", "automatic"],
+            ["dgx-fan-control", "status"],
+        ]
+    if case == "service-start-stop":
+        return [
+            ["systemctl", "start", DAEMON],
+            ["dgx-fan-control", "status"],
+            ["systemctl", "stop", DAEMON],
+            ["dgx-fan-control", "status"],
+        ]
+    if case == "unload-reload":
+        return [
+            ["modprobe", "-r", MODULE],
+            ["modprobe", MODULE],
+            ["dgx-fan-control", "status"],
+        ]
+    raise Stop(f"no command list for {case}")
+
+
+def read_only_faults(snap: dict) -> list[str]:
+    faults = []
+    if snap["profile"] not in ("EC 3.5.8", "EC 3.13.7"):
+        faults.append(f"profile is {snap['profile']}")
+    if not snap["module_loaded"]:
+        faults.append("module is not loaded")
+    elif snap["checkout_version"] != snap["loaded_version"]:
+        faults.append(
+            f"loaded {snap['loaded_version']} differs from checkout {snap['checkout_version']}"
+        )
+    if snap["module_loaded"]:
+        for name in ("automatic_floor_recovery", "allow_unverified_writes"):
+            if not param_ok(snap["params"].get(name)):
+                faults.append(f"{name} is {snap['params'].get(name)!r}, not off")
+    if snap["profile"] == "EC 3.13.7" and snap["cooling_device"]:
+        faults.append("EC 3.13.7 has a cooling device")
+    if snap["profile"] == "EC 3.5.8" and snap["module_loaded"] and not snap["cooling_device"]:
+        faults.append("EC 3.5.8 module is loaded without a cooling device")
+    if snap["foreign"]:
+        faults.append("status shows a foreign floor")
+    if not temperature_trusted(snap):
+        faults.append(
+            "temperature was not read from status, health, or a kernel thermal "
+            f"zone ({snap.get('temperature_source') or 'missing'}); "
+            "this is not a temperature pass"
+        )
+    if snap["health"] != "healthy":
+        faults.append(f"health is {snap['health']}")
+    if snap["status_code"] != 0:
+        faults.append(f"status exited {snap['status_code']}")
+    return faults
+
+
+def report_manual() -> None:
+    for name, why in MANUAL:
+        print(f"MANUAL {name}: {why}")
+
+
+def run_command(argv: list[str], run) -> subprocess.CompletedProcess[str]:
+    try:
+        return run(argv, timeout=COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired as exc:
+        raise Stop(
+            f"{' '.join(argv)} still running after {COMMAND_TIMEOUT}s; "
+            "a stuck sync_send_receive2 is not interrupted by this timeout"
+        ) from exc
+
+
+def live_collect(run) -> dict:
+    status = run_command(["dgx-fan-control", "status"], run)
+    health = run_command(["dgx-fan-control", "health"], run)
+    parsed = parse_status(status.stdout or "")
+    try:
+        log = run_command(["dmesg"], run)
+        log_text = log.stdout or ""
+    except Stop:
+        log_text = ""
+    profile = profile_of(parsed, log_text)
+    loaded = (Path("/sys/module") / MODULE).is_dir()
+    version = ""
+    if loaded:
+        info = run_command(["modinfo", "-F", "version", MODULE], run)
+        version = (info.stdout or "").strip()
+    params = {}
+    for name in ("automatic_floor_recovery", "allow_unverified_writes"):
+        path = PARAM_DIR / name
+        try:
+            params[name] = path.read_text(encoding="ascii").strip()
+        except OSError:
+            params[name] = None
+    gpu = run_command(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], run,
+    )
+    if gpu.returncode != 0:
+        job = "unknown"
+    elif (gpu.stdout or "").strip():
+        job = "present"
+    else:
+        job = "none"
+    service = run_command(["systemctl", "is-active", DAEMON], run)
+    watchdog = run_command(["systemctl", "is-active", WATCHDOG], run)
+    manual_unit = run_command(["systemctl", "is-enabled", MANUAL_UNIT], run)
+    manual_text = None
+    if MANUAL_STATE.is_file():
+        try:
+            manual_text = MANUAL_STATE.read_text(encoding="ascii")
+        except OSError:
+            manual_text = None
+    cooling = any(
+        (path / "type").read_text(encoding="ascii").strip() == "dgx_ec_fan_floor"
+        for path in Path("/sys/class/thermal").glob("cooling_device*")
+        if (path / "type").is_file()
+    ) if Path("/sys/class/thermal").is_dir() else False
+    rpms = []
+    hwmon = Path("/sys/class/hwmon")
+    if hwmon.is_dir():
+        for device in sorted(hwmon.glob("hwmon*")):
+            try:
+                name = (device / "name").read_text(encoding="ascii").strip()
+            except OSError:
+                continue
+            if name not in ("acpi_fan", "dgx_ec_fan"):
+                continue
+            for fan in sorted(device.glob("fan*_input")):
+                try:
+                    rpms.append(f"{name}:{fan.name}={fan.read_text(encoding='ascii').strip()}")
+                except OSError:
+                    rpms.append(f"{name}:{fan.name}=unreadable")
+    health_text = (health.stdout or "") + (health.stderr or "")
+    hottest, source = choose_temperature(
+        parsed["hottest_c"], health_text, read_zone_temperature(Path("/sys/class/thermal")),
+    )
+    return {
+        "profile": profile,
+        "module_loaded": loaded,
+        "loaded_version": version,
+        "checkout_version": checkout_version(),
+        "params": params,
+        "state": parsed["state"],
+        "manual": parsed["manual"],
+        "service_active": (service.stdout or "").strip() or "unknown",
+        "watchdog_active": parsed["watchdog_active"] or (watchdog.stdout or "").strip(),
+        "manual_unit": (manual_unit.stdout or "").strip() or "unknown",
+        "hottest_c": hottest,
+        "temperature_source": source,
+        "gpu_job": job,
+        "foreign": parsed["foreign"],
+        "cooling_device": cooling,
+        "rpms": rpms,
+        "health": "healthy" if "health: healthy" in health_text else "fail",
+        "status_code": status.returncode,
+        "root": os.geteuid() == 0,
+        "manual_file": manual_text,
+        "hostname": os.uname().nodename,
+    }
+
+
+def print_snapshot(snap: dict) -> None:
+    print(f"machine: {snap['hostname']}")
+    print(f"profile: {snap['profile']}")
+    print(f"checkout: {snap['checkout_version']} ({CHECKOUT})")
+    print(f"loaded: {snap['loaded_version'] or 'not loaded'}")
+    print(
+        "params: "
+        + " ".join(f"{name}={snap['params'].get(name)}" for name in (
+            "automatic_floor_recovery", "allow_unverified_writes",
+        ))
+    )
+    print(
+        f"state: {snap['state']} manual: {snap['manual'] or 'n/a'} "
+        f"service: {snap['service_active']} watchdog: {snap['watchdog_active']}"
+    )
+    print(
+        f"temperature: {snap['hottest_c'] if snap.get('hottest_c') is not None else 'missing'}"
+        f" source={snap.get('temperature_source') or 'missing'}"
+    )
+    print(
+        f"manual-unit: {snap.get('manual_unit') or 'unknown'} "
+        f"gpu_job: {snap['gpu_job']} foreign: {snap['foreign']}"
+    )
+    print("telemetry: " + (" ".join(snap["rpms"]) if snap["rpms"] else "no fan rpm read"))
+
+
+def service_floor_ready(active: str, state: int | None) -> bool:
+    """A running curve has left state 0. State 0 alone is not a daemon exit."""
+    return active == "active" and state not in (None, 0)
+
+
+def read_service_sample(run) -> dict:
+    print("RUN systemctl is-active " + DAEMON)
+    active = run_command(["systemctl", "is-active", DAEMON], run)
+    print("RUN dgx-fan-control status")
+    status = run_command(["dgx-fan-control", "status"], run)
+    parsed = parse_status(status.stdout or "")
+    print((status.stdout or "").rstrip())
+    return {
+        "active": (active.stdout or "").strip() or "unknown",
+        "state": parsed["state"],
+        "status_text": status.stdout or "",
+    }
+
+
+def await_service_floor(run, sleep) -> dict:
+    """Poll until the floor leaves 0, or the bounded window ends."""
+    last = None
+    for index in range(SERVICE_READY_POLLS):
+        if index:
+            sleep(SERVICE_READY_INTERVAL)
+        last = read_service_sample(run)
+        print(
+            f"service sample {index + 1}/{SERVICE_READY_POLLS}: "
+            f"active={last['active']} state={last['state']}"
+        )
+        if service_floor_ready(last["active"], last["state"]):
+            last["ready"] = True
+            last["samples"] = index + 1
+            return last
+    last["ready"] = False
+    last["samples"] = SERVICE_READY_POLLS
+    return last
+
+
+def not_ready_message(sample: dict) -> str:
+    return (
+        f"started service left state {sample['state']} "
+        f"after {sample['samples']} samples "
+        f"({SERVICE_READY_INTERVAL:.0f}s apart); is-active={sample['active']}. "
+        "The status phrase 'daemon not setting a floor' is printed for "
+        "cooling state 0 and does not say the service exited"
+    )
+
+
+def stop_performance_service(run) -> str | None:
+    """Stop the performance service. Do not disable it or the manual unit."""
+    print("RUN systemctl stop " + DAEMON)
+    try:
+        completed = run_command(["systemctl", "stop", DAEMON], run)
+    except Exception as exc:
+        return f"systemctl stop failed: {exc}"
+    if completed.returncode != 0:
+        detail = ((completed.stderr or completed.stdout or "").strip())
+        return f"systemctl stop exited {completed.returncode}: {detail}"
+    return None
+
+
+def run_service_start_stop(run, sleep) -> None:
+    """Start an inactive performance service, then always stop it.
+
+    The original error is kept when the later stop also fails.
+    """
+    primary = None
+    try:
+        print("RUN systemctl start " + DAEMON)
+        started = run_command(["systemctl", "start", DAEMON], run)
+        if started.returncode != 0:
+            detail = ((started.stderr or started.stdout or "").strip())
+            primary = f"systemctl start exited {started.returncode}: {detail}"
+        else:
+            sample = await_service_floor(run, sleep)
+            if not sample["ready"]:
+                primary = not_ready_message(sample)
+    except Exception as exc:
+        primary = primary or f"service-start-stop failed: {exc}"
+    cleanup = stop_performance_service(run)
+    if primary and cleanup:
+        raise Stop(f"{primary} Cleanup failed: {cleanup}")
+    if cleanup:
+        raise Stop(f"Cleanup failed after service-start-stop: {cleanup}")
+    if primary:
+        raise Stop(primary)
+
+
+def finish_mutating(case: str, snap_before: dict, snap_after: dict) -> None:
+    if case == "floor-automatic":
+        if snap_after["state"] != 0 or snap_after["manual"] != "none":
+            raise Stop(
+                f"floor-automatic left state {snap_after['state']} "
+                f"manual {snap_after['manual']!r}; not trying another cleanup"
+            )
+    elif case == "service-start-stop":
+        if snap_after["service_active"] != "inactive" or snap_after["state"] != 0:
+            raise Stop(
+                f"service-start-stop left service {snap_after['service_active']} "
+                f"state {snap_after['state']}"
+            )
+    elif case == "unload-reload":
+        if snap_before.get("manual_file") != snap_after.get("manual_file"):
+            raise Stop("unload-reload changed the saved manual-state file")
+        if snap_after["profile"] == "EC 3.13.7" and snap_after["cooling_device"]:
+            raise Stop("reload registered a cooling device on EC 3.13.7")
+        if snap_after["profile"] == "EC 3.5.8" and snap_after["state"] != 0:
+            raise Stop(f"reload left cooling state {snap_after['state']}")
+    print(f"PASS {case}")
+
+
+def main(argv: list[str] | None = None, environ: dict[str, str] | None = None,
+         collect=None, run=None, sleep=None) -> int:
+    env = os.environ if environ is None else environ
+    refused = gate(env)
+    if refused:
+        print(f"live-check: {refused}", file=sys.stderr)
+        return 2
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--case", action="append", default=[], choices=MUTATING)
+    parser.add_argument("--consent", action="append", default=[])
+    args = parser.parse_args(argv)
+    missing = [name for name in args.case if name not in args.consent]
+    if missing:
+        print(
+            "live-check: refusing mutating cases without matching --consent: "
+            + " ".join(missing),
+            file=sys.stderr,
+        )
+        return 2
+    if run is None:
+        def run(argv, timeout):
+            return subprocess.run(
+                argv, check=False, capture_output=True, text=True, timeout=timeout,
+            )
+    if collect is None:
+        collect = live_collect
+    if sleep is None:
+        sleep = time.sleep
+    print(
+        "live-check: userspace commands time out at "
+        f"{COMMAND_TIMEOUT}s. That does not interrupt a stuck secure-firmware call."
+    )
+    try:
+        snap = collect(run)
+        print_snapshot(snap)
+        faults = read_only_faults(snap)
+        if faults:
+            for item in faults:
+                print(f"FAIL read-only: {item}")
+            raise Stop("read-only checks failed; mutating cases not started")
+        print("PASS read-only")
+        for case in args.case:
+            kind, reasons = case_kind(case, snap)
+            if kind == "manual":
+                print(f"MANUAL {case}: " + "; ".join(reasons))
+                continue
+            if kind == "skip":
+                print(f"SKIP {case}: " + "; ".join(reasons))
+                report_manual()
+                return 3
+            before_file = snap.get("manual_file")
+            if case == "service-start-stop":
+                run_service_start_stop(run, sleep)
+                after = collect(run)
+                finish_mutating(case, snap, after)
+                snap = after
+                continue
+            seen_status = 0
+            for argv in commands_for(case):
+                print("RUN " + " ".join(argv))
+                completed = run_command(argv, run)
+                if completed.returncode != 0:
+                    detail = ((completed.stderr or completed.stdout or "").strip())
+                    raise Stop(f"{' '.join(argv)} exited {completed.returncode}: {detail}")
+                if argv[:2] == ["dgx-fan-control", "status"]:
+                    print((completed.stdout or "").rstrip())
+                    parsed = parse_status(completed.stdout or "")
+                    seen_status += 1
+                    if case == "floor-automatic" and seen_status == 1 and parsed["state"] != 6:
+                        raise Stop(f"set-state 6 read back state {parsed['state']}")
+            after = collect(run)
+            if case == "unload-reload":
+                finish_mutating(
+                    case,
+                    {"manual_file": before_file, "profile": snap["profile"]},
+                    after,
+                )
+            else:
+                finish_mutating(case, snap, after)
+            snap = after
+        report_manual()
+    except Stop as exc:
+        print(f"FAIL {exc.message}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -20,7 +20,7 @@ uname -r
 mokutil --sb-state
 ```
 
-Keep this checkout for builds and updates. Commands below assume you are in its
+`./scripts/check` does not talk to systemd or write sysfs. Keep this checkout for builds and updates. Commands below assume you are in its
 root. If matching headers are unavailable, resolve that first through your
 DGX OS package repositories. Another kernel's headers are not a substitute.
 
@@ -145,21 +145,28 @@ intended, enrolled pair. See the
 From the checkout root, register only the files needed to build the module:
 
 ```sh
-sudo install -d /usr/src/dgx-spark-fan-control-0.1.4/kernel
-sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.4/dkms.conf
+sudo install -d /usr/src/dgx-spark-fan-control-0.1.7/kernel
+sudo install -m 0644 dkms.conf /usr/src/dgx-spark-fan-control-0.1.7/dkms.conf
 sudo install -m 0644 kernel/Makefile kernel/dgx_ec_fan_control.c \
-  /usr/src/dgx-spark-fan-control-0.1.4/kernel/
-sudo dkms add -m dgx-spark-fan-control -v 0.1.4
-sudo dkms build -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
-sudo dkms install -m dgx-spark-fan-control -v 0.1.4 -k "$(uname -r)"
+  /usr/src/dgx-spark-fan-control-0.1.7/kernel/
+sudo dkms add -m dgx-spark-fan-control -v 0.1.7
+sudo dkms build -m dgx-spark-fan-control -v 0.1.7 -k "$(uname -r)"
+sudo dkms install -m dgx-spark-fan-control -v 0.1.7 -k "$(uname -r)"
 dkms status -m dgx-spark-fan-control
 modinfo -F signer dgx_ec_fan_control
 ```
 
 Expect `installed` for the running kernel and the intended certificate subject
-in `signer`. Continue with step 4. If previously installed manually, use the
+in `signer`. **DKMS installs only the kernel module.** It does not replace
+`/usr/local/sbin/dgx-fan-control`. Continue with step 4 and install that
+command before loading the module, or a previous 0.1.4 CLI stays in place.
+If previously installed manually, use the
 [migration instructions](maintenance.md#switch-from-manual-installation-to-dkms)
 first so an old module does not mask the DKMS version.
+
+DKMS does not install the command and does not refresh the stored health
+record. After section 4 installs the command, run the health refresh at the
+end of that section.
 
 ## 3B. Manual build and sign
 
@@ -181,9 +188,16 @@ For a system without signature enforcement, replace `./scripts/build-sign`
 with `make -C kernel`, then use the same installation commands. An unsigned
 module will not load under enforced Secure Boot.
 
-## 4. Load the driver and verify automatic mode
+This build does not install the command and does not refresh the stored
+health record. After section 4 installs the command, run the health refresh
+at the end of that section.
 
-Both build routes join here:
+## 4. Install the command, then load the driver
+
+**Do this after every DKMS or manual module build.** DKMS does not install
+the Python command. If `/usr/local/sbin/dgx-fan-control` is left over from
+0.1.4, the new module will be controlled by the old CLI until this copy
+replaces it.
 
 ```sh
 sudo install -D -m 0755 userspace/dgx_fan_control.py /usr/local/sbin/dgx-fan-control
@@ -191,28 +205,100 @@ sudo modprobe dgx_ec_fan_control
 dgx-fan-control status
 ```
 
-Status must start with **`state=0/12`**: the device was found and its added floor
-is unset. Successful `modprobe` alone is insufficient; device probing can still
-reject the firmware contract. See [troubleshooting](troubleshooting.md) if needed.
+Status must start with **`state=0/12 (daemon not setting a floor; EC's own curve)`**: the device was
+found and its added floor is unset. That is NVIDIA's curve, not fans stopped.
+On EC 3.13.7, status may instead print
+`control unsupported on this firmware`: telemetry is up and floor writes were
+rejected. A mailbox timeout prints an error and does not create the hwmon
+device. EC 3.5.8 with October SoC 2.158.15 has both completed this probe and
+timed out on other boots, so a timeout is a fallback case, not the only
+result for that pair. If status says the probe refused a foreign floor, do
+not write ACPI level 0. Successful `modprobe` alone is insufficient; device
+probing can still reject the firmware contract. See
+[troubleshooting](troubleshooting.md) if needed. Fan-floor control needs
+EC 3.5.8. Downgrading from 3.13.7, and stopping fwupd from putting 3.13.7
+back, are in
+[EC firmware pairing and downgrade](#6-ec-firmware-pairing-and-downgrade).
+
+Finish by refreshing the stored health record. Installing a different
+build marks the old record stale, so the first `health` run after an
+install or update prints `stored health: ... stale (written by a different
+install)`. That is expected and is not a fault. The `--record` run that
+follows replaces it with the current result and, on a healthy run, also
+clears the stored needs-intervention flag and the stall and watchdog-reboot
+markers. The plain command runs under `sudo` but does not write
+(`recorded: no`).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+
+```sh
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+```
 
 ## 5. Choose your startup mode
 
-Install the boot-load entry and optional service definition:
+Install everything that is not optional with one script, run from the
+checkout:
 
 ```sh
-sudo install -D -m 0644 systemd/dgx_ec_fan_control.conf \
-  /etc/modules-load.d/dgx_ec_fan_control.conf
-sudo install -D -m 0644 systemd/dgx-fan-control.service \
-  /etc/systemd/system/dgx-fan-control.service
-sudo systemctl daemon-reload
+sudo ./scripts/install-userland
 ```
+
+It installs the boot-load entry, the command, the unit files (control,
+watchdog, health, and manual), the motd snippet, and the defaults file when
+it is absent. It then reloads systemd, enables `dgx-fan-health.service` and
+`dgx-fan-manual.service` for the next boot, and enables and starts
+`dgx-fan-watchdog.service`. It does **not** enable `dgx-fan-control.service`;
+that is the optional mode below. The script is short; read it to see each
+step. It writes the boot-load entry
+(`/etc/modules-load.d/dgx_ec_fan_control.conf`) only when that file is
+absent, so a file left by `module disable` stays disabled. Use
+`module enable` to turn boot loading back on.
+
+Then refresh the stored health record, as in
+[section 4](#4-install-the-command-then-load-the-driver). The script does not
+do this for you.
+
+```sh
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+```
+
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to `sudo dgx-fan-control acpi-max` when a
+downgrade to EC 3.5.8 leaves a fan at 0 RPM.
+
+To leave the watchdog disabled, run
+`sudo ./scripts/install-userland --no-watchdog`. The health check still
+expects the watchdog to be active, so that opt-out makes the next health
+check record needs-intervention. Do not run `health --record` while the
+watchdog is disabled.
 
 Then choose one mode:
 
 | Startup mode | Best for | Command |
 | --- | --- | --- |
-| NVIDIA factory curve; manual boosts when needed | Pre-cooling individual jobs | `sudo systemctl disable --now dgx-fan-control.service` |
+| NVIDIA factory curve; manual boosts when needed | Pre-cooling individual jobs | `sudo systemctl disable --now dgx-fan-control.service`, then `sudo dgx-fan-control automatic` |
 | This project's performance curve | Continual temperature-based extra cooling | `sudo systemctl enable --now dgx-fan-control.service` |
+| Held manual floor | A fixed floor across boots, without the performance curve | `sudo systemctl disable --now dgx-fan-control.service`, then `sudo dgx-fan-control set-state <n>` |
+
+Install enables `dgx-fan-manual.service`, which reapplies a held floor at the
+next boot. It does not start the performance curve. For that mode, stop the
+performance service, record the floor, and confirm it. See
+[Hold a manual floor](usage.md#hold-a-manual-floor).
+
+```sh
+sudo systemctl disable --now dgx-fan-control.service
+sudo dgx-fan-control set-state <n>
+dgx-fan-control status
+```
+
+`status` shows `manual-floor: N (last-set)`.
+`sudo systemctl disable --now dgx-fan-control.service` alone restores
+NVIDIA's curve only for the current session. A remaining last-set floor
+comes back at the next boot unless `automatic` cleared it.
 
 For factory-curve mode, also clear any manual floor:
 
@@ -223,10 +309,47 @@ dgx-fan-control status
 
 The module loads at boot on NVIDIA's curve (state 0) whether or not the
 service is enabled. State 0 is that curve, not fans stopped. A latched lower
-clamp of 0 is cleared during load. Enabling the service adds our performance
-curve. `start`/`stop` change the current session; `enable`/`disable` change
-future boots. Disabling the service alone does not clear a manually set
-non-zero floor, which is why `automatic` is explicit above.
+clamp of exactly 0 is cleared during load. A non-zero floor this driver does
+not own is not cleared. Enabling the service adds our performance curve.
+`module enable` loads the module and does not enable the service.
+`sudo dgx-fan-control module enable --start-service` is the explicit choice,
+same as the table above. `start`/`stop` change the current session;
+`enable`/`disable` change future boots. Do not substitute an ACPI level of 0 for
+`automatic`.
+
+The watchdog is a separate unit. It reads the ACPI fans and `thermal_zone0`
+directly. `systemctl disable --now dgx-fan-control.service` and
+`module disable` do not stop it.
+
+After a reboot, check the watchdog and the health oneshot. Do not write an
+ACPI fan level for this check.
+
+```sh
+systemctl is-active dgx-fan-watchdog.service
+systemctl is-active dgx-fan-health.service
+sudo journalctl -u dgx-fan-watchdog.service -b --no-pager | head
+sudo journalctl -u dgx-fan-health.service -b --no-pager
+```
+
+Both `is-active` commands should print `active`. The watchdog journal should
+contain `fan-stall watchdog watching`. The health journal should contain
+`health: healthy`, or a needs-intervention line when a check failed.
+`sudo dgx-fan-control health` prints the same checks in one pass and does
+not write the flag or the record.
+`dgx-fan-control status` prints `NEEDS INTERVENTION:` while that flag is set.
+If you have explicitly enabled the performance
+service, stop it without disabling it, confirm the watchdog journal then
+shows the daemon-not-active alert, and start it again. While a floor is
+held, the daemon exits 79 right after `start`, and the watchdog does not alert
+for that exit.
+
+```sh
+sudo systemctl stop dgx-fan-control.service
+sudo journalctl -u dgx-fan-watchdog.service -n 20 --no-pager
+sudo systemctl start dgx-fan-control.service
+```
+
+Do not write ACPI `cur_state` 0, or any level below 35, to provoke a stall.
 
 For the performance service, verify startup:
 
@@ -240,3 +363,171 @@ sudo journalctl -u dgx-fan-control.service -n 30
 The service runs as root to write thermal sysfs, with an empty capability set,
 no network access, and a read-only system filesystem. Module loading is separate.
 Continue to [pre-cooling and everyday usage](usage.md).
+
+## 6. EC firmware pairing and downgrade
+
+Fan-floor control needs **EC 3.5.8**. **EC 3.13.7** accepts the capability
+reply and then refuses floor writes. Downgrade to 3.5.8, then block EC
+updates so a later fwupd run does not install 3.13.7 again. This page does
+not flash firmware for you. `dgx-fan-control` does not change fwupd settings.
+
+In `fwupdmgr get-devices` the EC row is titled **Embedded Controller**
+(seen on both 3.5.8 and 3.13.7). fwupd's verbose log calls it
+**UEFI Device Firmware**, a name two other entries share. Pick the EC by
+GUID and version, not by either name. The fwupd ESRT device ID is derived from the GUID and the
+physical path, so identical boards share it. On DGX Spark the EC device ID
+is `8c948e1db381648c8893897e4d09b7b153309991`. Confirm both of the following
+before any flash:
+
+- GUID `3d13c989-e6a8-4ead-95ee-921f09868f65`
+- a version of `0x03xxxxxx` (`0x03000508` is 3.5.8, `0x03000d07` is 3.13.7)
+
+| What it is | GUID | Version |
+| --- | --- | --- |
+| Embedded controller | `3d13c989-e6a8-4ead-95ee-921f09868f65` | `0x03xxxxxx` |
+| SoC / UEFI | `b488217b-3895-4fc0-b1bf-ab7005a2d45a` | `0x02009e0f` (October SoC 2.158.15) |
+| Another UEFI device | `dd1a238a-5f8e-46bd-9401-a88da99c5a96` | `0x00000519` |
+
+Do not flash the SoC entry, or the `0x00000519` entry, when you mean the EC.
+After a successful EC update the summary can say
+`Embedded Controller (0x03000d07 → 0x03000508)`.
+
+```sh
+sudo fwupdmgr get-devices
+```
+
+The unblocked EC row is titled `Embedded Controller`, with summary
+`UEFI System Resource Table device (Updated via capsule-on-disk)` and current
+version `0x03000508` on 3.5.8 or `0x03000d07` on 3.13.7. A blocked EC is missing from this list, from
+`fwupdmgr get-devices --show-all`, and from `fwupdmgr get-updates`.
+To read a blocked EC's version, see
+[Block or allow EC firmware updates](troubleshooting.md#block-or-allow-ec-firmware-updates).
+
+### Upgrade to 3.13.7 or downgrade to 3.5.8
+
+Confirm the GUID and the `0x03xxxxxx` version, then use the device ID:
+
+```sh
+sudo fwupdmgr get-releases 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr update 8c948e1db381648c8893897e4d09b7b153309991
+sudo fwupdmgr downgrade 8c948e1db381648c8893897e4d09b7b153309991
+```
+
+`update` moves toward the newer release (3.13.7). `downgrade` moves toward
+3.5.8. Decline the report-upload prompt. Let the machine reboot. Do not cut
+power. Check `get-devices` again after the reboot and confirm the version
+before the fan check or the health refresh. Upgrading to 3.13.7 removes
+fan-floor control.
+
+If the version is 3.5.8, confirm both fans before that refresh.
+`dgx-fan-control status` prints the cooling state, not RPM. Health and the
+watchdog collect every `fan*_input` under every hwmon device named
+`acpi_fan`. On these Sparks each fan is its own `acpi_fan` device, and that
+device has only `fan1_input`.
+
+```sh
+for device in /sys/class/hwmon/hwmon*; do
+  [ "$(cat "$device/name" 2>/dev/null)" = acpi_fan ] || continue
+  for input in "$device"/fan*_input; do
+    [ -e "$input" ] || continue
+    echo "$device $(basename "$input" _input)=$(cat "$input")"
+  done
+done
+```
+
+There should be two `acpi_fan` readings in total, one per device on this
+hardware, and every one must be greater than 0. A missing reading is not
+confirmed. If any reading is missing or 0 RPM, immediately run
+`sudo dgx-fan-control acpi-max`, then read the tachometers again.
+On EC 3.5.8 an ACPI level of 0 stops the fans.
+`acpi-max` writes level 100. Never write `cur_state` 0 or any ACPI level
+below 35. If `acpi-max` refuses because the module or
+`dgx-fan-control.service` is active, stop that service, unload
+`dgx_ec_fan_control`, and run `acpi-max` again. Do not pass `--force`, and
+do not choose a level below 35.
+
+A firmware change marks the stored health record stale. What `--record`
+saves, and what it clears on a healthy run, is in
+[section 4](#4-install-the-command-then-load-the-driver).
+EC 3.13.7 telemetry-only is a healthy result, not needs-intervention.
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to the `acpi-max` safety step above.
+
+```sh
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+```
+
+### Block EC updates
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices 3d13c989-e6a8-4ead-95ee-921f09868f65
+sudo systemctl restart fwupd
+```
+
+That value **replaces** the whole `DisabledDevices` list. On fwupd 2.0.20
+the block is not written where a search of the usual files can see it.
+`/etc/fwupd/fwupd.conf` can contain only `[fwupd]` and `EspLocation=/boot/efi`.
+Both of these can print nothing:
+
+```sh
+grep -ri DisabledDevices /etc/fwupd /var/lib/fwupd
+sudo grep -rIl 3d13c989 /etc /var/lib/fwupd /usr/share/fwupd
+```
+
+The check that shows the block:
+
+```sh
+sudo fwupdtool get-devices --show-all --verbose 2>&1 | grep -i "is disabled"
+```
+
+A blocked EC produces a line containing
+`is disabled [3d13c989-e6a8-4ead-95ee-921f09868f65]`.
+
+`sudo dgx-fan-control health` reports the same fact without changing fwupd.
+`ec-updates: pass (blocked)` means the EC is blocked.
+`ec-updates: warn (not blocked; EC 3.5.8 can be replaced by 3.13.7)` means
+fwupd can still install 3.13.7. `ec-updates: unknown (...)` means fwupd was
+missing or too slow to answer. Without root, when get-devices lacks the EC
+GUID and the kernel `pinned EC` probe line is readable, health shows
+`ec-updates: pass (likely blocked; absent from get-devices while the EC
+probe succeeded)`. When that probe line is unreadable too, it shows
+`ec-updates: unknown (needs root to confirm the block)`, because only root
+can read the `is disabled` line. None of those lines fail health, and none
+of them set needs-intervention. `status` does not query fwupd.
+
+### Unblock, then block again
+
+```sh
+sudo fwupdmgr modify-config fwupd DisabledDevices ""
+sudo systemctl restart fwupd
+```
+
+An empty value clears **every** `DisabledDevices` entry, not only the EC.
+To keep another device disabled, set the value to every GUID you still
+want blocked, separated by commas, instead of `""`. This fwupd version
+does not show the current list in the files above, so copy those GUIDs
+down before you replace the value. There is no `fwupd-block` command here,
+because a helper cannot read the list it would overwrite.
+
+After a downgrade to 3.5.8, block the EC GUID again with the command in
+the previous section. Confirm with the `fwupdtool` line, not with
+`fwupd.conf`. Then refresh the stored health record again so it matches
+this firmware. What `--record` saves and clears is in
+[section 4](#4-install-the-command-then-load-the-driver).
+Do not write an ACPI level to make this health check pass or to provoke a
+result. That does not apply to the `acpi-max` safety step after the
+downgrade reboot.
+
+```sh
+sudo dgx-fan-control health
+sudo dgx-fan-control health --record
+```
+
+## 7. Updating
+
+Update the userspace on every update. Rebuild the kernel module only after
+`git pull` and that userspace update, and only when the version check on
+[Updates and removal](maintenance.md#update-this-projects-source)
+says to: the installed module version differs from `DGX_EC_DRIVER_VERSION`,
+or `kernel/` changed. The DKMS and by-hand rebuilds stay on that page.

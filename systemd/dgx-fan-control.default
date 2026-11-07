@@ -1,0 +1,119 @@
+# /etc/default/dgx-fan-control
+# Optional settings for the fan watchdog and the post-boot health check.
+# Stock-curve checks observe fans/thermals. ACPI holds additionally arm
+# workload-stop and power actions, even without a configured stop hook.
+# This file is root configuration. The commands run as root.
+
+# Command whose standard input is the health summary. Empty disables it.
+# Example: curl -fsS --data-binary @- https://example.invalid/hook
+DGX_FAN_NOTIFY=
+
+# Command, or an http(s) URL to GET. Success means this machine is ready
+# for work. The health check runs it only after the fan and thermal checks
+# pass, retrying through the settle window (default 45 seconds, each try
+# times out after 5 seconds). Empty means not configured: fan checks alone
+# decide. A failure sets needs-intervention with the reason "workload not ready".
+READY_CHECK=
+
+# Command whose exit 0 means work is in progress, so do not reboot.
+# A failure or timeout counts as busy. Empty uses nvidia-smi compute apps.
+# A persistent model server always shows a compute process, so with that
+# default a stalled-fan reboot stays deferred; the true-zero 85 C cutoff
+# still applies. ACPI writes additionally arm the escalation settings below. The deferral limit below raises an alert; it still
+# does not reboot through work. Prefer a command that measures in-flight
+# requests.
+BUSY_CHECK=
+
+# Seconds to defer a reboot while work is in progress. When this runs out
+# and the fans are still at a true zero, or the floor is still foreign, the
+# watchdog alerts and keeps deferring. It does not reboot through work.
+# Overrides dgx-fan-control watchdog --max-defer-seconds when set.
+MAX_DEFER_SECONDS=1800
+
+# Command that prints one monotonic progress number (for example a token
+# counter). The watchdog runs it with a 5 second timeout whenever work is
+# in progress. A larger number than the previous sample is progress.
+# Failure, timeout, or unparseable output is logged once and the built-in
+# heuristic is used instead. Empty uses the built-in heuristic.
+#
+# The built-in heuristic is weaker than this hook. It treats the job as
+# stuck when nvidia-smi still lists a compute process and, for
+# STUCK_SECONDS, GPU utilization stays at or below 5 percent, or those
+# processes' CPU time in /proc/<pid>/stat stops advancing. A long prefill
+# can look idle. A busy-loop hang can look alive.
+#
+# Example, not enabled. vLLM Prometheus lines carry labels, for example
+# vllm:generation_tokens_total{model_name="x"} 1234.0. Match with or without
+# labels and sum every series. A total of 0 is still a number. Only a
+# larger total than the last sample is progress.
+# PROGRESS_CHECK=curl -fsS http://127.0.0.1:8000/metrics | awk '/^vllm:(generation|prompt)_tokens_total[{ ]/{s+=$NF} END{print s+0}'
+PROGRESS_CHECK=
+
+# Seconds without progress before a hot-under-load warning. Progress is
+# sampled whenever a job is busy. The warning is raised only while the fans
+# are spinning and the hottest zone is at or above the true-zero cutoff.
+# It does not kill the job, reboot, power off, or set needs-intervention.
+# Overrides dgx-fan-control watchdog --stuck-seconds when set.
+STUCK_SECONDS=600
+
+# Optional override of the held floor. Empty uses the last set-state
+# recorded while the performance service was stopped. automatic clears
+# that record. If this is set, it wins over the record. Use 1 through 12.
+# This is the kernel cooling state, not an ACPI level. Do not set 0.
+MANUAL_STATE=
+
+
+# EC 3.5.8 ACPI emergency protection; independent of the true-zero 85 C rule.
+# All temperatures are the hottest thermal zone. See docs/ec-curve.md.
+# Restart dgx-fan-watchdog.service after changing these values.
+# 70 C is an advisory only. Holding 70 through 79 C does not stop anything.
+# A program can read /var/lib/dgx-fan-control/acpi-advisory or the journal
+# line acpi_thermal_advisory. The optional hook below is not waited on.
+# 80 C starts the stop hook when one is configured, and in the ACPI phase
+# also forces level 100. With no hook, 80 C does not send SIGTERM.
+# 85 C is SIGTERM. 90 C is SIGKILL. Degrees of headroom are not seconds.
+# Poweroff is separate from SIGKILL: the zone must stay at or above
+# SHUTDOWN_C for SHUTDOWN_SECONDS. One sample does not power off.
+# A zone that stays below SHUTDOWN_C does not power off. The true-zero
+# 85 C path is not this rule.
+ACPI_THERMAL_ADVISORY_C=70
+# Optional. Empty disables it. Executable plus arguments, not a shell.
+# Started when the advisory is published and never waited on. It does not
+# signal the workload. A slow or failed hook does not delay 80/85/90.
+ACPI_THERMAL_ADVISORY_HOOK=
+ACPI_THERMAL_MAX_C=80
+ACPI_THERMAL_STOP_C=85
+ACPI_THERMAL_KILL_C=90
+ACPI_THERMAL_SHUTDOWN_C=90
+ACPI_THERMAL_HOOK_SECONDS=10
+ACPI_THERMAL_TERM_SECONDS=10
+# ACPI_THERMAL_KILL_SECONDS is deprecated. If an old file still sets it,
+# the process logs a warning and ignores the value. SIGKILL is not delayed
+# by it, and it is not the poweroff interval.
+# How long the zone must stay at or above SHUTDOWN_C before poweroff.
+# Not a measured trip time. A sample below SHUTDOWN_C, an EC-only unreadable
+# sample, or a skipped poll breaks that interval. Phase 1 still treats an
+# unreadable zone as SHUTDOWN_C.
+ACPI_THERMAL_SHUTDOWN_SECONDS=15
+ACPI_THERMAL_HYSTERESIS_C=2
+# Explicit no disables only this ACPI shutdown stage, NOT true-zero poweroff.
+# Phase 1: a confirmed stop reboots immediately and does not power off.
+# Phase 2: there is no reboot. Shutdown is only after the post-stop watch.
+ACPI_THERMAL_SHUTDOWN=yes
+# Executable/script plus arguments, not shell syntax. Runs asynchronously as root.
+# Empty means there is no hook: SIGTERM waits for STOP_C, however long that takes.
+# A failed hook is not this case; a failure sends SIGTERM on that poll.
+# A confirmed stop reboots with no cool-down wait. That reboot restores the
+# EC curve and does not relaunch the killed command.
+# Incident latch survives reboot; reset explicitly with acpi-incident-reset.
+ACPI_THERMAL_STOP_HOOK=
+# Optional. Empty disables resume. The boot health unit runs this once on the
+# boot after an ACPI incident (EC-only phase). It must exit promptly. It is
+# not a shell and it is not the killed command line. A later thermal stop in
+# that phase does not run it again and does not reboot. A job that cannot
+# checkpoint does not resume unless this command, or the manager it calls,
+# starts it again.
+ACPI_THERMAL_RESUME_HOOK=
+# These additional targets never bypass root/system-process exclusions.
+ACPI_THERMAL_PIDS=
+ACPI_THERMAL_PROCESS_NAMES=

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Install the boot-load entry, the command, the watchdog, the performance unit,
+# and the health check.
+# Writes the modules-load.d entry only when it is absent, so a file left by
+# `dgx-fan-control module disable` (or one this project did not write) is kept.
+# Enables and starts the fan-stall watchdog unless --no-watchdog.
+# Enables dgx-fan-health.service for the next boot. Does not start it now.
+# Does not enable dgx-fan-control.service. That remains an explicit choice
+# (systemctl enable, or: dgx-fan-control module enable --start-service).
+# Restarts the watchdog and dgx-fan-control.service only if they are already
+# running, so an update loads the new command. Safe to rerun on every update.
+set -euo pipefail
+
+watchdog=1
+for arg in "$@"; do
+  case "${arg}" in
+    --no-watchdog) watchdog=0 ;;
+    -h|--help)
+      echo "usage: sudo scripts/install-userland [--no-watchdog]"
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: ${arg}" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "scripts/install-userland must run as root" >&2
+  exit 1
+fi
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+modules_load=/etc/modules-load.d/dgx_ec_fan_control.conf
+if [[ ! -e "${modules_load}" ]]; then
+  install -D -m 0644 "${root}/systemd/dgx_ec_fan_control.conf" "${modules_load}"
+else
+  echo "leaving existing ${modules_load} unchanged"
+fi
+install -D -m 0755 "${root}/userspace/dgx_fan_control.py" /usr/local/sbin/dgx-fan-control
+install -D -m 0644 "${root}/systemd/dgx-fan-control.service" \
+  /etc/systemd/system/dgx-fan-control.service
+install -D -m 0644 "${root}/systemd/dgx-fan-watchdog.service" \
+  /etc/systemd/system/dgx-fan-watchdog.service
+install -D -m 0644 "${root}/systemd/dgx-fan-health.service" \
+  /etc/systemd/system/dgx-fan-health.service
+install -D -m 0644 "${root}/systemd/dgx-fan-manual.service" \
+  /etc/systemd/system/dgx-fan-manual.service
+install -D -m 0755 "${root}/systemd/95-dgx-fan-control" \
+  /etc/update-motd.d/95-dgx-fan-control
+if [[ ! -f /etc/default/dgx-fan-control ]]; then
+  install -D -m 0644 "${root}/systemd/dgx-fan-control.default" \
+    /etc/default/dgx-fan-control
+fi
+systemctl daemon-reload
+systemctl enable dgx-fan-health.service
+systemctl enable dgx-fan-manual.service
+systemctl try-restart dgx-fan-watchdog.service dgx-fan-control.service
+
+if [[ "${watchdog}" -eq 1 ]]; then
+  systemctl enable --now dgx-fan-watchdog.service
+else
+  echo "not enabling dgx-fan-watchdog.service (--no-watchdog)"
+fi

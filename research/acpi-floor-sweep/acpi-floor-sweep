@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Supervised test of low ACPI Fan levels, for measuring a safe minimum.
+
+Run as root on EC 3.5.8, at idle, with dgx_ec_fan_control unloaded and
+dgx-fan-control.service stopped. EC 3.13.7 ignores ACPI fan levels, so the
+script refuses before any write when dgx_ec_fan is present without
+dgx_ec_fan_floor, or when the kernel log from this boot shows the module
+pinned EC 3.13.7. The shared writer additionally requires a positive
+EC 3.5.8 identification from the kernel log or ESRT before arming protection.
+
+Steps every ACPI Fan cooling device through the given levels (default
+40 35), holds each one, and logs every fan tachometer plus the hottest
+thermal zone each interval. It stops and writes level 100 at once if any fan
+reads 0 or is missing, a fan falls below --min-rpm, the hottest zone reaches
+--max-temp, or the run is interrupted. It also writes 100 when it finishes.
+Level 100 is still an ACPI hold: it does not restore the EC curve. Any ACPI
+write from this project, including a clean exit, stays in effect until
+reboot. It never writes a level below 35 or writes 0. The independent
+watchdog must be running; protection continues after this script exits.
+This file is a checkout diagnostic. scripts/install-userland does not
+install it.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import datetime as dt
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HARD_MIN_LEVEL = 35
+RESTORE_LEVEL = 100
+ACPI_COOLING_TYPE = "Fan"
+ACPI_FAN_NAME = "acpi_fan"
+FLOOR_COOLING_TYPE = "dgx_ec_fan_floor"
+TELEMETRY_HWMON_NAME = "dgx_ec_fan"
+MODULE_NAME = "dgx_ec_fan_control"
+DAEMON_UNIT = "dgx-fan-control.service"
+TELEMETRY_ONLY_MESSAGE = (
+    "telemetry only, nothing written; EC runs its own curve "
+    "(dgx_ec_fan present without dgx_ec_fan_floor)"
+)
+
+
+_CONTROLLER = None
+
+
+def controller():
+    global _CONTROLLER
+    if _CONTROLLER is None:
+        source = Path(__file__).resolve().parents[2] / "userspace/dgx_fan_control.py"
+        if not source.is_file():
+            source = Path("/usr/local/sbin/dgx-fan-control")
+        loader = importlib.machinery.SourceFileLoader("dgx_acpi_controller", str(source))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        _CONTROLLER = importlib.util.module_from_spec(spec)
+        loader.exec_module(_CONTROLLER)
+    return _CONTROLLER
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return None
+
+
+def cooling_devices(thermal_root: Path) -> list[Path]:
+    return [d for d in sorted(thermal_root.glob("cooling_device*"))
+            if read_text(d / "type") == ACPI_COOLING_TYPE]
+
+
+def fan_devices(hwmon_root: Path) -> list[Path]:
+    """Each Spark fan is its own acpi_fan device with only fan1_input."""
+    return [d for d in sorted(hwmon_root.glob("hwmon*"))
+            if read_text(d / "name") == ACPI_FAN_NAME]
+
+
+def floor_devices(thermal_root: Path) -> list[Path]:
+    """dgx_ec_fan_floor cooling devices from this project's kernel module."""
+    return [d for d in sorted(thermal_root.glob("cooling_device*"))
+            if read_text(d / "type") == FLOOR_COOLING_TYPE]
+
+
+def telemetry_hwmon_devices(hwmon_root: Path) -> list[Path]:
+    """dgx_ec_fan hwmon devices from this project's kernel module."""
+    return [d for d in sorted(hwmon_root.glob("hwmon*"))
+            if read_text(d / "name") == TELEMETRY_HWMON_NAME]
+
+
+def telemetry_only_bind(thermal_root: Path, hwmon_root: Path) -> bool:
+    """True when dgx_ec_fan is present and dgx_ec_fan_floor is not.
+
+    Same sysfs shape classify_fan_binding treats as unsupported (telemetry
+    only) in userspace/dgx_fan_control.py.
+    """
+    if floor_devices(thermal_root):
+        return False
+    return bool(telemetry_hwmon_devices(hwmon_root))
+
+
+def read_kernel_log() -> str:
+    try:
+        completed = subprocess.run(["dmesg"], check=False, capture_output=True,
+                                   text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return completed.stdout or ""
+
+
+def pinned_ec_name(log_text: str) -> str | None:
+    """EC firmware the kernel module pinned this boot, e.g. 'EC 3.13.7'."""
+    match = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
+    return match.group(1) if match else None
+
+
+def read_fans(devices: list[Path]) -> list[int | None]:
+    readings = []
+    for device in devices:
+        raw = read_text(device / "fan1_input")
+        try:
+            readings.append(int(raw) if raw is not None else None)
+        except ValueError:
+            readings.append(None)
+    return readings
+
+
+def hottest_c(thermal_root: Path) -> float | None:
+    temps = []
+    for zone in thermal_root.glob("thermal_zone*"):
+        raw = read_text(zone / "temp")
+        try:
+            temps.append(int(raw) / 1000.0)
+        except (TypeError, ValueError):
+            continue
+    return max(temps) if temps else None
+
+
+def write_level(devices: list[Path], level: int) -> list[str]:
+    if level < HARD_MIN_LEVEL and level != 0:
+        raise ValueError(f"refusing ACPI level {level}: below {HARD_MIN_LEVEL}")
+    if level == 0:
+        raise ValueError("refusing ACPI level 0: it stops both fans")
+    results = []
+    for device in devices:
+        controller().write_acpi_fan_level(device, level)
+        results.append(f"{device.name}={read_text(device / 'cur_state')}")
+    return results
+
+
+def abort_reason(rpms: list[int | None], min_rpm: int,
+                 hot: float | None, max_temp: float) -> str | None:
+    if not rpms:
+        return "no fan tachometer found"
+    for index, rpm in enumerate(rpms, start=1):
+        if rpm is None:
+            return f"fan {index} reading missing"
+        if rpm == 0:
+            return f"fan {index} reads 0 RPM"
+        if rpm < min_rpm:
+            return f"fan {index} at {rpm} RPM, below --min-rpm {min_rpm}"
+    if hot is not None and hot >= max_temp:
+        return f"hottest zone {hot:.1f} C reached --max-temp {max_temp:.1f}"
+    return None
+
+
+def sweep(levels: list[int], hold: float, interval: float, min_rpm: int,
+          max_temp: float, thermal_root: Path, hwmon_root: Path, log,
+          sleep=time.sleep, now=utc_now) -> int:
+    """Return 0 if every level held, 2 if a check stopped the run."""
+    for level in levels:
+        if level < HARD_MIN_LEVEL or level > RESTORE_LEVEL:
+            raise ValueError(
+                f"refusing ACPI level {level}: allowed {HARD_MIN_LEVEL} "
+                f"through {RESTORE_LEVEL}")
+    if telemetry_only_bind(thermal_root, hwmon_root):
+        raise RuntimeError(TELEMETRY_ONLY_MESSAGE)
+    coolers = cooling_devices(thermal_root)
+    if not coolers:
+        raise RuntimeError("no ACPI Fan cooling device found")
+    fans = fan_devices(hwmon_root)
+    if not fans:
+        raise RuntimeError("no acpi_fan tachometer found")
+    controller().arm_acpi_monitor(thermal_root, hwmon_root)
+    header = "time_utc,level," + ",".join(
+        f"fan{i}_rpm" for i in range(1, len(fans) + 1)) + ",hottest_c,event"
+    log(header)
+    result = 0
+    samples = max(1, int(round(hold / interval)))
+    try:
+        for level in levels:
+            written = write_level(coolers, level)
+            log(f"{now()},{level},{','.join('' for _ in fans)},,"
+                f"wrote {' '.join(written)}")
+            for _ in range(samples):
+                sleep(interval)
+                rpms = read_fans(fans)
+                hot = hottest_c(thermal_root)
+                cells = ",".join("" if r is None else str(r) for r in rpms)
+                hot_cell = "" if hot is None else f"{hot:.1f}"
+                reason = abort_reason(rpms, min_rpm, hot, max_temp)
+                log(f"{now()},{level},{cells},{hot_cell},"
+                    f"{'ABORT ' + reason if reason else ''}")
+                if reason:
+                    result = 2
+                    return result
+        return result
+    finally:
+        try:
+            written = write_level(coolers, RESTORE_LEVEL)
+            log(f"{now()},{RESTORE_LEVEL},{','.join('' for _ in fans)},,"
+                f"restored {' '.join(written)}")
+        except (OSError, ValueError) as exc:
+            log(f"{now()},,,,RESTORE FAILED {exc}; write 100 to cur_state by hand")
+            result = 3
+
+
+def preflight(thermal_root: Path | None = None,
+              hwmon_root: Path | None = None,
+              log_text: str | None = None) -> str | None:
+    if thermal_root is None:
+        thermal_root = Path("/sys/class/thermal")
+    if hwmon_root is None:
+        hwmon_root = Path("/sys/class/hwmon")
+    if os.geteuid() != 0:
+        return "run as root"
+    if telemetry_only_bind(thermal_root, hwmon_root):
+        return TELEMETRY_ONLY_MESSAGE
+    if log_text is None:
+        if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+            return "offline checks do not access hardware"
+        log_text = read_kernel_log()
+    if pinned_ec_name(log_text) == "EC 3.13.7":
+        return ("telemetry only, nothing written; the kernel log shows "
+                "EC 3.13.7, which ignores ACPI fan levels")
+    if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+        return "offline checks do not access hardware"
+    if Path(f"/sys/module/{MODULE_NAME}").exists():
+        return f"unload {MODULE_NAME} first; it shares the EC floor register"
+    try:
+        state = subprocess.run(["systemctl", "is-active", DAEMON_UNIT],
+                               capture_output=True, text=True).stdout.strip()
+    except OSError:
+        state = "unknown"
+    if state in ("active", "activating", "reloading"):
+        return f"stop {DAEMON_UNIT} first"
+    return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    if os.environ.get("DGX_FAN_CONTROL_OFFLINE") == "1":
+        print(
+            "acpi-floor-sweep: refusing; offline checks do not access hardware",
+            file=sys.stderr,
+        )
+        return 1
+    if os.environ.get("DGX_FAN_HARDWARE_TEST") != "1":
+        print(
+            "acpi-floor-sweep: refusing; set DGX_FAN_HARDWARE_TEST=1 to run "
+            "this hardware diagnostic. It writes ACPI fan levels 35 through "
+            "100 on EC 3.5.8 and does not restore the EC curve.",
+            file=sys.stderr,
+        )
+        return 1
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("levels", nargs="*", type=int, default=[40, 35])
+    parser.add_argument("--hold", type=float, default=180.0,
+                        help="seconds at each level (default 180)")
+    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--min-rpm", type=int, default=1000,
+                        help="stop if any fan reads below this (default 1000)")
+    parser.add_argument("--max-temp", type=float, default=60.0,
+                        help="stop if the hottest zone reaches this C (default 60)")
+    parser.add_argument("--log", type=Path, default=None,
+                        help="CSV path (default ./acpi-floor-sweep-<UTC>.csv)")
+    args = parser.parse_args(argv)
+    problem = preflight()
+    if problem:
+        print(f"acpi-floor-sweep: {problem}", file=sys.stderr)
+        return 1
+    path = args.log or Path(
+        f"acpi-floor-sweep-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}.csv")
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with path.open("w", encoding="ascii") as handle:
+        def log(line: str) -> None:
+            print(line, flush=True)
+            handle.write(line + "\n")
+            handle.flush()
+        try:
+            code = sweep(args.levels, args.hold, args.interval, args.min_rpm,
+                         args.max_temp, Path("/sys/class/thermal"),
+                         Path("/sys/class/hwmon"), log)
+        except KeyboardInterrupt:
+            print("interrupted; level 100 was written", file=sys.stderr)
+            code = 130
+        except (RuntimeError, ValueError) as exc:
+            print(f"acpi-floor-sweep: {exc}", file=sys.stderr)
+            code = 1
+    print(f"log: {path}")
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

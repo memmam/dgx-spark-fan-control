@@ -4,16 +4,266 @@
 from __future__ import annotations
 
 import argparse
+import contextvars
 import errno
+import fcntl
+import hashlib
+import json
 import logging
 import math
+import os
+import re
+import shlex
 import signal
+import stat
+import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from threading import Event
 from pathlib import Path
 
 COOLING_DEVICE_TYPE = "dgx_ec_fan_floor"
+ACPI_COOLING_TYPE = "Fan"
+HWMON_DEVICE_NAME = "dgx_ec_fan"
+ACPI_FAN_NAME = "acpi_fan"
+ACPI_MIN_LEVEL = 35
+ACPI_MAX_LEVEL = 100
+CONTROL_UNSUPPORTED = "control unsupported on this firmware"
+TELEMETRY_ONLY_STATUS = "control unsupported on this firmware (telemetry only)"
+# On telemetry-only firmware the EC curve is the only fan control, and it
+# holds base speed until about 80 C (docs/ec-curve.md). A GPU clock cap is
+# the remaining lever. 2200 MHz is the default in MiaAI-Lab's sparkLimiter.
+CLOCK_CAP_HINT = (
+    "fans follow the EC curve only (base speed until about 80 C); to run "
+    "cooler under load, cap the GPU clock with sudo nvidia-smi -lgc 0,2200 "
+    "(2200 MHz from MiaAI-Lab sparkLimiter); see docs/ec-curve.md"
+)
+WATCHDOG_POLL_SECONDS = 2.0
+WATCHDOG_ZERO_SECONDS = 10.0
+# Any-temperature alert. Idle fans on EC 3.5.8 with the October SoC run near
+# 2700/4050 RPM, so 0/0 is not a normal state. Fifteen seconds is several
+# 2-second polls, long enough to ignore one missed tach sample, and short
+# enough to announce a stop at 39°C well before a clean shutdown at 85°C.
+WATCHDOG_STALL_SECONDS = 15.0
+WATCHDOG_REBOOT_SECONDS = 60.0
+WATCHDOG_ZERO_FAN_CELSIUS = 85.0
+# Deprecated name for WATCHDOG_ZERO_FAN_CELSIUS. The 85 C poweroff is only
+# for a true zero. It is not a limit while the fans are spinning.
+WATCHDOG_SOC_CELSIUS = WATCHDOG_ZERO_FAN_CELSIUS
+# Journal-only. A rise this fast can pass the 104.8 C critical trip between
+# polls, so userspace does not act on it.
+OBSERVED_RISE_C_PER_S = 4.0
+HOT_CLEAR_HYSTERESIS_C = 2.0
+STUCK_SECONDS = 600.0
+GPU_IDLE_UTIL_PERCENT = 5.0
+JOB_WATCH_NAME = "job-watch"
+WATCHDOG_NONZERO_CLEAR_SECONDS = 30.0
+WATCHDOG_ALERT_REPEAT_SECONDS = 1800.0
+WATCHDOG_MAX_DEFER_SECONDS = 1800.0
+CHECK_TIMEOUT_SECONDS = 5.0
+# Built-in GPU sample. A restart can make nvidia-smi fail once and then
+# succeed, so try twice more before calling the sample a gap. Outside the
+# watchdog poll this is 2s per try plus 0.5s and 1s of backoff. Inside one
+# poll the shared budget below stops the probes at 3s so the next fan read
+# is not stretched by a hang.
+NVIDIA_SMI_ATTEMPTS = 3
+NVIDIA_SMI_BACKOFF_SECONDS = (0.5, 1.0)
+NVIDIA_SMI_TIMEOUT_SECONDS = 2.0
+PROBE_BUDGET_SECONDS = 3.0
+# The first poll after a restart can overlap NVML still coming back, and the
+# 3s probe budget can turn that into a false miss. Fans and the true-zero
+# poweroff do not wait. Only the GPU sample does.
+GPU_SAMPLE_GRACE_SECONDS = 5.0
+# Written by progress_source before the sampling-gap wording. Health still
+# has to display files left by that code.
+LEGACY_GPU_FAILURE = "nvidia-smi failed"
+WATCHDOG_STARTED_NAME = "watchdog-started"
+_probe_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "dgx_probe_deadline", default=None,
+)
+# fwupd ESRT GUID for the DGX Spark embedded controller. The device name is
+# "UEFI Device Firmware", shared with the SoC and other entries. This GUID
+# and a 0x03xxxxxx version identify the EC.
+EC_FWUPD_GUID = "3d13c989-e6a8-4ead-95ee-921f09868f65"
+NEEDS_ROOT = "unknown (needs root)"
+WATCHDOG_DEFAULT_ACTION = "systemctl poweroff"
+WATCHDOG_REBOOT_ACTION = "systemctl reboot"
+DAEMON_UNIT = "dgx-fan-control.service"
+WATCHDOG_UNIT = "dgx-fan-watchdog.service"
+MANUAL_UNIT = "dgx-fan-manual.service"
+MANUAL_STATE_NAME = "manual-state"
+DAEMON_RESTART_LOOP = 3
+DAEMON_ALERT_INTERVAL_SECONDS = 60.0
+STALL_MARKER_DIR = Path("/var/lib/dgx-fan-control")
+# Set only by ./scripts/check and the test modules. Production units do not
+# set it. When it is set, host commands and host-path writes fail before
+# they start. Unsetting it restores the normal watchdog and fan commands.
+OFFLINE_GUARD_ENV = "DGX_FAN_CONTROL_OFFLINE"
+_HOST_WRITE_ROOTS = (
+    "/sys", "/proc", "/etc", "/usr", "/lib", "/lib64",
+    "/var", "/run", "/boot", "/dev", "/opt",
+)
+_OFFLINE_COMPILE_OK = frozenset({
+    "cc", "gcc", "c99", "c11", "clang", "as", "ld", "python", "python3",
+})
+_OFFLINE_SHELL_BLOCKED = re.compile(
+    r"(?:^|[^A-Za-z0-9_./-])("
+    r"systemctl|systemd-run|busctl|modprobe|insmod|rmmod|dkms|"
+    r"reboot|poweroff|shutdown|halt|telinit|wall|kill|killall|pkill|"
+    r"fwupdmgr|fwupdtool|fwupd|nvidia-smi|dmesg"
+    r")(?:$|[^A-Za-z0-9_./-])"
+)
+
+
+class OfflineGuardError(RuntimeError):
+    """An offline test tried to touch the host. Nothing was executed."""
+
+
+def offline_guard_active() -> bool:
+    return os.environ.get(OFFLINE_GUARD_ENV) == "1"
+
+
+def offline_hides_host_path(path: Path) -> bool:
+    """Offline checks must not classify a fixture from this machine's sysfs.
+
+    The check uses the absolute path string and does not stat the directory.
+    A temporary fixture is not under these roots, so it is still read.
+    """
+    if not offline_guard_active():
+        return False
+    text = os.path.abspath(os.fspath(path))
+    for root in ("/sys", "/proc"):
+        if text == root or text.startswith(root + os.sep):
+            return True
+    return False
+
+
+def offline_blocks_real(fn: object) -> bool:
+    """True when offline and fn is not a test double."""
+    return offline_guard_active() and not hasattr(fn, "assert_called")
+
+
+def _under_temp(path: Path) -> bool:
+    temp = Path(tempfile.gettempdir()).resolve()
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = Path(os.path.abspath(path))
+    return resolved == temp or temp in resolved.parents
+
+
+def refuse_host_write(path: Path) -> None:
+    """Block writes to host sysfs, firmware, and persistent config.
+
+    The check uses the absolute path string. It does not stat the target.
+    """
+    if not offline_guard_active():
+        return
+    text = os.path.abspath(os.fspath(path))
+    temp = os.path.abspath(tempfile.gettempdir())
+    if text == temp or text.startswith(temp + os.sep):
+        return
+    for root in _HOST_WRITE_ROOTS:
+        if text == root or text.startswith(root + os.sep):
+            raise OfflineGuardError(f"offline tests refuse to write {text}")
+
+
+def refuse_offline_exec(*args, **kwargs) -> None:
+    """Block host programs. Compilers and temp-dir executables still run."""
+    if not offline_guard_active():
+        return
+    if kwargs.get("shell"):
+        text = args[0] if args else ""
+        if not isinstance(text, str) or _OFFLINE_SHELL_BLOCKED.search(text):
+            raise OfflineGuardError("offline tests refuse a shell command")
+        return
+    if not args:
+        raise OfflineGuardError("offline tests refuse an empty command")
+    argv = args[0]
+    if isinstance(argv, (str, Path)):
+        program = str(argv)
+    else:
+        try:
+            program = str(next(iter(argv)))
+        except StopIteration:
+            raise OfflineGuardError("offline tests refuse an empty command") from None
+    base = Path(program).name
+    if base in _OFFLINE_COMPILE_OK:
+        return
+    if program.startswith("/") and _under_temp(Path(program)):
+        return
+    raise OfflineGuardError(f"offline tests refuse to run {base}")
+
+
+def install_offline_subprocess_guard() -> None:
+    """Wrap subprocess so a mock that calls back into it still cannot exec."""
+    if not offline_guard_active():
+        return
+    current = subprocess.run
+    if getattr(current, "_dgx_offline_guard", False):
+        return
+    bare_run = current
+    bare_popen = subprocess.Popen
+
+    def guarded_run(*args, **kwargs):
+        refuse_offline_exec(*args, **kwargs)
+        guarded_run.real_invocations += 1
+        return guarded_run._bare(*args, **kwargs)
+
+    def guarded_popen(*args, **kwargs):
+        refuse_offline_exec(*args, **kwargs)
+        guarded_popen.real_invocations += 1
+        return guarded_popen._bare(*args, **kwargs)
+
+    guarded_run._dgx_offline_guard = True
+    guarded_run._bare = bare_run
+    guarded_run.real_invocations = 0
+    guarded_popen._dgx_offline_guard = True
+    guarded_popen._bare = bare_popen
+    guarded_popen.real_invocations = 0
+    subprocess.run = guarded_run
+    subprocess.Popen = guarded_popen
+
+
+install_offline_subprocess_guard()
+STALL_MARKER_NAME = "true-zero-reboot"
+MODULE_NAME = "dgx_ec_fan_control"
+MANAGED_BLACKLIST_NAME = "dgx-spark-fan-control-disable.conf"
+MODULES_LOAD_NAME = "dgx_ec_fan_control.conf"
+MANAGED_BLACKLIST_TEXT = (
+    "# Managed by dgx-fan-control module disable. Do not edit.\n"
+    "# Remove with: dgx-fan-control module enable\n"
+    "blacklist dgx_ec_fan_control\n"
+    "install dgx_ec_fan_control /bin/false\n"
+)
+MODULES_LOAD_TEXT = (
+    "# Load the exact-kernel, locally signed additive fan-floor driver at boot.\n"
+    "dgx_ec_fan_control\n"
+)
+MODULES_LOAD_DISABLED_TEXT = (
+    "# Disabled by dgx-fan-control module disable.\n"
+    "# Restore with: dgx-fan-control module enable\n"
+    "# dgx_ec_fan_control\n"
+)
 MAX_STATE = 12
+# Same RPM-mode tables as the kernel profiles. State 0 is unset and is not
+# an owned floor. The raw value is what the EC register holds.
+FLOOR_TABLES = {
+    "EC 3.5.8": (
+        None, 2700, 3600, 4500, 5400, 6300, 7200, 8100, 9000,
+        10125, 11250, 12375, 13500,
+    ),
+    "EC 3.13.7": (
+        None, 2000, 2213, 2427, 2640, 2854, 3068, 3281, 3495,
+        3709, 3922, 4136, 4350,
+    ),
+}
+OWNED_MODPROBE_NAME = "dgx-fan-control-owned.conf"
+MIN_CURVE_STATE = 1
 POLL_SECONDS = 2.0
 FILTER_ALPHA = 0.35
 DOWN_HYSTERESIS_C = 4.0
@@ -21,27 +271,85 @@ UP_STATES_PER_POLL = 2
 DOWN_STATES_PER_POLL = 1
 TRANSPORT_FAILURE_LIMIT = 3
 RETRY_INITIAL_SECONDS = 2.0
+# Reply-guard refusal is EPROTO. The driver has already started its 30s
+# recovery cooldown, so a shorter retry cannot succeed. Idle-guard refusal
+# stays EAGAIN and keeps the 2s/4s backoff.
+RECOVERY_COOLDOWN_SECONDS = 31.0
 CONTROLLER_UNAVAILABLE_EXIT = 69
+UNSUPPORTED_FIRMWARE_EXIT = 69
+# Probe refused a floor this driver does not own. Restarting cannot fix it.
+FOREIGN_FLOOR_EXIT = 78
+# A held manual floor is recorded. Starting the curve would walk it down,
+# and the stop path would write state 0. The floor stays until automatic.
+HELD_FLOOR_EXIT = 79
 RETRYABLE_ERRNOS = frozenset((
     errno.EBUSY, errno.EAGAIN, errno.EINTR, errno.EIO,
-    errno.ETIMEDOUT, errno.EREMOTEIO,
+    errno.ETIMEDOUT, errno.EREMOTEIO, errno.EPROTO,
 ))
 
-# The curve becomes deliberately aggressive well below NVIDIA's stock 80 C
-# second step. Firmware still takes the maximum of its own demand and this
-# additive request.
+# Temperatures are unchanged. State indexes are shared by every capability
+# profile: the kernel maps them to that profile's floor table. State 0 is
+# NVIDIA's curve and is never selected while this process is running. A lower
+# clamp of 0 has been observed to latch with the fans stopped. State 1 is the
+# first additive floor of the active profile. State 12 is that profile's
+# reported maximum. Stopping the daemon still writes state 0.
 PERFORMANCE_CURVE = (
-    (50.0, 3),   # 4,500 common RPM floor
-    (55.0, 5),   # 6,300
-    (60.0, 8),   # 9,000
-    (65.0, 10),  # 11,250 (fan 0 saturates at 9,000)
-    (70.0, 12),  # 13,500 (both fans at their maxima)
+    (0.0, 1),
+    (50.0, 3),
+    (55.0, 5),
+    (60.0, 8),
+    (65.0, 10),
+    (70.0, 12),
 )
+
+# Opt-in quieter curve from tenhkspark, upstream PR #2 and
+# tenhkspark/dgx-spark-fan-tuning patch/0001-performance-curve.patch.
+# For EC 3.5.8 with the pre-October SoC (validation image 2.155.11) when
+# less noise is worth higher temperatures. State 1 is still the floor.
+QUIET_CURVE = (
+    (0.0, 1),
+    (52.0, 2),
+    (57.0, 3),
+    (62.0, 4),
+    (66.0, 5),
+    (70.0, 6),
+    (73.0, 8),
+    (76.0, 10),
+    (78.0, 12),
+)
+CURVES = {
+    "performance": PERFORMANCE_CURVE,
+    "quiet": QUIET_CURVE,
+}
 
 LOG = logging.getLogger("dgx-fan-control")
 
 
-def find_cooling_device(thermal_root: Path) -> Path:
+def mark_reported(exc: BaseException) -> None:
+    """Remember that this failure is already in the process log.
+
+    main logs unreported exceptions once. Repeating one that a command
+    already logged puts the same event on the terminal and in the journal
+    a second time.
+    """
+    setattr(exc, "_dgx_reported", True)
+
+
+def was_reported(exc: BaseException) -> bool:
+    return bool(getattr(exc, "_dgx_reported", False))
+
+
+class ControlUnsupported(RuntimeError):
+    """Hwmon telemetry is bound and the EC is not accepting a floor."""
+
+
+class ForeignFloor(RuntimeError):
+    """Probe refused a lower floor written from outside this driver."""
+
+
+def cooling_devices(thermal_root: Path) -> list[Path]:
+    if offline_hides_host_path(thermal_root):
+        return []
     matches = []
     for candidate in sorted(thermal_root.glob("cooling_device*")):
         try:
@@ -50,6 +358,11 @@ def find_cooling_device(thermal_root: Path) -> Path:
             continue
         if device_type == COOLING_DEVICE_TYPE:
             matches.append(candidate)
+    return matches
+
+
+def find_cooling_device(thermal_root: Path) -> Path:
+    matches = cooling_devices(thermal_root)
     if len(matches) != 1:
         raise RuntimeError(
             f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
@@ -57,47 +370,3468 @@ def find_cooling_device(thermal_root: Path) -> Path:
     return matches[0]
 
 
-def read_hottest_temperature_c(thermal_root: Path) -> float:
+def find_fan_hwmon(hwmon_root: Path) -> Path | None:
+    if offline_hides_host_path(hwmon_root):
+        return None
+    matches = []
+    for candidate in sorted(hwmon_root.glob("hwmon*")):
+        try:
+            name = (candidate / "name").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if name == HWMON_DEVICE_NAME:
+            matches.append(candidate)
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected at most one {HWMON_DEVICE_NAME!r} hwmon device, found {len(matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def read_thermal_zone_c(thermal_root: Path, zone: str = "thermal_zone0") -> float:
+    text = (thermal_root / zone / "temp").read_text(encoding="ascii").strip()
+    millidegrees = int(text)
+    if not 0 <= millidegrees <= 200_000:
+        raise RuntimeError(f"{zone} temperature is outside the accepted range")
+    return millidegrees / 1000.0
+
+
+def read_named_fan_rpms(hwmon_root: Path, device_name: str = ACPI_FAN_NAME) -> list[int]:
+    """RPM inputs for one hwmon name. Does not require this project's module."""
+    if offline_hides_host_path(hwmon_root):
+        return []
     readings = []
-    for path in sorted(thermal_root.glob("thermal_zone*/temp")):
+    for device in sorted(hwmon_root.glob("hwmon*")):
+        try:
+            name = (device / "name").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if name != device_name:
+            continue
+        for path in sorted(device.glob("fan*_input")):
+            readings.append(int(path.read_text(encoding="ascii").strip()))
+    return readings
+
+
+def systemctl_query(verb: str, unit: str = DAEMON_UNIT) -> str:
+    try:
+        completed = subprocess.run(
+            ["systemctl", verb, unit],
+            check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OfflineGuardError:
+        return "unknown"
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
+        return "unknown"
+    lines = (completed.stdout or "").strip().splitlines()
+    return lines[0] if lines else "unknown"
+
+
+def systemctl_is_active(unit: str = DAEMON_UNIT) -> str:
+    return systemctl_query("is-active", unit)
+
+
+def read_daemon_unit(unit: str = DAEMON_UNIT) -> tuple[str, str, int | None]:
+    active, enabled, exec_status, _result, _restarts = read_daemon_facts(unit)
+    return active, enabled, exec_status
+
+
+def read_daemon_facts(unit: str = DAEMON_UNIT) -> tuple:
+    """active, enabled, exec status, Result, and NRestarts."""
+    properties = systemctl_show_properties(unit, (
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+        "ExecMainStartTimestampMonotonic",
+        "ExecMainExitTimestampMonotonic",
+        "Result",
+        "NRestarts",
+    ))
+    result = properties.get("Result", "").strip()
+    if result in {"", "n/a"}:
+        result = ""
+    return (
+        systemctl_query("is-active", unit),
+        systemctl_query("is-enabled", unit),
+        _show_int(properties, "ExecMainStatus"),
+        result or None,
+        _show_int(properties, "NRestarts"),
+    )
+
+
+def systemctl_show_properties(unit: str, names: tuple[str, ...],
+                              timestamp: str | None = None) -> dict[str, str]:
+    command = ["systemctl", "show"]
+    if timestamp:
+        command.append(f"--timestamp={timestamp}")
+    for name in names:
+        command.extend(["-p", name])
+    command.append(unit)
+    try:
+        completed = subprocess.run(
+            command, check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
+        return {}
+    found: dict[str, str] = {}
+    for line in (completed.stdout or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key] = value.strip()
+    return found
+
+
+def _show_int(properties: dict[str, str], name: str) -> int | None:
+    text = properties.get(name, "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def read_exec_main(unit: str = DAEMON_UNIT) -> tuple[int | None, str | None, int | None, int | None]:
+    """Exit code, wall-clock exit time, and start/exit monotonic microseconds.
+
+    A monotonic value of 0 means systemd has no such timestamp. ExecMainStatus
+    is also 0 when the main process has never exited, so callers must not
+    treat a bare 0 as a completed run.
+    """
+    properties = systemctl_show_properties(unit, (
+        "ExecMainStatus",
+        "ExecMainExitTimestamp",
+        "ExecMainStartTimestampMonotonic",
+        "ExecMainExitTimestampMonotonic",
+    ))
+    timestamp = properties.get("ExecMainExitTimestamp", "").strip()
+    if timestamp in {"", "n/a", "0"}:
+        timestamp = None
+    return (
+        _show_int(properties, "ExecMainStatus"),
+        timestamp,
+        _show_int(properties, "ExecMainStartTimestampMonotonic"),
+        _show_int(properties, "ExecMainExitTimestampMonotonic"),
+    )
+
+
+def systemctl_exec_main_status(unit: str = DAEMON_UNIT) -> int | None:
+    status, _timestamp, _start_us, _exit_us = read_exec_main(unit)
+    return status
+
+
+def service_exit_is_current(active: str, enabled: str, exec_status: int | None = None,
+                            exit_timestamp: str | None = None,
+                            start_monotonic_us: int | None = None,
+                            exit_monotonic_us: int | None = None) -> bool:
+    """True when this inactive or failed state is the main process's own exit.
+
+    A disabled unit that is not failed has not run since it was disabled, so
+    a leftover ExecMainStatus is not current. An active unit is still running.
+    Enabled and inactive counts only after the main process has exited since
+    it last started.
+    """
+    if exec_status is None:
+        return False
+    if active == "failed":
+        return True
+    if active == "active" or enabled != "enabled":
+        return False
+    if not exit_timestamp or exit_monotonic_us == 0:
+        return False
+    if (
+        start_monotonic_us not in (None, 0)
+        and exit_monotonic_us not in (None, 0)
+        and exit_monotonic_us < start_monotonic_us
+    ):
+        return False
+    return True
+
+
+def format_service_exit(active: str, enabled: str, exec_status: int | None = None,
+                        exit_timestamp: str | None = None,
+                        start_monotonic_us: int | None = None,
+                        exit_monotonic_us: int | None = None) -> str:
+    """n/a, a bare code, or '<code> at <ExecMainExitTimestamp>'."""
+    if not service_exit_is_current(
+        active, enabled, exec_status, exit_timestamp,
+        start_monotonic_us, exit_monotonic_us,
+    ):
+        return "n/a"
+    if exit_timestamp:
+        return f"{exec_status} at {exit_timestamp}"
+    return str(exec_status)
+
+
+def daemon_is_down(state: str) -> bool:
+    return state != "active"
+
+
+def daemon_stop_is_manual(active: str, enabled: str,
+                          exec_status: int | None = None,
+                          result: str | None = None) -> bool:
+    """True when the performance service was stopped on purpose.
+
+    Restart=always would restart a spontaneous exit 0, so an inactive unit
+    whose result is success and whose exit is 0 was stopped with systemctl.
+    Disabled and inactive is the same choice. Exits 69, 78, and 79 are not that.
+    Exit 79 is a held floor: the daemon refused to start.
+    """
+    if active == "failed" or active != "inactive":
+        return False
+    if enabled == "disabled":
+        return True
+    if exec_status in (
+        UNSUPPORTED_FIRMWARE_EXIT, FOREIGN_FLOOR_EXIT, HELD_FLOOR_EXIT,
+    ):
+        return False
+    if result == "success" and exec_status in (None, 0):
+        return True
+    if exec_status == 0 and result in (None, "success"):
+        return True
+    return False
+
+
+def daemon_needs_alarm(active: str, enabled: str = "enabled",
+                       exec_status: int | None = None,
+                       result: str | None = None,
+                       n_restarts: int | None = None,
+                       firmware_unsupported: bool = False) -> bool:
+    """Alarm on a crash, a nonzero exit, or a restart loop.
+
+    A manual stop does not alarm. Exit 69 does not alarm in any unit state,
+    including failed and enabled: that is the telemetry-only probe. Exit 79
+    does not alarm in any unit state either: a held floor refused the start.
+    Exit 78 does not alarm unless the unit is failed. Recognized unsupported
+    firmware is not a fault whether the unit is enabled or disabled.
+    """
+    if firmware_unsupported or exec_status in (
+        UNSUPPORTED_FIRMWARE_EXIT, HELD_FLOOR_EXIT,
+    ):
+        return False
+    if daemon_stop_is_manual(active, enabled, exec_status, result):
+        return False
+    if (
+        n_restarts is not None
+        and n_restarts >= DAEMON_RESTART_LOOP
+        and active == "active"
+    ):
+        return True
+    if active == "active":
+        return False
+    if active == "failed":
+        return True
+    if exec_status == FOREIGN_FLOOR_EXIT:
+        return False
+    if enabled == "disabled" and active == "inactive":
+        return False
+    return True
+
+
+def split_unit_state(reported: str | tuple) -> tuple:
+    """active, enabled, exec status, Result, NRestarts.
+
+    Older callers pass a string or a shorter tuple. Missing fields stay None.
+    """
+    if isinstance(reported, tuple):
+        active = reported[0]
+        enabled = reported[1] if len(reported) > 1 else "enabled"
+        exec_status = reported[2] if len(reported) > 2 else None
+        result = reported[3] if len(reported) > 3 else None
+        n_restarts = reported[4] if len(reported) > 4 else None
+        return active, enabled, exec_status, result, n_restarts
+    return reported, "enabled", None, None, None
+
+
+def broadcast_alert(message: str) -> None:
+    subprocess.run(["wall", message], check=False, capture_output=True)
+
+
+def run_watchdog_action(action: str) -> int:
+    argv = shlex.split(action)
+    if not argv:
+        raise ValueError("watchdog action is empty")
+    completed = subprocess.run(argv, check=False)
+    return completed.returncode
+
+
+def read_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str | None:
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def read_stall_marker(path: Path) -> tuple[str, str, str] | None:
+    """boot id, timestamp, and reason, or None when no reboot was recorded.
+
+    A marker written before reasons existed is treated as a true-zero reboot.
+    """
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    found = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    boot_id = found.get("boot_id")
+    timestamp = found.get("time")
+    if not boot_id or not timestamp:
+        return None
+    return boot_id, timestamp, found.get("reason") or "true-zero"
+
+
+def write_stall_marker(path: Path, boot_id: str, when: float, reason: str = "true-zero") -> None:
+    ensure_state_dir(path.parent)
+    path.write_text(
+        f"boot_id={boot_id}\ntime={when:.3f}\nreason={reason}\n",
+        encoding="ascii",
+    )
+
+
+INTERVENTION_NAME = "needs-intervention"
+HEALTH_NAME = "health"
+# Schema of the on-disk health file. A missing or different value was written
+# by older code and is shown as stale. Plain health does not rewrite it.
+HEALTH_RECORD_VERSION = "2"
+
+
+def _code_fingerprint() -> str:
+    """Short hash of this file. Different bytes are a different install.
+
+    The format number above changes only by hand. This changes when the
+    installed script's bytes change, so a new build does not need a bump.
+    Reinstalling the same bytes does not.
+    """
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+HEALTH_CODE = _code_fingerprint()
+RECORD_HINT = (
+    "`sudo dgx-fan-control health --record` saves the current result; on a "
+    "healthy run it also clears the stored needs-intervention flag and the "
+    "stall and watchdog-reboot markers, and, if this boot follows a watchdog "
+    "reboot that has not been announced, logs and broadcasts that recovery once."
+)
+NOTIFY_DEFAULT = Path("/etc/default/dgx-fan-control")
+
+
+def ensure_state_dir(path: Path) -> None:
+    """Create the state directory and keep it traversable by later SSH logins."""
+    refuse_host_write(path)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o755)
+    except OSError:
+        return
+
+
+def write_state_text(path: Path, text: str) -> None:
+    """Write a state file as mode 0644 so a login can read the flag."""
+    refuse_host_write(path)
+    ensure_state_dir(path.parent)
+    path.write_text(text, encoding="ascii")
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        return
+
+
+def unsupported_firmware_flag_only(reason: str | None) -> bool:
+    """True when a stored flag names only the telemetry-only firmware state.
+
+    That state is deliberate. The held-floor line from the same transition
+    does not make it a real fault. Any other reason stays in place.
+    """
+    if not reason or reason == NEEDS_ROOT:
+        return False
+    text = reason.strip()
+    exact = "unsupported firmware; telemetry only"
+    if text == exact:
+        return True
+    prefix = exact + "; "
+    if not text.startswith(prefix):
+        return False
+    rest = text[len(prefix):].strip()
+    return rest.startswith("manual floor state ") and rest.endswith(" is not held")
+
+
+def write_intervention(path: Path, reason: str, boot_id: str | None, when: float) -> None:
+    """Record a fault. Recognized unsupported firmware is not a fault."""
+    if unsupported_firmware_flag_only(reason):
+        return
+    write_state_text(
+        path,
+        f"reason={reason}\nboot_id={boot_id or ''}\ntime={when:.3f}\n",
+    )
+
+
+def dismiss_unsupported_firmware_flag(path: Path) -> bool:
+    """Remove a stale unsupported-firmware flag. Other reasons stay.
+
+    True only when the file is gone. A reader that cannot unlink leaves the
+    file in place; callers must not show that reason as a live fault.
+    """
+    if not unsupported_firmware_flag_only(read_intervention_reason(path)):
+        return False
+    return clear_stall_marker(path)
+
+
+def access_denied(exc: BaseException) -> bool:
+    return isinstance(exc, OSError) and exc.errno in (errno.EACCES, errno.EPERM)
+
+
+def scandir_names(path: Path) -> list[str] | None:
+    """Directory entry names, or None when the directory is not readable."""
+    try:
+        with os.scandir(path) as scanned:
+            names = [entry.name for entry in scanned]
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        if access_denied(exc):
+            return None
+        return []
+    return sorted(names)
+
+
+def read_intervention_reason(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "reason" and value.strip():
+            return value.strip()
+    stripped = text.strip()
+    return stripped or None
+
+
+def intervention_banner(path: Path) -> str:
+    reason = read_intervention_reason(path)
+    if not reason or unsupported_firmware_flag_only(reason):
+        return ""
+    return f"NEEDS INTERVENTION: {reason}\n"
+
+
+def clear_stall_marker(path: Path) -> bool:
+    """Remove path. True when it is gone. Permission denied leaves it."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return not path.exists()
+    return not path.exists()
+
+
+PREVIOUS_REBOOT_NAME = "previous-watchdog-reboot"
+RECOVERY_ANNOUNCED_NAME = "recovery-announced"
+HEALTH_SETTLE_SECONDS = 45.0
+HEALTH_POLL_SECONDS = 2.0
+# Health only. A restart can show one tachometer as 0 for a moment.
+# Three 1s rereads, and no more than that, before the check fails.
+HEALTH_FAN_RECHECK_SECONDS = 1.0
+HEALTH_FAN_RECHECK_LIMIT = 3
+
+
+def remember_previous_reboot(directory: Path, boot_id: str | None,
+                             marker: tuple[str, str, str] | None) -> None:
+    """Keep a note when this boot follows a watchdog reboot.
+
+    The stall marker itself is removed once the fans are nonzero. The health
+    check still needs to know that this boot came after that reboot.
+    """
+    if not boot_id or marker is None or marker[0] == boot_id:
+        return
+    path = directory / PREVIOUS_REBOOT_NAME
+    try:
+        existing = path.read_text(encoding="ascii")
+    except OSError:
+        existing = ""
+    if f"boot_id={boot_id}\n" in existing:
+        return
+    write_state_text(path, f"boot_id={boot_id}\nreason={marker[2]}\n")
+
+
+def pending_watchdog_reboot(state_dir: Path, boot_id: str | None) -> str | None:
+    """Reason text when this boot follows a watchdog reboot, else None."""
+    marker = read_stall_marker(state_dir / STALL_MARKER_NAME)
+    if marker is not None and boot_id and marker[0] != boot_id:
+        return marker[2]
+    path = state_dir / PREVIOUS_REBOOT_NAME
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except OSError:
+        return None
+    found = {}
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    if boot_id and found.get("boot_id") == boot_id:
+        return found.get("reason") or "true-zero"
+    return None
+
+
+def recovery_already_announced(state_dir: Path, boot_id: str | None) -> bool:
+    if not boot_id:
+        return False
+    path = state_dir / RECOVERY_ANNOUNCED_NAME
+    try:
+        text = path.read_text(encoding="ascii")
+    except OSError:
+        return False
+    return f"boot_id={boot_id}" in text
+
+
+def read_defaults(path: Path = NOTIFY_DEFAULT) -> dict[str, str]:
+    """KEY=VALUE lines from /etc/default/dgx-fan-control. Missing file is empty.
+
+    Permission denied is raised so a health check can say it needs root
+    instead of treating the file as unset.
+    """
+    if offline_guard_active() and path == NOTIFY_DEFAULT:
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if access_denied(exc):
+            raise
+        return {}
+    found = {}
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        found[key.strip()] = value.strip().strip("'\"")
+    return found
+
+
+def command_succeeded(command: str, timeout: float = CHECK_TIMEOUT_SECONDS) -> bool | None | str:
+    """True on success, False on a clean non-zero exit.
+
+    An http or https URL is a GET. ``timeout`` and ``unknown (needs root)``
+    name those outcomes. None is any other failure.
+    """
+    command = command.strip()
+    if not command:
+        return None
+    allowed = _budgeted_timeout(timeout)
+    if allowed is None:
+        return "timeout"
+    timeout = allowed
+    if command.startswith("http://") or command.startswith("https://"):
+        try:
+            with urllib.request.urlopen(command, timeout=timeout) as response:
+                return 200 <= getattr(response, "status", 200) < 300
+        except TimeoutError:
+            return "timeout"
+        except urllib.error.URLError as exc:
+            if isinstance(getattr(exc, "reason", None), TimeoutError):
+                return "timeout"
+            return None
+        except OSError as exc:
+            if access_denied(exc):
+                return NEEDS_ROOT
+            return None
+        except ValueError:
+            return None
+    try:
+        completed = subprocess.run(
+            command, shell=True, check=False, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    except OfflineGuardError:
+        return None
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
+        return None
+    return completed.returncode == 0
+
+
+def read_progress_value(command: str) -> float | None:
+    """A monotonic progress number from PROGRESS_CHECK, or None if unusable.
+
+    The command has the same timeout as BUSY_CHECK. Success is exit 0 and a
+    final token that parses as a number, including 0. A zero sum is a real
+    sample. A higher number than last time is progress.
+    """
+    command = command.strip()
+    if not command:
+        return None
+    timeout = _budgeted_timeout(CHECK_TIMEOUT_SECONDS)
+    if timeout is None:
+        return None
+    try:
+        completed = subprocess.run(
+            command, shell=True, check=False, capture_output=True, text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
+        return None
+    if completed.returncode != 0:
+        return None
+    tokens = (completed.stdout or "").strip().split()
+    if not tokens:
+        return None
+    try:
+        return float(tokens[-1])
+    except ValueError:
+        return None
+
+
+def process_cpu_ticks(pid: int) -> int | None:
+    """utime+stime from /proc/<pid>/stat, or None if the process is unreadable."""
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    rest = text.rsplit(")", 1)[-1].split()
+    if len(rest) < 13:
+        return None
+    try:
+        return int(rest[11]) + int(rest[12])
+    except ValueError:
+        return None
+
+
+def _nvidia_smi_snippet(text: str) -> str:
+    """One short ASCII line from nvidia-smi stderr, or empty."""
+    line = ""
+    for candidate in (text or "").splitlines():
+        if candidate.strip():
+            line = candidate.strip()
+            break
+    cleaned = " ".join(line.split())
+    return cleaned.encode("ascii", "replace").decode("ascii")[:80]
+
+
+def _budgeted_timeout(requested: float) -> float | None:
+    """Requested seconds, clipped to the watchdog probe budget.
+
+    None means the budget is already spent and the caller must not block.
+    """
+    deadline = _probe_deadline.get()
+    if deadline is None:
+        return requested
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(requested, remaining)
+
+
+@contextmanager
+def probe_budget(seconds: float = PROBE_BUDGET_SECONDS):
+    """Cap GPU and progress probes for one watchdog iteration."""
+    token = _probe_deadline.set(time.monotonic() + seconds)
+    try:
+        yield
+    finally:
+        _probe_deadline.reset(token)
+
+
+def run_nvidia_smi(args: list[str], *, sleeper=None,
+                   timeout: float = NVIDIA_SMI_TIMEOUT_SECONDS):
+    """Run nvidia-smi, retrying a transient failure twice.
+
+    Returns (completed, None) on exit 0. Otherwise (None, (exit label, stderr
+    snippet)). A missing binary is not retried. The caller still treats a
+    remaining failure as a running job so a reboot is deferred. A watchdog
+    probe budget stops further tries without sleeping past the cap.
+    """
+    if sleeper is None:
+        sleeper = time.sleep
+    code = "unknown"
+    stderr = ""
+    for attempt in range(NVIDIA_SMI_ATTEMPTS):
+        allowed = _budgeted_timeout(timeout)
+        if allowed is None:
+            if not stderr and code == "unknown":
+                code = "budget"
+            break
+        try:
+            completed = subprocess.run(
+                args, check=False, capture_output=True, text=True, timeout=allowed,
+            )
+        except subprocess.TimeoutExpired:
+            code, stderr = "timeout", ""
+        except (FileNotFoundError, OfflineGuardError) as exc:
+            return None, ("missing", _nvidia_smi_snippet(str(exc)))
+        except OSError as exc:
+            code, stderr = "error", _nvidia_smi_snippet(str(exc))
+        else:
+            if completed.returncode == 0:
+                return completed, None
+            code = str(completed.returncode)
+            stderr = _nvidia_smi_snippet(completed.stderr or "")
+        if attempt + 1 < NVIDIA_SMI_ATTEMPTS:
+            pause = _budgeted_timeout(NVIDIA_SMI_BACKOFF_SECONDS[attempt])
+            if pause is None:
+                break
+            sleeper(pause)
+    return None, (code, stderr)
+
+
+def remember_nvidia_smi_failure(code: str, stderr: str) -> None:
+    run_nvidia_smi.last_failure = (code, stderr)
+
+
+def clear_nvidia_smi_failure() -> None:
+    run_nvidia_smi.last_failure = None
+
+
+def gpu_gap_sentence(code: str = "unknown", extra: str = "") -> str:
+    """Sampling-gap sentence. This does not run nvidia-smi."""
+    text = (
+        f"could not sample GPU: nvidia-smi exited {code}; "
+        "transient after a restart is normal"
+    )
+    if extra:
+        text += f"; {extra}"
+    return text
+
+
+def gpu_sample_gap_detail() -> str:
+    """Parenthetical for a GPU sample that failed after the short retry."""
+    failure = getattr(run_nvidia_smi, "last_failure", None)
+    code, extra = failure if failure else ("unknown", "")
+    return gpu_gap_sentence(code, extra)
+
+
+def read_builtin_progress() -> tuple[float | None, dict[int, int] | None]:
+    """GPU utilization percent and per-pid CPU ticks for compute processes.
+
+    None means that signal could not be read. A missing signal does not by
+    itself mean the job is stuck. nvidia-smi is retried briefly first.
+    """
+    util_run, _util_failure = run_nvidia_smi(
+        [
+            "nvidia-smi", "--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )
+    pid_run, _pid_failure = run_nvidia_smi(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+    )
+    util = None
+    if util_run is not None and util_run.returncode == 0:
+        values = []
+        for line in (util_run.stdout or "").splitlines():
+            token = line.strip().split()
+            if not token:
+                continue
+            try:
+                values.append(float(token[0]))
+            except ValueError:
+                continue
+        if values:
+            util = max(values)
+    ticks: dict[int, int] | None = None
+    if pid_run is not None and pid_run.returncode == 0:
+        ticks = {}
+        for line in (pid_run.stdout or "").splitlines():
+            token = line.strip()
+            if not token or not token.isdigit():
+                continue
+            pid = int(token)
+            cpu = process_cpu_ticks(pid)
+            if cpu is not None:
+                ticks[pid] = cpu
+    return util, ticks
+
+
+def builtin_signals_stuck(util: float | None, ticks: dict[int, int] | None,
+                          previous: dict[int, int] | None) -> tuple[bool, bool]:
+    """Whether GPU util is idle, and whether CPU time failed to advance.
+
+    Each value is True only when that signal was readable and showed no
+    progress. A busy-loop on the GPU can keep utilization high and look
+    alive. A long prefill can report a low utilization and look idle.
+    """
+    util_idle = util is not None and util <= GPU_IDLE_UTIL_PERCENT
+    cpu_flat = False
+    if ticks is not None and previous:
+        cpu_flat = True
+        for pid, cpu in ticks.items():
+            if cpu > previous.get(pid, cpu - 1):
+                cpu_flat = False
+                break
+        if not ticks:
+            cpu_flat = False
+    return util_idle, cpu_flat
+
+
+def read_job_watch(state_dir: Path) -> dict[str, str]:
+    """Last watchdog progress sample. ``unreadable=yes`` is not a missing file."""
+    path = state_dir / JOB_WATCH_NAME
+    try:
+        text = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        if access_denied(exc):
+            return {"unreadable": "yes"}
+        return {}
+    found = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    return found
+
+
+def write_job_watch(state_dir: Path, source: str, stuck: bool, seconds: float,
+                    detail: str = "", when: float | None = None) -> None:
+    if when is None:
+        when = time.time()
+    try:
+        write_state_text(
+            state_dir / JOB_WATCH_NAME,
+            f"source={source}\n"
+            f"detail={detail}\n"
+            f"stuck={'yes' if stuck else 'no'}\n"
+            f"no_progress_seconds={max(0.0, seconds):.0f}\n"
+            f"recorded={when:.3f}\n",
+        )
+    except OSError:
+        return
+
+
+def format_utc_stamp(raw: str | float | None) -> str | None:
+    """Absolute UTC time, matching the stored-health clock format."""
+    try:
+        stamp = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(stamp):
+        return None
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(stamp))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _with_recorded_time(text: str, job_watch: dict[str, str]) -> str:
+    shown = format_utc_stamp(job_watch.get("recorded"))
+    if not shown or not text.endswith(")"):
+        return text
+    return text[:-1] + f"; recorded {shown})"
+
+
+def translate_legacy_job_watch(fields: dict[str, str]) -> dict[str, str]:
+    """Map a pre-gap ``nvidia-smi failed`` sample onto the sampling-gap sentence.
+
+    The exit code was not stored, so it is ``unknown``. This does not probe.
+    """
+    if fields.get("detail", "").strip() != LEGACY_GPU_FAILURE:
+        return fields
+    updated = dict(fields)
+    updated["source"] = "unknown"
+    updated["detail"] = gpu_gap_sentence()
+    return updated
+
+
+def recorded_work_text(fields: dict[str, str]) -> str | None:
+    """What the last job-watch sample said, without taking a new sample."""
+    fields = translate_legacy_job_watch(fields)
+    if not fields or fields.get("unreadable") == "yes":
+        return None
+    source = fields.get("source", "").strip()
+    detail = fields.get("detail", "").strip()
+    if not source and not detail:
+        return None
+    if source == "unknown" or detail.startswith("could not sample GPU"):
+        return detail or "could not sample GPU"
+    if source == "off":
+        return detail or "no job running"
+    moving = "not moving" if fields.get("stuck") == "yes" else "moving"
+    return f"GPU job running, progress {moving} via {detail or source}"
+
+
+def last_recorded_work_note(state: dict, state_dir: Path) -> str:
+    """Poweroff parenthetical. A file error falls back; nothing is probed."""
+    try:
+        fields = _recorded_work_fields(state, state_dir)
+        phrase = recorded_work_text(fields) if fields else None
+        shown = format_utc_stamp(fields.get("recorded")) if fields else None
+    except Exception:
+        return "not sampled now; no earlier work-state record"
+    if not phrase or not shown:
+        return "not sampled now; no earlier work-state record"
+    return f"not sampled now; last recorded work state at {shown}: {phrase}"
+
+
+def _recorded_work_fields(state: dict, state_dir: Path) -> dict[str, str] | None:
+    if state.get("recorded_at") is not None and (
+        state.get("source") or state.get("detail")
+    ):
+        stuck = state.get("stuck")
+        return {
+            "source": str(state.get("source", "")),
+            "detail": str(state.get("detail", "")),
+            "stuck": "yes" if stuck is True or stuck == "yes" else "no",
+            "recorded": str(state.get("recorded_at")),
+        }
+    found = read_job_watch(state_dir)
+    if not found or found.get("unreadable") == "yes":
+        return None
+    return found
+
+
+def job_watch_recorded_time(fields: dict[str, str]) -> float | None:
+    """Unix time stored with the sample. File mtime is not a sample time."""
+    raw = fields.get("recorded", "").strip()
+    if not raw:
+        return None
+    try:
+        stamp = float(raw)
+    except ValueError:
+        return None
+    if not math.isfinite(stamp):
+        return None
+    return stamp
+
+
+def parse_systemctl_timestamp(raw: str) -> float | None:
+    """Seconds from ``systemctl show --timestamp=us`` or ``unix``."""
+    text = raw.strip()
+    if text.startswith("@"):
+        text = text[1:]
+    if text in {"", "n/a", "0"}:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if value > 10**14:
+        value /= 1_000_000
+    return value
+
+
+_systemd_timestamp_unavailable = False
+
+
+def watchdog_active_since(state_dir: Path | None) -> float | None:
+    """Unix time the current watchdog process started.
+
+    The watchdog writes ``watchdog-started`` before its first poll. If that
+    file is not there yet, ask systemd. A bus failure is remembered so a
+    health pass does not pay for it again.
+    """
+    global _systemd_timestamp_unavailable
+    if state_dir is not None:
+        try:
+            text = (state_dir / WATCHDOG_STARTED_NAME).read_text(encoding="ascii")
+        except OSError:
+            text = ""
+        for line in text.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() == "time":
+                try:
+                    stamp = float(value.strip())
+                except ValueError:
+                    break
+                if math.isfinite(stamp) and stamp > 0:
+                    return stamp
+                break
+    if _systemd_timestamp_unavailable:
+        return None
+    try:
+        properties = systemctl_show_properties(
+            WATCHDOG_UNIT, ("ActiveEnterTimestamp",), timestamp="us",
+        )
+    except Exception:
+        _systemd_timestamp_unavailable = True
+        return None
+    if not properties:
+        _systemd_timestamp_unavailable = True
+        return None
+    return parse_systemctl_timestamp(properties.get("ActiveEnterTimestamp", ""))
+
+
+def job_watch_predates(sample_time: float | None, started: float | None, *,
+                       present: bool, stamped: bool) -> bool:
+    """True when this file is from before the current watchdog process.
+
+    A missing file is not a previous sample. A file with no ``recorded=``
+    stamp cannot be dated, so it is previous once this process has started,
+    and the display says the time is unknown.
+    """
+    if not present or started is None:
+        return False
+    if not stamped:
+        return True
+    return sample_time is not None and sample_time < started
+
+
+def _waiting_for_sample(fields: dict[str, str], sample_time: float | None) -> str:
+    shown = format_utc_stamp(sample_time)
+    detail = fields.get("detail", "").strip()
+    gap = (
+        fields.get("source") == "unknown"
+        or detail.startswith("could not sample GPU")
+    )
+    if gap and detail and shown:
+        return (
+            "waiting for first watchdog sample "
+            f"(previous sample at {shown}: {detail})"
+        )
+    if gap and detail:
+        return (
+            "waiting for first watchdog sample "
+            f"(previous sample, time unknown: {detail})"
+        )
+    if shown:
+        return f"waiting for first watchdog sample (previous sample at {shown})"
+    return "waiting for first watchdog sample (previous sample, time unknown)"
+
+
+def format_progress(job_watch: dict[str, str], *,
+                    sample_time: float | None = None,
+                    watchdog_started: float | None = None) -> str:
+    """Progress note, including why. Every uid prints the same stored sample.
+
+    Health does not run nvidia-smi or PROGRESS_CHECK itself. Those probes
+    run in the root watchdog, and a second probe can disagree by uid.
+    A file from before this watchdog start is not the current sample.
+    """
+    if job_watch.get("unreadable") == "yes":
+        return NEEDS_ROOT
+    fields = translate_legacy_job_watch(job_watch)
+    recorded = job_watch_recorded_time(fields)
+    del sample_time  # A file mtime is not the sample time.
+    present = bool(job_watch)
+    if job_watch_predates(
+        recorded, watchdog_started, present=present, stamped=recorded is not None,
+    ):
+        return _waiting_for_sample(fields, recorded)
+    source = fields.get("source", "")
+    if source == "unknown":
+        # A sampling gap is not a health failure. The next good sample
+        # overwrites this file, so one transient miss does not stick.
+        gap = fields.get("detail", "").strip() or "could not sample GPU"
+        return _with_recorded_time(f"unknown ({gap})", fields)
+    if source not in {"hook", "built-in", "off", "waiting"}:
+        source = "off"
+    detail = fields.get("detail", "").strip()
+    if not detail:
+        if not fields:
+            detail = "no watchdog sample"
+        elif source == "hook":
+            detail = "PROGRESS_CHECK"
+        elif source == "built-in":
+            detail = "GPU utilization"
+        elif source == "waiting":
+            detail = "waiting for first watchdog sample"
+        else:
+            detail = "no job running"
+    if source == "waiting":
+        return _with_recorded_time(
+            f"waiting ({detail})", fields,
+        )
+    return _with_recorded_time(f"{source} ({detail})", fields)
+
+
+def work_is_in_progress(defaults: dict[str, str], gpu_jobs) -> tuple[bool, str]:
+    """Whether a reboot should wait.
+
+    BUSY_CHECK exit 0 means work is in progress. A failure or timeout counts
+    as busy. When BUSY_CHECK is unset, nvidia-smi compute apps are the default.
+    """
+    command = defaults.get("BUSY_CHECK", "").strip()
+    if command:
+        result = command_succeeded(command)
+        if result is True:
+            return True, "busy-check"
+        if result is False:
+            return False, "busy-check"
+        return True, "busy-check-failed"
+    clear_nvidia_smi_failure()
+    state = gpu_jobs()
+    if state is None:
+        return True, "nvidia-smi-failed"
+    return bool(state), "nvidia-smi"
+
+
+def ready_for_work(defaults: dict[str, str]) -> str:
+    """pass, fail, timeout, not configured, or unknown (needs root)."""
+    command = defaults.get("READY_CHECK", "").strip()
+    if not command:
+        return "not configured"
+    result = command_succeeded(command)
+    if result == NEEDS_ROOT:
+        return NEEDS_ROOT
+    if result == "timeout":
+        return "timeout"
+    if result is True:
+        return "pass"
+    return "fail"
+
+
+def configured_float(defaults: dict[str, str], key: str, fallback: float) -> float:
+    raw = defaults.get(key, "").strip()
+    if not raw:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        LOG.warning("%s is not a number; using %s", key, fallback)
+        return fallback
+    if not math.isfinite(value) or value < 0:
+        LOG.warning("%s must be finite and non-negative; using %s", key, fallback)
+        return fallback
+    return value
+
+
+def _emit_check(name: str, status: str, detail: str, emit) -> str | None:
+    """Print one check. Return the flag text when it is not a pass.
+
+    ``note`` is a deliberate state. It is printed and is not a failure.
+    """
+    if status == "pass":
+        emit(f"{name}: pass" if not detail else f"{name}: pass ({detail})")
+        return None
+    if status == "warn":
+        emit(f"{name}: warn ({detail})")
+        return None
+    if status == "note":
+        emit(f"{name}: {detail}")
+        return None
+    if status == "unknown":
+        emit(f"{name}: {NEEDS_ROOT}")
+        return f"{name}: {NEEDS_ROOT}"
+    emit(f"{name}: fail ({detail})")
+    return detail
+
+
+def boot_load_state(etc: Path) -> str:
+    """managed-off, enabled, absent, or unknown.
+
+    managed-off is the modules-load file written by module disable.
+    """
+    path = etc / "modules-load.d" / MODULES_LOAD_NAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent"
+    except OSError as exc:
+        if access_denied(exc):
+            return "unknown"
+        return "absent"
+    if "Disabled by dgx-fan-control module disable" in text:
+        return "managed-off"
+    if text_selects_module(text):
+        return "enabled"
+    return "absent"
+
+
+def read_last_manual_state(state_dir: Path) -> int | None:
+    """Last floor recorded by set-state while the service was stopped."""
+    try:
+        text = (state_dir / MANUAL_STATE_NAME).read_text(encoding="ascii")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "state":
+            try:
+                state = int(value.strip())
+            except ValueError:
+                return None
+            if 1 <= state <= MAX_STATE:
+                return state
+            return None
+    return None
+
+
+def raw_floor_for_state(profile: str | None, state: int) -> int | None:
+    table = FLOOR_TABLES.get(profile or "")
+    if table is None or not 1 <= state <= MAX_STATE:
+        return None
+    return table[state]
+
+
+def latest_refused_floor(log_text: str) -> int | None:
+    """Raw floor from the newest probe refusal, if the log has one."""
+    found = None
+    for match in re.finditer(
+        r"refusing to replace existing lower floor (0x[0-9a-fA-F]+)",
+        log_text,
+    ):
+        found = int(match.group(1), 16)
+    return found
+
+
+def floor_matches_last_set(live_floor: int | None,
+                           record: tuple[int, int | None] | None) -> str:
+    """ours, foreign, or none.
+
+    A missing record, or a record with no raw floor, is foreign whenever a
+    live floor is present. State 0 is never a record.
+    """
+    if live_floor is None:
+        return "none"
+    if record is None or record[1] is None or not 1 <= record[0] <= MAX_STATE:
+        return "foreign"
+    if live_floor == record[1]:
+        return "ours"
+    return "foreign"
+
+
+def floor_report(live_floor: int | None,
+                 record: tuple[int, int | None] | None) -> str | None:
+    """Health line detail, or None when there is nothing to say."""
+    verdict = floor_matches_last_set(live_floor, record)
+    if verdict == "none":
+        return None
+    if verdict == "ours" and record is not None:
+        return f"ours (matches last-set {record[0]})"
+    last = "none" if record is None or record[1] is None else f"0x{record[1]:x}"
+    live = "none" if live_floor is None else f"0x{live_floor:x}"
+    return f"foreign (live {live}, last-set {last})"
+
+
+def format_manual_floor_line(state_dir: Path = STALL_MARKER_DIR) -> str:
+    """One status line for the held floor, or none."""
+    try:
+        defaults = read_defaults()
+    except OSError as exc:
+        if access_denied(exc):
+            return f"manual-floor: {NEEDS_ROOT}"
+        defaults = {}
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid":
+        return "manual-floor: invalid MANUAL_STATE"
+    if state is None:
+        return "manual-floor: none"
+    origin = "MANUAL_STATE" if source == "override" else "last-set"
+    return f"manual-floor: {state} ({origin})"
+
+
+def read_manual_record(state_dir: Path, defaults: dict[str, str] | None = None,
+                       profile: str | None = None) -> tuple[int, int | None] | None:
+    """(state, raw floor) from MANUAL_STATE or the last-set file."""
+    if defaults is None:
+        defaults = {}
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid" or state is None:
+        return None
+    raw = None
+    try:
+        text = (state_dir / MANUAL_STATE_NAME).read_text(encoding="ascii")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if key == "floor":
+            try:
+                raw = int(value.strip(), 0)
+            except ValueError:
+                raw = None
+        elif key == "profile" and profile is None:
+            profile = value.strip() or None
+    if raw is None:
+        raw = raw_floor_for_state(profile, state)
+    return state, raw
+
+
+def write_last_manual_state(state_dir: Path, state: int,
+                            floor: int | None = None,
+                            profile: str | None = None) -> None:
+    """Record a held floor. State 0 is not a held floor and is not written."""
+    if not 1 <= state <= MAX_STATE:
+        raise ValueError(
+            "manual floor must be 1 through 12; state 0 is not persisted"
+        )
+    lines = [f"state={state}"]
+    if floor is not None:
+        lines.append(f"floor={floor}")
+    if profile:
+        lines.append(f"profile={profile}")
+    write_state_text(state_dir / MANUAL_STATE_NAME, "\n".join(lines) + "\n")
+
+
+def write_owned_module_option(etc: Path, state: int, floor: int) -> None:
+    """modprobe options the kernel probe reads at the next load."""
+    path = etc / "modprobe.d" / OWNED_MODPROBE_NAME
+    refuse_host_write(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "# Managed by dgx-fan-control. Do not edit.\n"
+        f"options dgx_ec_fan_control owned_state={state} owned_floor={floor}\n",
+        encoding="ascii",
+    )
+
+
+def clear_owned_module_option(etc: Path) -> None:
+    path = etc / "modprobe.d" / OWNED_MODPROBE_NAME
+    refuse_host_write(path)
+    try:
+        path.unlink()
+    except OSError:
+        return
+
+
+def clear_last_manual_state(state_dir: Path) -> None:
+    clear_stall_marker(state_dir / MANUAL_STATE_NAME)
+
+
+def parse_manual_override(defaults: dict[str, str]) -> tuple[int | None, bool]:
+    """Return (state, invalid). An empty MANUAL_STATE is not an override."""
+    raw = defaults.get("MANUAL_STATE", "").strip()
+    if not raw:
+        return None, False
+    try:
+        state = int(raw)
+    except ValueError:
+        return None, True
+    if not 1 <= state <= MAX_STATE:
+        return None, True
+    return state, False
+
+
+def resolved_manual_state(defaults: dict[str, str], state_dir: Path) -> tuple[int | None, str]:
+    """Wanted floor and its source: override, last-set, invalid, or empty."""
+    override, invalid = parse_manual_override(defaults)
+    if invalid:
+        return None, "invalid"
+    if override is not None:
+        return override, "override"
+    last = read_last_manual_state(state_dir)
+    if last is None:
+        return None, ""
+    return last, "last-set"
+
+
+def enable_manual_oneshot() -> None:
+    try:
+        subprocess.run(
+            ["systemctl", "enable", MANUAL_UNIT],
+            check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def disable_manual_oneshot() -> None:
+    try:
+        subprocess.run(
+            ["systemctl", "disable", MANUAL_UNIT],
+            check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def remember_manual_floor(state: int, service_active: str, state_dir: Path,
+                          *, profile: str | None = None, floor: int | None = None,
+                          etc: Path | None = None) -> None:
+    """Persist set-state when the performance service is not running.
+
+    An active service owns the curve and is not recorded. State 0 clears the
+    record. The raw floor is passed to the kernel at the next load. This
+    never writes an ACPI fan level.
+    """
+    if etc is None:
+        etc = Path("/etc")
+    if service_active == "active":
+        return
+    if service_active in {NEEDS_ROOT, "timeout", "unknown"}:
+        return
+    if state == 0:
+        clear_last_manual_state(state_dir)
+        clear_owned_module_option(etc)
+        disable_manual_oneshot()
+        return
+    if floor is None:
+        floor = raw_floor_for_state(profile, state)
+    write_last_manual_state(state_dir, state, floor, profile)
+    if floor is not None:
+        write_owned_module_option(etc, state, floor)
+    enable_manual_oneshot()
+
+
+def clear_persisted_manual_floor(state_dir: Path,
+                                 defaults: dict[str, str] | None = None,
+                                 etc: Path | None = None) -> None:
+    """Drop the last-set floor. A MANUAL_STATE override is left in place."""
+    if etc is None:
+        etc = Path("/etc")
+    del defaults
+    clear_last_manual_state(state_dir)
+    clear_owned_module_option(etc)
+    disable_manual_oneshot()
+
+
+def telemetry_hwmon_present(hwmon_root: Path) -> bool | None:
+    """True when dgx_ec_fan is registered. None when the directory is unreadable."""
+    names = scandir_names(hwmon_root)
+    if names is None:
+        return None
+    for name in names:
+        if not name.startswith("hwmon"):
+            continue
+        try:
+            device_name = (hwmon_root / name / "name").read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if device_name == HWMON_DEVICE_NAME:
+            return True
+    return False
+
+
+def telemetry_only_firmware(log_text: str, profile: str | None,
+                            telemetry: bool | None,
+                            device_count: int | None) -> bool:
+    """Recognized unsupported firmware, not a missing driver.
+
+    EC 3.13.7 registers hwmon and does not register a cooling device. That
+    shape still counts when the kernel log is unreadable. A log that names
+    a control-capable profile does not.
+    """
+    if (
+        "registering hwmon telemetry only" in log_text
+        or "floor writes disabled" in log_text
+        or profile == "EC 3.13.7"
+    ):
+        return True
+    if profile not in (None, "EC 3.13.7"):
+        return False
+    return telemetry is True and device_count == 0
+
+
+def floor_devices(thermal_root: Path) -> list[Path] | None:
+    """dgx_ec_fan_floor devices, or None when the thermal directory is unreadable."""
+    names = scandir_names(thermal_root)
+    if names is None:
+        return None
+    found = []
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        try:
+            kind = (thermal_root / name / "type").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return None
+            continue
+        if kind == COOLING_DEVICE_TYPE:
+            found.append(thermal_root / name)
+    return found
+
+
+def apply_manual_floor(thermal_root: Path, hwmon_root: Path,
+                       defaults: dict[str, str] | None = None,
+                       state_dir: Path | None = None,
+                       wait_seconds: float = 30.0,
+                       monotonic=None, sleeper=None) -> int:
+    """Write the persisted floor to the cooling device. Never writes ACPI.
+
+    MANUAL_STATE overrides the last set-state. An empty configuration exits 0.
+    """
+    del hwmon_root
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    if acpi_incident_latched(state_dir):
+        LOG.critical("ACPI incident latched; not restoring a manual floor; explicit acpi-incident-reset required")
+        return HELD_FLOOR_EXIT
+    dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
+    state, source = resolved_manual_state(defaults, state_dir)
+    if source == "invalid":
+        LOG.error("MANUAL_STATE must be a floor from 1 through 12; not applying")
+        return 1
+    if state is None:
+        return 0
+    if monotonic is None:
+        monotonic = time.monotonic
+    if sleeper is None:
+        sleeper = time.sleep
+    deadline = monotonic() + wait_seconds
+    device = None
+    while True:
+        matches = floor_devices(thermal_root)
+        if matches is None:
+            LOG.error("manual floor %s not applied; thermal sysfs is not readable", state)
+            return 1
+        if len(matches) == 1:
+            device = matches[0]
+            break
+        if monotonic() >= deadline:
+            LOG.error("manual floor %s not applied; cooling device missing", state)
+            return 1
+        sleeper(1)
+    write_state(device, state)
+    LOG.info("applied manual floor state %s from %s", state, source)
+    return 0
+
+
+def _module_loaded_now() -> bool | None:
+    """True, False, or None when /sys/module cannot be read."""
+    path = Path("/sys/module") / MODULE_NAME
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        if access_denied(exc):
+            return None
+        return False
+    return stat.S_ISDIR(mode)
+
+
+def _count_floor_devices(thermal_root: Path) -> int | None:
+    names = scandir_names(thermal_root)
+    if names is None:
+        return None
+    found = 0
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        try:
+            kind = (thermal_root / name / "type").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return None
+            continue
+        if kind == COOLING_DEVICE_TYPE:
+            found += 1
+    return found
+
+
+def _acpi_fan_cur_states(thermal_root: Path) -> str:
+    """cur_state of every ACPI Fan cooling device. Not a tachometer.
+
+    On EC 3.13.7 a write to this file is ignored, so the level can be
+    nonzero while the tachometer reads 0. The health check reports the
+    level and does not treat it as the RPM.
+    """
+    names = scandir_names(thermal_root)
+    if names is None:
+        return "unreadable"
+    states = []
+    for name in names:
+        if not name.startswith("cooling_device"):
+            continue
+        device = thermal_root / name
+        try:
+            kind = (device / "type").read_text(encoding="ascii").strip()
+        except OSError:
+            continue
+        if kind != ACPI_COOLING_TYPE:
+            continue
+        try:
+            cur = (device / "cur_state").read_text(encoding="ascii").strip()
+        except OSError:
+            cur = "unreadable"
+        states.append(f"{name}:{cur}")
+    return " ".join(states) if states else "none"
+
+
+def _acpi_fan_points(hwmon_root: Path) -> tuple[str, dict[tuple[str, str], int | None]]:
+    """One pass over acpi_fan tachometers.
+
+    ``unknown`` means the directory was not readable. ``unreadable`` means a
+    present input could not be parsed. Otherwise ``ok``. A missing
+    ``fan1_input`` on a present device is ``None``. Each Spark fan is its
+    own ``acpi_fan`` device and that device has only ``fan1_input``.
+    """
+    names = scandir_names(hwmon_root)
+    if names is None:
+        return "unknown", {}
+    devices = []
+    for name in names:
+        device = hwmon_root / name
+        try:
+            kind = (device / "name").read_text(encoding="ascii").strip()
+        except OSError as exc:
+            if access_denied(exc):
+                return "unknown", {}
+            continue
+        if kind == ACPI_FAN_NAME:
+            devices.append(name)
+    points: dict[tuple[str, str], int | None] = {}
+    unreadable = False
+    for name in devices:
+        device = hwmon_root / name
+        fan_names = scandir_names(device)
+        if fan_names is None:
+            return "unknown", {}
+        found = False
+        for fan in fan_names:
+            if not (fan.startswith("fan") and fan.endswith("_input")):
+                continue
+            found = True
+            stem = fan[: -len("_input")]
+            try:
+                rpm = int((device / fan).read_text(encoding="ascii").strip())
+            except OSError as exc:
+                if access_denied(exc):
+                    return "unknown", {}
+                unreadable = True
+                points[(name, stem)] = None
+            except (UnicodeError, ValueError):
+                unreadable = True
+                points[(name, stem)] = None
+            else:
+                points[(name, stem)] = rpm
+        if not found:
+            points[(name, "fan1")] = None
+    if unreadable:
+        return "unreadable", points
+    return "ok", points
+
+
+def _fan_label(device: str, stem: str, device_count: int) -> str:
+    if device_count > 1:
+        return f"{device}:{stem}"
+    return stem
+
+
+def _format_fan_status(points: dict[tuple[str, str], int | None],
+                       thermal_root: Path, notes: list[str]) -> tuple[str, str]:
+    device_count = len({device for device, _stem in points})
+    readings = []
+    for (device, stem), rpm in points.items():
+        if not isinstance(rpm, int):
+            continue
+        readings.append((_fan_label(device, stem, device_count), rpm))
+    rpm_text = " ".join(f"{label}={rpm}" for label, rpm in readings)
+    if rpm_text:
+        rpm_text += " RPM"
+    else:
+        rpm_text = "no ACPI tachometer"
+    parts = [rpm_text]
+    parts.extend(notes)
+    parts.append(f"acpi cur_state={_acpi_fan_cur_states(thermal_root)}")
+    detail = "; ".join(parts)
+    if len(readings) < 2 or any(rpm == 0 for _label, rpm in readings):
+        return "fail", detail
+    return "pass", detail
+
+
+def _fan_reading_suspect(kind: str, points: dict[tuple[str, str], int | None]) -> bool:
+    if kind == "unknown":
+        return False
+    if kind != "ok":
+        return True
+    numeric = [rpm for rpm in points.values() if isinstance(rpm, int)]
+    if len(numeric) < 2 or any(rpm == 0 for rpm in numeric):
+        return True
+    return any(rpm is None for rpm in points.values())
+
+
+def _fan_recovery_notes(history: list[tuple[str, dict[tuple[str, str], int | None]]]) -> list[str]:
+    final_kind, final_points = history[-1]
+    if final_kind != "ok":
+        return []
+    device_count = len({device for device, _stem in final_points})
+    notes = []
+    for key, rpm in final_points.items():
+        if not isinstance(rpm, int) or rpm <= 0:
+            continue
+        zeros = 0
+        missing = 0
+        for kind, points in history[:-1]:
+            earlier = points.get(key)
+            if kind != "ok" or earlier is None or key not in points:
+                missing += 1
+            elif earlier == 0:
+                zeros += 1
+        if zeros == 0 and missing == 0:
+            continue
+        device, stem = key
+        label = _fan_label(device, stem, device_count)
+        if zeros:
+            times = "once" if zeros == 1 else f"{zeros} times"
+            notes.append(
+                f"{label} read 0 RPM {times}, recovered to {rpm} RPM "
+                "on recheck (transient)"
+            )
+        else:
+            times = "once" if missing == 1 else f"{missing} times"
+            notes.append(
+                f"{label} missing {times}, recovered to {rpm} RPM "
+                "on recheck (transient)"
+            )
+    return notes
+
+
+def _fan_status(hwmon_root: Path, thermal_root: Path) -> tuple[str, str]:
+    """ACPI tachometers under hwmon name acpi_fan, plus Fan cur_state.
+
+    This is not the dgx_ec_fan mailbox telemetry. A 0 RPM input still fails
+    even when cur_state is nonzero, including on EC 3.13.7. The numbers are
+    included on pass and fail so a one-sample 0 can be told from a stall.
+    This single pass is what the direct check uses. Health confirms a 0 or
+    a missing input before it fails; the watchdog does not.
+    """
+    kind, points = _acpi_fan_points(hwmon_root)
+    if kind == "unknown":
+        return "unknown", ""
+    if kind == "unreadable":
+        return "fail", "ACPI fan inputs are unreadable"
+    return _format_fan_status(points, thermal_root, [])
+
+
+def _fan_status_for_health(hwmon_root: Path, thermal_root: Path,
+                           sleeper) -> tuple[str, str]:
+    """Health's tachometer check. Recheck a 0 or a missing input before failing.
+
+    Up to three waits of one second. A value that comes back is a pass, with
+    a note that the first read did not hold. A miss that is still there
+    fails the same way as a single pass. This is not the watchdog path.
+    """
+    kind, points = _acpi_fan_points(hwmon_root)
+    if kind == "unknown":
+        return "unknown", ""
+    history = [(kind, points)]
+    while (
+        _fan_reading_suspect(kind, points)
+        and len(history) <= HEALTH_FAN_RECHECK_LIMIT
+    ):
+        sleeper(HEALTH_FAN_RECHECK_SECONDS)
+        kind, points = _acpi_fan_points(hwmon_root)
+        if kind == "unknown":
+            return "unknown", ""
+        history.append((kind, points))
+    if kind == "unreadable":
+        return "fail", "ACPI fan inputs are unreadable"
+    return _format_fan_status(points, thermal_root, _fan_recovery_notes(history))
+
+
+def _temperature_status(thermal_root: Path, zero_fan_celsius: float,
+                        fans_spinning: bool) -> tuple[str, str]:
+    """Readable temperature is never a health failure while the fans spin.
+
+    At or above the true-zero cutoff the line is a warning only. The 85 C
+    poweroff belongs to the watchdog's true-zero branch, not to this check.
+    """
+    try:
+        hottest = read_hottest_temperature_c(thermal_root)
+    except PermissionError:
+        return "unknown", ""
+    except (OSError, RuntimeError, ValueError):
+        return "fail", "hottest zone is not readable"
+    if fans_spinning and hottest >= zero_fan_celsius:
+        return "warn", f"hot under load, {hottest:.1f}C"
+    return "pass", f"{hottest:.1f}C"
+
+
+def collect_health_checks(thermal_root: Path, hwmon_root: Path, *,
+                          module_loaded: bool | None, service_active: str,
+                          service_enabled: str, exec_status: int | None,
+                          watchdog_active: str, soc_celsius: float,
+                          log_text: str | None, ready: str, emit,
+                          boot_load: str | None = None,
+                          service_result: str | None = None,
+                          n_restarts: int | None = None,
+                          record: tuple[int, int | None] | None = None,
+                          etc: Path | None = None,
+                          state_dir: Path | None = None,
+                          job_watch: dict[str, str] | None = None,
+                          ec_block: tuple[str, str] | None = None,
+                          sleeper=None) -> list[str]:
+    """Run every check, emitting each line before the next external call.
+
+    ``log_text`` None means read the kernel log only if a missing cooling
+    device still needs to be classified. The returned list is flag text for
+    checks that did not pass. ``ready`` is pass, fail, timeout, not
+    configured, or unknown (needs root).
+    """
+    problems: list[str] = []
+
+    def keep(name: str, status: str, detail: str = "") -> None:
+        problem = _emit_check(name, status, detail, emit)
+        if problem:
+            problems.append(problem)
+
+    if etc is None:
+        etc = Path("/etc")
+    if module_loaded is None:
+        module_loaded = _module_loaded_now()
+    if boot_load is None and module_loaded is not True:
+        boot_load = boot_load_state(etc)
+    managed_off = module_loaded is False and boot_load == "managed-off"
+    if module_loaded is None:
+        keep("module", "unknown")
+    elif boot_load == "unknown" and module_loaded is not True:
+        keep("module", "unknown")
+    elif managed_off:
+        keep("module", "note", "off (disabled by module disable)")
+    elif module_loaded:
+        keep("module", "pass")
+    elif boot_load == "enabled":
+        keep("module", "fail", "enabled but not loaded: check dmesg | grep dgx_ec")
+    else:
+        keep(
+            "module", "fail",
+            "not loaded; boot load is disabled. Run sudo dgx-fan-control module enable",
+        )
+
+    devices = floor_devices(thermal_root)
+    if log_text is None and module_loaded is True and not managed_off:
+        log_text = read_kernel_log()
+    log_text = log_text or ""
+    live_floor = latest_refused_floor(log_text)
+    foreign_log = "refusing to replace existing lower floor" in log_text
+    profile = pinned_ec_name(log_text)
+    telemetry = telemetry_hwmon_present(hwmon_root)
+    device_count = None if devices is None else len(devices)
+    recognized = telemetry_only_firmware(log_text, profile, telemetry, device_count)
+    firmware_label = profile or "EC 3.13.7"
+    verdict = floor_matches_last_set(live_floor, record)
+    if recognized:
+        keep(
+            "firmware", "note",
+            f"control unsupported ({firmware_label}, telemetry only)",
+        )
+        keep(
+            "cooling-device", "note",
+            f"n/a ({firmware_label}: telemetry only, control unsupported)",
+        )
+        keep("clock-cap", "note", CLOCK_CAP_HINT)
+    elif managed_off:
+        keep("cooling-device", "note", "skipped (module disabled by module disable)")
+    elif devices is None:
+        keep("cooling-device", "unknown")
+    elif verdict == "ours" and devices is not None and len(devices) == 1:
+        keep("cooling-device", "pass")
+    elif verdict == "ours":
+        keep(
+            "cooling-device", "fail",
+            f"owned floor matches last-set {record[0]} but the cooling device is missing",
+        )
+    elif foreign_log or (
+        exec_status == FOREIGN_FLOOR_EXIT and service_active != "active"
+        and verdict != "ours"
+    ):
+        keep("cooling-device", "fail", "probe refused a foreign lower floor")
+    elif devices is not None and len(devices) != 1:
+        if module_loaded is not True:
+            keep("cooling-device", "note", "skipped (module not loaded)")
+        elif profile not in (None, "EC 3.13.7"):
+            keep(
+                "cooling-device", "fail",
+                "loaded but no cooling device registered; check dmesg | grep dgx_ec",
+            )
+        elif telemetry is False:
+            keep("cooling-device", "fail", "telemetry missing")
+        else:
+            keep(
+                "cooling-device", "fail",
+                "loaded but no cooling device registered; check dmesg | grep dgx_ec",
+            )
+    else:
+        keep("cooling-device", "pass")
+
+    report = floor_report(live_floor, record if verdict != "none" or record else None)
+    if devices is not None and len(devices) == 1 and record is not None and live_floor is None:
+        try:
+            live_state = read_state(devices[0])
+        except (OSError, RuntimeError, ValueError):
+            live_state = None
+        if live_state == record[0]:
+            report = f"ours (matches last-set {record[0]})"
+            verdict = "ours"
+        elif live_state is not None:
+            report = f"foreign (live state {live_state}, last-set state {record[0]})"
+            verdict = "foreign"
+    if report is not None:
+        emit(f"floor: {report}")
+        if verdict == "foreign":
+            problems.append(report)
+
+    manual = daemon_stop_is_manual(
+        service_active, service_enabled, exec_status, service_result,
+    )
+    restart_loop = (
+        n_restarts is not None
+        and n_restarts >= DAEMON_RESTART_LOOP
+        and not manual
+        and exec_status != HELD_FLOOR_EXIT
+    )
+    if recognized and service_enabled == "enabled" and service_active != "active":
+        keep(
+            "daemon", "note",
+            "n/a (unsupported firmware; service enabled but idle)",
+        )
+    elif recognized:
+        keep("daemon", "note", "n/a/stopped (unsupported firmware)")
+    elif service_active == NEEDS_ROOT or service_enabled == NEEDS_ROOT:
+        keep("daemon", "unknown")
+    elif service_active == "timeout" or service_enabled == "timeout":
+        keep("daemon", "fail", "systemctl timed out")
+    elif exec_status == HELD_FLOOR_EXIT and service_active != "active":
+        if record is not None and 1 <= record[0] <= MAX_STATE:
+            detail = f"stopped (held floor {record[0]}; automatic clears it)"
+        else:
+            detail = "stopped (exit 79, held floor)"
+        keep("daemon", "note", detail)
+    elif restart_loop:
+        keep("daemon", "fail", f"restart loop (NRestarts={n_restarts})")
+    elif manual:
+        keep("daemon", "note", "stopped (manual)")
+    elif service_active == "unknown" or service_enabled == "unknown":
+        keep("daemon", "fail", "systemctl state unknown")
+    elif exec_status == FOREIGN_FLOOR_EXIT and service_active != "active":
+        keep("daemon", "note", "stopped (exit 78)")
+    elif exec_status == UNSUPPORTED_FIRMWARE_EXIT and service_active != "active":
+        keep("daemon", "note", "stopped (exit 69)")
+    elif service_active == "failed" or (
+        service_enabled == "enabled" and service_active != "active"
+    ):
+        keep("daemon", "fail", f"{DAEMON_UNIT} is not active ({service_active})")
+    else:
+        keep("daemon", "pass")
+
+    if recognized:
+        if record is not None:
+            keep("mode", "note", f"n/a (last-set {record[0]} kept)")
+        else:
+            keep("mode", "note", "n/a")
+    elif record is not None and managed_off:
+        keep("mode", "fail", f"last-set floor is {record[0]} but the module is disabled")
+    elif record is not None and verdict == "foreign":
+        keep("mode", "fail", f"manual floor state {record[0]} is not what is held")
+    elif record is not None and verdict == "ours":
+        keep("mode", "note", f"manual floor state {record[0]} (held)")
+    elif record is not None and (devices is None or len(devices) != 1):
+        keep("mode", "fail", f"manual floor state {record[0]} is not held")
+    else:
+        keep("mode", "note", "not configured")
+
+    if sleeper is None:
+        sleeper = time.sleep
+    fan_status, fan_detail = _fan_status_for_health(
+        hwmon_root, thermal_root, sleeper,
+    )
+    keep("fans", fan_status, fan_detail)
+    keep(
+        "temperature",
+        *_temperature_status(
+            thermal_root, soc_celsius, fans_spinning=(fan_status == "pass"),
+        ),
+    )
+    if job_watch is None:
+        job_watch = read_job_watch(state_dir) if state_dir is not None else {}
+    recorded = job_watch_recorded_time(job_watch)
+    watchdog_started = (
+        watchdog_active_since(state_dir) if watchdog_active == "active" else None
+    )
+    keep(
+        "progress", "note",
+        format_progress(job_watch, watchdog_started=watchdog_started),
+    )
+    progress_source = job_watch.get("source", "off")
+    if progress_source not in {"hook", "built-in", "off"}:
+        progress_source = "off"
+    if (
+        job_watch.get("stuck") == "yes"
+        and job_watch.get("unreadable") != "yes"
+        and not job_watch_predates(
+            recorded, watchdog_started,
+            present=bool(job_watch), stamped=recorded is not None,
+        )
+    ):
+        seconds = job_watch.get("no_progress_seconds", "0")
+        keep(
+            "job", "warn",
+            f"job may be stuck: no progress {seconds}s, via {progress_source}",
+        )
+    if ec_block is None:
+        try:
+            ec_block = read_ec_update_block(log_text or "")
+        except (OSError, subprocess.TimeoutExpired):
+            ec_block = ("note", "unknown (fwupd failed)")
+    ec_status, ec_detail = ec_block
+    if ec_status not in {"pass", "warn", "note"}:
+        ec_status, ec_detail = "note", "unknown (fwupd failed)"
+    keep("ec-updates", ec_status, ec_detail)
+
+    if watchdog_active == NEEDS_ROOT:
+        keep("watchdog", "unknown")
+    elif watchdog_active == "timeout":
+        keep("watchdog", "fail", "systemctl timed out")
+    elif watchdog_active != "active":
+        keep("watchdog", "fail", f"{WATCHDOG_UNIT} is not active ({watchdog_active})")
+    else:
+        keep("watchdog", "pass")
+
+    if recognized:
+        emit("ready: n/a")
+    elif ready == "not configured":
+        emit("ready: not configured")
+    elif ready == "pass":
+        emit("ready: pass")
+    elif ready == "timeout":
+        keep("ready", "fail", "READY_CHECK timed out")
+    elif ready == NEEDS_ROOT:
+        keep("ready", "unknown")
+    else:
+        keep("ready", "fail", "workload not ready")
+    return problems
+
+
+def write_health_record(path: Path, result: str, ready: str, reasons: list[str],
+                        boot_id: str | None, when: float,
+                        firmware: str | None = None) -> None:
+    lines = [
+        f"result={result}",
+        f"ready={ready}",
+        f"boot_id={boot_id or ''}",
+        f"time={when:.3f}",
+        f"version={HEALTH_RECORD_VERSION}",
+        f"code={HEALTH_CODE}",
+    ]
+    if firmware:
+        lines.append(f"firmware={firmware}")
+    if reasons:
+        lines.append("reason=" + "; ".join(reasons))
+    write_state_text(path, "\n".join(lines) + "\n")
+
+
+def _health_record_fields(text: str) -> dict[str, str]:
+    found = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            found[key.strip()] = value.strip()
+    return found
+
+
+DISMISSED_UNSUPPORTED = (
+    "none (dismissed: unsupported firmware is a deliberate state; "
+    "run `sudo dgx-fan-control health --record` to remove the file)"
+)
+
+
+def dismiss_unsupported_health_record(path: Path) -> bool:
+    """Drop a stored needs-intervention result that only names unsupported firmware.
+
+    True only when that file is gone. Plain health does not otherwise rewrite
+    it. A different reason stays. Permission denied leaves the bytes in place.
+    """
+    try:
+        fields = _health_record_fields(path.read_text(encoding="ascii"))
+    except OSError:
+        return False
+    if fields.get("result") != "needs-intervention":
+        return False
+    if not unsupported_firmware_flag_only(fields.get("reason", "")):
+        return False
+    return clear_stall_marker(path)
+
+
+def unsupported_health_record(text: str) -> bool:
+    """True when text is still a telemetry-only needs-intervention record."""
+    if text in {"none", NEEDS_ROOT}:
+        return False
+    fields = _health_record_fields(text)
+    return (
+        fields.get("result") == "needs-intervention"
+        and unsupported_firmware_flag_only(fields.get("reason", ""))
+    )
+
+
+def current_firmware_token(thermal_root: Path, hwmon_root: Path, log_text: str) -> str:
+    profile = pinned_ec_name(log_text)
+    devices = floor_devices(thermal_root)
+    count = None if devices is None else len(devices)
+    if telemetry_only_firmware(log_text, profile, telemetry_hwmon_present(hwmon_root), count):
+        return profile or "EC 3.13.7"
+    return profile or "unknown"
+
+
+def _format_record_time(raw: str) -> str:
+    """Local wall time with zone, or the stored text when it is not a timestamp."""
+    try:
+        stamp = float(raw)
+    except ValueError:
+        return raw
+    if not math.isfinite(stamp):
+        return raw
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(stamp))
+    except (OSError, OverflowError, ValueError):
+        return raw
+
+
+def format_stored_health(text: str, boot_id: str | None, firmware: str, *,
+                         current_healthy: bool = False) -> tuple[str, str | None]:
+    """The stored-health line and an optional hint line. Never rewrites the file.
+
+    Time is local. A record is stale when it is from a previous boot, other
+    firmware, an older record format, or a different installed script. A stored
+    needs-intervention result shows its reason, and when this run is healthy
+    the hint says so and what --record would also clear.
+    """
+    if text in {"none", NEEDS_ROOT}:
+        return text, None
+    fields = _health_record_fields(text)
+    parts = []
+    if "result" in fields:
+        parts.append(f"result={fields['result']}")
+    if "ready" in fields:
+        parts.append(f"ready={fields['ready']}")
+    if "time" in fields:
+        parts.append("time=" + _format_record_time(fields["time"]))
+    failed = fields.get("result") == "needs-intervention"
+    if failed and fields.get("reason"):
+        parts.append(f"reason={fields['reason']}")
+    stale = []
+    stored_boot = fields.get("boot_id")
+    if stored_boot and boot_id and stored_boot != boot_id:
+        stale.append("previous boot")
+    stored_firmware = fields.get("firmware")
+    if not stored_firmware:
+        stale.append("firmware not recorded")
+    elif firmware != "unknown" and stored_firmware != firmware:
+        stale.append("firmware changed")
+    if fields.get("version") != HEALTH_RECORD_VERSION:
+        # An older format has no comparable code=, so that is the whole reason.
+        stale.append("older record format")
+    elif fields.get("code") != HEALTH_CODE:
+        stale.append("written by a different install")
+    if stale:
+        parts.append("stale (" + ", ".join(stale) + ")")
+    line = " ".join(parts) if parts else text.splitlines()[0]
+    hint = None
+    if failed and current_healthy:
+        if stale:
+            lead = "superseded by the current healthy run"
+        elif stored_boot and boot_id and stored_boot == boot_id:
+            lead = "an earlier run this boot failed; the current run is healthy"
+        else:
+            # Boot ids were missing, so this is not known to be the same boot.
+            lead = "an earlier recorded run failed; the current run is healthy"
+        hint = f"{lead}. {RECORD_HINT}"
+    return line, hint
+
+
+def run_notify(defaults: dict[str, str], summary: str) -> None:
+    """Run DGX_FAN_NOTIFY with the summary on stdin. Empty means off."""
+    command = defaults.get("DGX_FAN_NOTIFY", "").strip()
+    if not command:
+        return
+    try:
+        subprocess.run(
+            command, shell=True, input=summary, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        LOG.warning("notify hook failed: %s", exc)
+
+
+def _stored_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return "none"
+    except OSError as exc:
+        if access_denied(exc):
+            return NEEDS_ROOT
+        return "none"
+
+
+def run_health(thermal_root: Path, hwmon_root: Path, *,
+               settle_seconds: float = 0,
+               poll_seconds: float = HEALTH_POLL_SECONDS,
+               soc_celsius: float = WATCHDOG_SOC_CELSIUS,
+               state_dir: Path | None = None,
+               etc: Path | None = None,
+               defaults: dict[str, str] | None = None,
+               monotonic=None, wall_time=None, sleeper=None,
+               observer=None, notifier=None, boot_id: str | None = None,
+               notify=None, record: bool | None = None) -> int:
+    """Print fan, thermal, and READY_CHECK results.
+
+    An interactive call uses one pass and does not write. ``settle_seconds``
+    retries until the checks pass; the boot unit passes that. Lines are
+    printed as each check finishes on a single pass. While settling, each
+    failed attempt is one journal line. Writing the health file, clearing
+    markers, broadcasting, and setting the flag happen only when ``record``
+    is true. The default records when the effective uid is 0.
+    """
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    if etc is None:
+        etc = Path("/etc")
+    defaults_denied = False
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError as exc:
+            defaults = {}
+            defaults_denied = access_denied(exc)
+    if not math.isfinite(settle_seconds) or settle_seconds < 0:
+        raise ValueError("health settle interval must be finite and non-negative")
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("health poll interval must be finite and positive")
+    if monotonic is None:
+        monotonic = time.monotonic
+    if wall_time is None:
+        wall_time = time.time
+    if sleeper is None:
+        sleeper = time.sleep
+    if notifier is None:
+        notifier = broadcast_alert
+    if notify is None:
+        notify = run_notify
+    if boot_id is None:
+        boot_id = read_boot_id()
+    if record is None:
+        record = os.geteuid() == 0
+    # Plain health does not rewrite these files. It does unlink a record whose
+    # only reason is unsupported firmware. If that unlink is denied, the
+    # bytes stay and the display treats them as dismissed.
+    dismiss_unsupported_firmware_flag(state_dir / INTERVENTION_NAME)
+    dismiss_unsupported_health_record(state_dir / HEALTH_NAME)
+    interactive = settle_seconds <= 0
+    deadline = monotonic() + settle_seconds
+    attempt = 0
+    lines: list[str] = []
+    problems: list[str] = []
+    ready = "not configured"
+    seen_log = ""
+
+    def evaluate(emit) -> list[str]:
+        nonlocal ready, seen_log
+        if observer is None:
+            active, enabled, exec_status, service_result, n_restarts = read_daemon_facts()
+            watchdog_active, _watchdog_enabled = watchdog_unit_state()
+            snapshot = {
+                "module_loaded": None,
+                "service_active": active,
+                "service_enabled": enabled,
+                "exec_status": exec_status,
+                "service_result": service_result,
+                "n_restarts": n_restarts,
+                "watchdog_active": watchdog_active,
+            }
+            log_text = None
+        else:
+            snapshot = observer()
+            log_text = snapshot.get("log_text", "")
+        if defaults_denied:
+            ready = NEEDS_ROOT
+        else:
+            ready = ready_for_work(defaults)
+        profile = pinned_ec_name(log_text or "")
+        seen_log = log_text or ""
+        record = snapshot.get("record", read_manual_record(state_dir, defaults, profile))
+        return collect_health_checks(
+            thermal_root, hwmon_root,
+            module_loaded=snapshot.get("module_loaded", None),
+            service_active=snapshot["service_active"],
+            service_enabled=snapshot["service_enabled"],
+            exec_status=snapshot.get("exec_status"),
+            watchdog_active=snapshot["watchdog_active"],
+            soc_celsius=soc_celsius,
+            log_text=log_text,
+            ready=ready,
+            emit=emit,
+            boot_load=snapshot.get("boot_load"),
+            service_result=snapshot.get("service_result"),
+            n_restarts=snapshot.get("n_restarts"),
+            record=record,
+            etc=etc,
+            state_dir=state_dir,
+            job_watch=snapshot.get("job_watch"),
+            ec_block=snapshot.get("ec_updates"),
+            sleeper=sleeper,
+        )
+
+    while True:
+        attempt += 1
+        lines = []
+        if interactive:
+            problems = evaluate(lambda line: (lines.append(line), print(line, flush=True)))
+        else:
+            problems = evaluate(lines.append)
+        if not problems or interactive or monotonic() >= deadline:
+            if problems and not interactive:
+                LOG.info("health attempt %d: %s", attempt, "; ".join(
+                    line for line in lines if not line.endswith(": pass")
+                    and line != "ready: not configured" and line != "ready: pass"
+                ))
+            break
+        failing = [
+            line for line in lines
+            if not line.endswith(": pass")
+            and line != "ready: not configured" and line != "ready: pass"
+        ]
+        LOG.info("health attempt %d: %s", attempt, "; ".join(failing))
+        sleeper(poll_seconds)
+    if not interactive:
+        for line in lines:
+            print(line, flush=True)
+    print("health: healthy" if not problems else "health: fail", flush=True)
+    when = wall_time()
+    firmware = current_firmware_token(thermal_root, hwmon_root, seen_log)
+    if any(line == "ready: n/a" for line in lines):
+        ready = "n/a"
+    health_path = state_dir / HEALTH_NAME
+    intervention_path = state_dir / INTERVENTION_NAME
+    if record:
+        try:
+            if not problems:
+                previous = pending_watchdog_reboot(state_dir, boot_id)
+                clear_stall_marker(state_dir / STALL_MARKER_NAME)
+                clear_stall_marker(intervention_path)
+                clear_stall_marker(state_dir / PREVIOUS_REBOOT_NAME)
+                write_health_record(
+                    health_path, "healthy", ready, [], boot_id, when, firmware,
+                )
+                if previous and not recovery_already_announced(state_dir, boot_id):
+                    message = "dgx-fan-control: recovered after watchdog reboot"
+                    LOG.info(message)
+                    _wall(notifier, message, "recovery notice")
+                    write_state_text(
+                        state_dir / RECOVERY_ANNOUNCED_NAME,
+                        f"boot_id={boot_id or ''}\n",
+                    )
+                    notify(defaults, message + "\n")
+                else:
+                    LOG.info("dgx-fan-control: healthy")
+            else:
+                reason = "; ".join(problems)
+                write_intervention(intervention_path, reason, boot_id, when)
+                write_health_record(
+                    health_path, "needs-intervention", ready, problems, boot_id, when,
+                    firmware,
+                )
+                message = f"dgx-fan-control: needs intervention: {reason}"
+                LOG.critical(message)
+                notify(defaults, message + "\n")
+        except OSError as exc:
+            if access_denied(exc):
+                print("recorded: no (needs root)", flush=True)
+                return 1
+            raise
+    stored_flag = _stored_text(intervention_path)
+    if stored_flag not in {"none", NEEDS_ROOT} and stored_flag.startswith("reason="):
+        stored_flag = stored_flag.split("reason=", 1)[1].split("\n", 1)[0]
+    if unsupported_firmware_flag_only(stored_flag):
+        stored_flag = DISMISSED_UNSUPPORTED
+    stored_raw = _stored_text(health_path)
+    if unsupported_health_record(stored_raw):
+        stored_health, stored_hint = DISMISSED_UNSUPPORTED, None
+    else:
+        stored_health, stored_hint = format_stored_health(
+            stored_raw, boot_id, firmware,
+            current_healthy=not problems,
+        )
+    print(f"stored needs-intervention: {stored_flag}", flush=True)
+    print(f"stored health: {stored_health}", flush=True)
+    if stored_hint:
+        print(f"stored health note: {stored_hint}", flush=True)
+    print("recorded: yes" if record else "recorded: no", flush=True)
+    # Resume only after this recording run passed, and only when the zone is
+    # still below the 80 C hook threshold. An advisory in the 70s does not
+    # block it. A phase-2 stop already recorded for this boot skips the hook
+    # inside maybe_run_acpi_resume_hook.
+    if record and not defaults_denied and not problems:
+        try:
+            hottest = read_hottest_temperature_c(thermal_root)
+        except (OSError, RuntimeError, ValueError):
+            hottest = None
+        maybe_run_acpi_resume_hook(
+            defaults, state_dir=state_dir, health_ok=True, hottest_c=hottest,
+        )
+    return 0 if not problems else 1
+
+
+def show_intervention() -> None:
+    path = STALL_MARKER_DIR / INTERVENTION_NAME
+    dismiss_unsupported_firmware_flag(path)
+    if acpi_incident_latched():
+        if acpi_protection_phase() == "ec":
+            print(
+                "ACPI incident is in EC-only monitoring: no ACPI writes, no "
+                "second reboot, and no automatic resume. A new thermal stop "
+                "can shut down if heat persists. acpi-incident-reset releases "
+                "the latch."
+            )
+        else:
+            print(
+                "ACPI thermal incident latched: ACPI writes and fan-curve startup "
+                "inhibited until acpi-incident-reset. Stock EC control is what a "
+                "reboot restores. This latch does not resume or forbid a workload."
+            )
+    banner = intervention_banner(path)
+    if banner:
+        print(banner, end="")
+
+
+def gpu_job_running(sleeper=None) -> bool | None:
+    """True when nvidia-smi lists a compute pid. None when the query fails.
+
+    None is treated as a running job so a missed query cannot reboot the machine.
+    A transient failure is retried before this returns None.
+    """
+    completed, failure = run_nvidia_smi(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        sleeper=sleeper,
+    )
+    if failure is not None:
+        remember_nvidia_smi_failure(failure[0], failure[1])
+        return None
+    clear_nvidia_smi_failure()
+    return any(line.strip() for line in (completed.stdout or "").splitlines())
+
+
+def recover_fan_stall(thermal_root: Path, *, module_loaded: bool) -> None:
+    """One repair after a true-zero stall. Never writes ACPI 0 or a level below 35.
+
+    With the module loaded, request its maximum floor through its cooling
+    device. Do not write ACPI: both paths use the same EC register.
+    """
+    if module_loaded:
+        devices = cooling_devices(thermal_root)
+        if len(devices) != 1:
+            LOG.error(
+                "fan stall: %s is loaded but there is no single cooling device; "
+                "not writing ACPI",
+                MODULE_NAME,
+            )
+            return
+        try:
+            write_state(devices[0], MAX_STATE)
+        except (OSError, RuntimeError, ValueError) as exc:
+            LOG.error(
+                "fan stall: module state %d write failed: %s", MAX_STATE, exc,
+            )
+            return
+        LOG.critical(
+            "fan stall: requested module state %d because every fan read 0 RPM; "
+            "did not write ACPI",
+            MAX_STATE,
+        )
+        return
+    try:
+        set_acpi_fans(
+            thermal_root, ACPI_MAX_LEVEL,
+            module_loaded=False, service_active="inactive", report=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        LOG.error("fan stall: ACPI level %d write failed: %s", ACPI_MAX_LEVEL, exc)
+        return
+    LOG.critical(
+        "fan stall: wrote ACPI Fan level %d because every fan read 0 RPM",
+        ACPI_MAX_LEVEL,
+    )
+
+
+def note_deferred_reboot(kind: str, detail: str, now: float, since: float | None,
+                         wall_at: float | None, max_defer: float, repeat: float,
+                         notifier, announced: bool) -> tuple[float, float | None, bool]:
+    """Journal the deferral. After max_defer, wall as well and keep waiting."""
+    if since is None:
+        since = now
+    if now - since >= max_defer:
+        message = (
+            f"{kind}: deferral limit of {max_defer:.0f}s reached; "
+            "work is still in progress; not rebooting through work"
+        )
+        due = wall_at is None or now - wall_at >= repeat
+        if due:
+            LOG.critical(message)
+            _wall(notifier, message, "deferral-limit alert")
+            wall_at = now
+        else:
+            LOG.warning(message)
+        return since, wall_at, True
+    if not announced:
+        LOG.warning("%s: deferring reboot; %s", kind, detail)
+    return since, wall_at, True
+
+
+def _wall(notifier, message: str, what: str) -> None:
+    try:
+        notifier(message)
+    except OSError:
+        LOG.warning("could not broadcast the %s", what)
+
+
+def progress_source(command: str, state: dict, busy_how: str = "") -> tuple[str, str]:
+    """Source token and the reason health prints.
+
+    A failed nvidia-smi or BUSY_CHECK still counts as busy for reboot
+    deferral. That failure is not labeled as GPU utilization. Health reads
+    this pair back from the job-watch file, so sudo and a normal user print
+    the same line.
+    """
+    if state.get("hook_failed"):
+        return "built-in", "PROGRESS_CHECK failed"
+    if command.strip():
+        return "hook", "PROGRESS_CHECK"
+    if busy_how == "nvidia-smi-failed":
+        return "unknown", gpu_sample_gap_detail()
+    if busy_how == "busy-check-failed":
+        return "off", "BUSY_CHECK failed"
+    if state.get("busy"):
+        if busy_how == "busy-check":
+            return "built-in", "BUSY_CHECK"
+        return "built-in", "GPU utilization"
+    return "off", "no job running"
+
+
+def observe_hot_job(*, now: float, fan_rpms: list[int] | None, hottest: float | None,
+                    busy: bool, defaults: dict[str, str], state_dir: Path,
+                    notifier, alert_repeat: float, zero_fan_celsius: float,
+                    stuck_seconds: float, state: dict,
+                    progress_reader=None, builtin_reader=None,
+                    busy_how: str = "") -> None:
+    """Track a hot workload. Warn only. Never reboot, power off, or kill.
+
+    Progress is sampled whenever a job is busy, so a stall that starts
+    before the machine is hot still counts. The critical line and the wall
+    alert happen only during a hot episode: fans spinning and the hottest
+    zone at or above the true-zero cutoff. The episode ends when the job
+    ends or the zone falls below that cutoff by HOT_CLEAR_HYSTERESIS_C.
+    """
+    if progress_reader is None:
+        progress_reader = read_progress_value
+    if builtin_reader is None:
+        builtin_reader = read_builtin_progress
+    spinning = (
+        fan_rpms is not None
+        and len(fan_rpms) >= 2
+        and all(rpm > 0 for rpm in fan_rpms)
+    )
+    hot = spinning and hottest is not None and hottest >= zero_fan_celsius
+    command = defaults.get("PROGRESS_CHECK", "").strip()
+    was_busy = bool(state.get("busy"))
+    episode = bool(state.get("episode"))
+
+    def publish(stuck: bool, seconds: float) -> None:
+        source, detail = progress_source(command, state, busy_how)
+        recorded_at = time.time()
+        state["source"] = source
+        state["detail"] = detail
+        state["stuck"] = stuck
+        state["recorded_at"] = recorded_at
+        write_job_watch(state_dir, source, stuck, seconds, detail, when=recorded_at)
+
+    if not busy and was_busy and (episode or state.get("saw_hot")):
+        started = state.get("episode_started")
+        peak = state.get("peak")
+        until = state.get("hot_until")
+        if not isinstance(until, float):
+            until = now
+        duration = until - started if isinstance(started, float) else 0.0
+        peak_c = peak if isinstance(peak, float) else hottest
+        LOG.info(
+            "job finished; hot for %.0fs; peak %.1fC",
+            duration, peak_c if peak_c is not None else 0.0,
+        )
+        state["episode"] = False
+        state["saw_hot"] = False
+        state["hot_until"] = None
+        state["busy"] = False
+        state["stuck"] = False
+        state["stuck_since_alert"] = None
+        state["no_progress_since"] = None
+        publish(False, 0.0)
+        return
+
+    if not busy:
+        state["busy"] = False
+        state["no_progress_since"] = None
+        state["stuck"] = False
+        state["stuck_since_alert"] = None
+        if hot and not episode:
+            state["episode"] = True
+            state["episode_started"] = now
+            state["peak"] = hottest
+            state["hot_until"] = None
+        elif episode and (
+            hottest is None or hottest < zero_fan_celsius - HOT_CLEAR_HYSTERESIS_C
+        ):
+            state["episode"] = False
+            if state.get("hot_until") is None:
+                state["hot_until"] = now
+        elif episode and hottest is not None:
+            state["peak"] = max(state.get("peak") or hottest, hottest)
+        publish(False, 0.0)
+        return
+
+    state["busy"] = True
+    progressed = False
+    source = "built-in"
+    quiet_for = 0.0
+    if command:
+        value = progress_reader(command)
+        if value is None:
+            if not state.get("hook_failed"):
+                LOG.warning(
+                    "PROGRESS_CHECK failed; using the built-in progress heuristic",
+                )
+                state["hook_failed"] = True
+            source = "built-in"
+        else:
+            state["hook_failed"] = False
+            source = "hook"
+            previous = state.get("progress_value")
+            if isinstance(previous, float) and value > previous:
+                progressed = True
+            state["progress_value"] = value
+            if progressed:
+                state["no_progress_since"] = now
+                state["stuck"] = False
+                state["stuck_since_alert"] = None
+            elif state.get("no_progress_since") is None:
+                state["no_progress_since"] = now
+            quiet_for = now - state["no_progress_since"]
+    if source == "built-in":
+        util, ticks = builtin_reader()
+        previous_ticks = state.get("cpu_ticks") if isinstance(state.get("cpu_ticks"), dict) else {}
+        util_idle, cpu_flat = builtin_signals_stuck(util, ticks, previous_ticks)
+        state["cpu_ticks"] = ticks or {}
+        if util is not None and not util_idle:
+            state["util_flat_since"] = None
+        elif util_idle and state.get("util_flat_since") is None:
+            state["util_flat_since"] = now
+        if ticks is not None and previous_ticks and not cpu_flat:
+            state["cpu_flat_since"] = None
+        elif cpu_flat and state.get("cpu_flat_since") is None:
+            state["cpu_flat_since"] = now
+        held = 0.0
+        if util_idle and isinstance(state.get("util_flat_since"), float):
+            held = max(held, now - state["util_flat_since"])
+        if cpu_flat and isinstance(state.get("cpu_flat_since"), float):
+            held = max(held, now - state["cpu_flat_since"])
+        quiet_for = held
+        progressed = held == 0.0 and (
+            (util is not None and not util_idle)
+            or bool(previous_ticks and ticks is not None and not cpu_flat)
+        )
+        if progressed:
+            state["stuck"] = False
+            state["stuck_since_alert"] = None
+
+    if hot and not episode:
+        state["episode"] = True
+        state["episode_started"] = now
+        state["peak"] = hottest
+        state["hot_until"] = None
+        episode = True
+    if hot:
+        state["saw_hot"] = True
+    elif episode and hottest is not None and hottest < zero_fan_celsius - HOT_CLEAR_HYSTERESIS_C:
+        state["episode"] = False
+        if state.get("hot_until") is None:
+            state["hot_until"] = now
+        episode = False
+    elif episode and hottest is not None:
+        state["peak"] = max(state.get("peak") or hottest, hottest)
+
+    stuck = bool(episode and not progressed and quiet_for >= stuck_seconds)
+    if stuck and not state.get("stuck"):
+        LOG.critical(
+            "job may be stuck; no progress for %.0fs via %s; hottest %.1fC",
+            quiet_for, source, hottest if hottest is not None else 0.0,
+        )
+        _wall(
+            notifier,
+            f"dgx-fan-control: job may be stuck; no progress for {quiet_for:.0f}s via {source}",
+            "stuck-job alert",
+        )
+        state["stuck_since_alert"] = now
+    elif stuck:
+        last = state.get("stuck_since_alert")
+        if isinstance(last, float) and now - last >= alert_repeat:
+            _wall(
+                notifier,
+                f"dgx-fan-control: job may be stuck; no progress for {quiet_for:.0f}s via {source}",
+                "stuck-job alert",
+            )
+            state["stuck_since_alert"] = now
+    state["stuck"] = stuck
+    publish(stuck, quiet_for)
+
+
+def run_watchdog(thermal_root: Path, hwmon_root: Path, *,
+                 poll_seconds: float = WATCHDOG_POLL_SECONDS,
+                 zero_seconds: float = WATCHDOG_ZERO_SECONDS,
+                 stall_seconds: float = WATCHDOG_STALL_SECONDS,
+                 reboot_seconds: float = WATCHDOG_REBOOT_SECONDS,
+                 zero_fan_celsius: float | None = None,
+                 soc_celsius: float | None = None,
+                 alert_repeat_seconds: float = WATCHDOG_ALERT_REPEAT_SECONDS,
+                 nonzero_clear_seconds: float = WATCHDOG_NONZERO_CLEAR_SECONDS,
+                 action: str = WATCHDOG_DEFAULT_ACTION,
+                 reboot_action: str = WATCHDOG_REBOOT_ACTION,
+                 max_defer_seconds: float = WATCHDOG_MAX_DEFER_SECONDS,
+                 stuck_seconds: float = STUCK_SECONDS,
+                 monotonic=None, wall_time=None, runner=None, unit_state=None,
+                 notifier=None, gpu_jobs=None, module_loaded=None,
+                 progress_reader=None, builtin_reader=None,
+                 marker_path: Path | None = None,
+                 boot_id: str | None = None,
+                 defaults: dict[str, str] | None = None) -> int:
+    """Watch ACPI fans. A true zero or a foreign floor can reboot once.
+
+    A foreign floor skips the repair because those fans are already high.
+    The next boot with the same floor records needs-intervention and does
+    not reboot or power off. ``zero_seconds`` remains accepted so older
+    invocations still parse. MAX_DEFER_SECONDS in the defaults file, when
+    set, overrides ``max_defer_seconds``.
+    """
+    del zero_seconds  # Hot shutdown now follows the hottest zone, not a second hold.
+    if zero_fan_celsius is None:
+        zero_fan_celsius = (
+            soc_celsius if soc_celsius is not None else WATCHDOG_ZERO_FAN_CELSIUS
+        )
+    if not math.isfinite(poll_seconds) or poll_seconds <= 0:
+        raise ValueError("poll interval must be finite and positive")
+    if not math.isfinite(stall_seconds) or stall_seconds < 0:
+        raise ValueError("stall interval must be finite and non-negative")
+    if not math.isfinite(reboot_seconds) or reboot_seconds < 0:
+        raise ValueError("reboot interval must be finite and non-negative")
+    if not math.isfinite(zero_fan_celsius):
+        raise ValueError("true-zero poweroff temperature must be finite")
+    if not math.isfinite(alert_repeat_seconds) or alert_repeat_seconds < 0:
+        raise ValueError("alert repeat interval must be finite and non-negative")
+    if not math.isfinite(max_defer_seconds) or max_defer_seconds < 0:
+        raise ValueError("maximum deferral must be finite and non-negative")
+    if monotonic is None:
+        monotonic = time.monotonic
+    if wall_time is None:
+        wall_time = time.time
+    if runner is None:
+        runner = run_watchdog_action
+    if unit_state is None:
+        unit_state = read_daemon_facts
+    if notifier is None:
+        notifier = broadcast_alert
+    if gpu_jobs is None:
+        gpu_jobs = gpu_job_running
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            LOG.warning("could not read %s; BUSY_CHECK is unset", NOTIFY_DEFAULT)
+            defaults = {}
+    max_defer_seconds = configured_float(
+        defaults, "MAX_DEFER_SECONDS", max_defer_seconds,
+    )
+    stuck_seconds = configured_float(defaults, "STUCK_SECONDS", stuck_seconds)
+    if not math.isfinite(stuck_seconds) or stuck_seconds < 0:
+        raise ValueError("stuck interval must be finite and non-negative")
+    if marker_path is None:
+        marker_path = STALL_MARKER_DIR / STALL_MARKER_NAME
+    try:
+        write_state_text(
+            marker_path.parent / WATCHDOG_STARTED_NAME,
+            f"time={wall_time():.3f}\n",
+        )
+    except OSError:
+        pass
+    dismiss_unsupported_firmware_flag(marker_path.parent / INTERVENTION_NAME)
+    if boot_id is None:
+        boot_id = read_boot_id()
+    stop_requested = Event()
+
+    def request_stop(signum: int, frame: object) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    LOG.critical(
+        "fan-stall watchdog watching ACPI fans and the hottest thermal zone; "
+        "0 RPM on every fan for more than %.0fs alerts and attempts a repair; "
+        "still stopped after %.0fs reboots when no work is in progress; "
+        "a true zero powers off at %.0fC. Spinning fans are not powered off "
+        "for temperature unless an ACPI hold has armed thermal escalation",
+        stall_seconds, reboot_seconds, zero_fan_celsius,
+    )
+    zero_since: float | None = None
+    nonzero_since: float | None = None
+    announced_shortage = False
+    last_daemon_wall: float | None = None
+    last_daemon_state: tuple | None = None
+    last_stall_wall: float | None = None
+    stall_repair_done = False
+    reboot_requested = False
+    deferred_logged = False
+    smi_warned = False
+    gpu_grace_noted = False
+    job_state: dict = {}
+    started_mono = monotonic()
+    LOG.info(
+        "hot-under-load tracking warns after %.0fs without progress; "
+        "it does not stop a job, reboot, or power off",
+        stuck_seconds,
+    )
+    reported_unsupported = False
+    reported_held_floor = False
+    foreign_walled = False
+    manual_stop_logged = False
+    foreign_since: float | None = None
+    foreign_deferred = False
+    foreign_intervened = False
+    foreign_defer_since: float | None = None
+    foreign_defer_wall: float | None = None
+    zero_defer_since: float | None = None
+    zero_defer_wall: float | None = None
+    last_observed_c: float | None = None
+    last_observed_at: float | None = None
+
+    def note_observed_rise(hottest: float | None, when: float) -> None:
+        """Journal a fast rise. This does not power off or reboot."""
+        nonlocal last_observed_c, last_observed_at
+        if hottest is None:
+            return
+        if (
+            last_observed_c is not None
+            and last_observed_at is not None
+            and when > last_observed_at
+        ):
+            elapsed = when - last_observed_at
+            rate = (hottest - last_observed_c) / elapsed
+            if rate >= OBSERVED_RISE_C_PER_S:
+                LOG.warning(
+                    "observational: hottest zone rose %.1fC in %.1fs "
+                    "(%.1fC/s). No action. Userspace polling cannot beat a "
+                    "rise this fast to the critical trip",
+                    hottest - last_observed_c, elapsed, rate,
+                )
+        last_observed_c = hottest
+        last_observed_at = when
+
+    def sample_work(now: float, fan_rpms: list[int] | None,
+                    hottest: float | None) -> tuple[bool, str]:
+        """GPU sample for this poll, after the startup grace.
+
+        During the grace this does not call nvidia-smi, BUSY_CHECK, or
+        PROGRESS_CHECK, and it does not replace the previous job-watch file.
+        The caller still treats work as in progress so a reboot waits.
+        """
+        nonlocal smi_warned, gpu_grace_noted
+        if now - started_mono < GPU_SAMPLE_GRACE_SECONDS:
+            if not gpu_grace_noted:
+                LOG.info(
+                    "delaying the first GPU sample until %.0fs after start "
+                    "so a restart does not record a miss",
+                    GPU_SAMPLE_GRACE_SECONDS,
+                )
+                gpu_grace_noted = True
+            return True, "startup-grace"
+        with probe_budget():
+            busy, how = work_is_in_progress(defaults, gpu_jobs)
+            if how == "nvidia-smi-failed" and not smi_warned:
+                LOG.warning(
+                    "%s; treating a GPU job as running", gpu_sample_gap_detail(),
+                )
+                smi_warned = True
+            if how == "busy-check-failed" and not smi_warned:
+                LOG.warning("BUSY_CHECK failed; treating work as in progress")
+                smi_warned = True
+            observe_hot_job(
+                now=now, fan_rpms=fan_rpms, hottest=hottest, busy=busy,
+                defaults=defaults, state_dir=marker_path.parent, notifier=notifier,
+                alert_repeat=alert_repeat_seconds, zero_fan_celsius=zero_fan_celsius,
+                stuck_seconds=stuck_seconds, state=job_state,
+                progress_reader=progress_reader, builtin_reader=builtin_reader,
+                busy_how=how,
+            )
+            return busy, how
+
+    try:
+        acpi_guard = AcpiThermalGuard(defaults)
+    except (ValueError, TypeError) as exc:
+        LOG.critical("invalid ACPI thermal configuration (%s); using safe defaults for existing holds", exc)
+        acpi_guard = AcpiThermalGuard({})
+    while not stop_requested.is_set():
+        try:
+            poll_acpi_thermal(acpi_guard, thermal_root, hwmon_root, monotonic(), zero_fan_celsius)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # The sample did not finish. Time during this fault is not
+            # continuous heat. The workload stage and the incident latch stay.
+            acpi_guard.clear_poweroff_clock()
+            LOG.critical(
+                "ACPI thermal observation failed: %s; poweroff interval "
+                "cleared; preserving true-zero monitoring, the incident "
+                "latch, and the workload stage",
+                exc,
+            )
+        active_state, enabled_state, exec_status, unit_result, n_restarts = (
+            split_unit_state(unit_state())
+        )
+        if exec_status == FOREIGN_FLOOR_EXIT:
+            now = monotonic()
+            if foreign_since is None:
+                foreign_since = now
+            held = now - foreign_since
+            message = (
+                "dgx-fan-control: probe refused a foreign lower floor; "
+                "a reboot clears the ACPI floor"
+            )
+            if not foreign_walled:
+                LOG.critical(message)
+                _wall(notifier, message, "foreign-floor alert")
+                foreign_walled = True
+            else:
+                LOG.info(message)
+            try:
+                hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                hottest = None
+            note_observed_rise(hottest, now)
+            # Reboot can wait on this sample. The budget keeps it from
+            # stretching the next iteration. The startup grace skips it.
+            try:
+                foreign_rpms = read_named_fan_rpms(hwmon_root)
+            except (OSError, UnicodeError, ValueError, RuntimeError):
+                foreign_rpms = None
+            busy, busy_how = sample_work(now, foreign_rpms, hottest)
+            if (busy_how != "startup-grace" and held >= reboot_seconds
+                    and not acpi_incident_latched()):
+                marker = read_stall_marker(marker_path)
+                previous_boot = (
+                    marker is not None and boot_id is not None and marker[0] != boot_id
+                )
+                if busy:
+                    detail = (
+                        "a GPU job is running"
+                        if busy_how.startswith("nvidia-smi")
+                        else "BUSY_CHECK reports work in progress"
+                    )
+                    foreign_defer_since, foreign_defer_wall, foreign_deferred = (
+                        note_deferred_reboot(
+                            "foreign floor", detail, now, foreign_defer_since,
+                            foreign_defer_wall, max_defer_seconds,
+                            alert_repeat_seconds, notifier, foreign_deferred,
+                        )
+                    )
+                elif previous_boot or boot_id is None:
+                    reason = (
+                        "foreign floor remains after a watchdog reboot; "
+                        "fans are held high; not rebooting again"
+                    )
+                    if previous_boot:
+                        remember_previous_reboot(marker_path.parent, boot_id, marker)
+                    if not foreign_intervened:
+                        write_intervention(
+                            marker_path.parent / INTERVENTION_NAME,
+                            reason, boot_id, wall_time(),
+                        )
+                        LOG.critical("dgx-fan-control: needs intervention: %s", reason)
+                        foreign_intervened = True
+                    else:
+                        LOG.info("dgx-fan-control: needs intervention: %s", reason)
+                elif reboot_requested or (
+                    marker is not None and boot_id is not None and marker[0] == boot_id
+                ):
+                    LOG.info(
+                        "foreign floor: reboot already requested this boot; "
+                        "not requesting another",
+                    )
+                else:
+                    write_stall_marker(
+                        marker_path, boot_id, wall_time(), reason="foreign-floor",
+                    )
+                    reboot_requested = True
+                    idle = (
+                        "no GPU job" if busy_how.startswith("nvidia-smi")
+                        else "no work in progress"
+                    )
+                    LOG.critical(
+                        "foreign floor: %s; a reboot clears the ACPI floor; "
+                        "running %s",
+                        idle, reboot_action,
+                    )
+                    status = runner(reboot_action)
+                    if status != 0:
+                        LOG.critical("fan-stall action exited %s", status)
+                        return status if isinstance(status, int) else 1
+                    return 0
+            if stop_requested.is_set():
+                break
+            stop_requested.wait(poll_seconds)
+            continue
+        foreign_since = None
+        # A stall is measured fan RPM only. Cooling state 0 is not a stall.
+        manual_stop = daemon_stop_is_manual(
+            active_state, enabled_state, exec_status, unit_result,
+        )
+        device_count = floor_devices(thermal_root)
+        firmware_unsupported = telemetry_only_firmware(
+            "", None, telemetry_hwmon_present(hwmon_root),
+            None if device_count is None else len(device_count),
+        )
+        restart_loop = (
+            n_restarts is not None
+            and n_restarts >= DAEMON_RESTART_LOOP
+            and not manual_stop
+            and active_state == "active"
+            and not firmware_unsupported
+            and exec_status != UNSUPPORTED_FIRMWARE_EXIT
+            and exec_status != HELD_FLOOR_EXIT
+        )
+        if exec_status == HELD_FLOOR_EXIT:
+            if not reported_held_floor:
+                LOG.info(
+                    "dgx-fan-control: %s refused to start while a floor is "
+                    "held (active=%s enabled=%s exit=%s); not alerting",
+                    DAEMON_UNIT, active_state, enabled_state, exec_status,
+                )
+                reported_held_floor = True
+            last_daemon_wall = None
+            last_daemon_state = None
+        elif daemon_needs_alarm(
+            active_state, enabled_state, exec_status, unit_result, n_restarts,
+            firmware_unsupported=firmware_unsupported,
+        ):
+            now = monotonic()
+            state_key = (active_state, enabled_state, exec_status, n_restarts)
+            changed = state_key != last_daemon_state
+            if restart_loop:
+                message = (
+                    f"dgx-fan-control: {DAEMON_UNIT} restart loop "
+                    f"(NRestarts={n_restarts})"
+                )
+            else:
+                message = (
+                    f"dgx-fan-control: {DAEMON_UNIT} is not active "
+                    f"({active_state}, {enabled_state})"
+                )
+            LOG.warning(message)
+            repeat_due = (
+                last_daemon_wall is None
+                or now - last_daemon_wall >= alert_repeat_seconds
+            )
+            if changed or repeat_due:
+                _wall(notifier, message, "fan-daemon alert")
+                last_daemon_wall = now
+            last_daemon_state = state_key
+            manual_stop_logged = False
+        elif manual_stop:
+            if not manual_stop_logged:
+                LOG.info(
+                    "dgx-fan-control: %s is stopped (manual); not alerting",
+                    DAEMON_UNIT,
+                )
+                manual_stop_logged = True
+            last_daemon_wall = None
+            last_daemon_state = None
+        else:
+            last_daemon_wall = None
+            last_daemon_state = None
+            if ((exec_status == UNSUPPORTED_FIRMWARE_EXIT or firmware_unsupported)
+                    and not reported_unsupported):
+                LOG.warning(
+                    "dgx-fan-control: %s is not a fault on unsupported "
+                    "firmware (active=%s enabled=%s exit=%s); not alerting",
+                    DAEMON_UNIT, active_state, enabled_state, exec_status,
+                )
+                reported_unsupported = True
+        try:
+            fan_rpms = read_named_fan_rpms(hwmon_root)
+        except (OSError, UnicodeError, ValueError, RuntimeError):
+            LOG.error("fan-stall observation failed; not treating it as a stall")
+            fan_rpms = None
+        if fan_rpms is None or len(fan_rpms) < 2:
+            if fan_rpms is not None and not announced_shortage:
+                LOG.warning(
+                    "fan-stall watchdog sees %d ACPI fan input(s); "
+                    "it will not trip until two are present",
+                    len(fan_rpms),
+                )
+                announced_shortage = True
+            zero_since = None
+            nonzero_since = None
+            last_stall_wall = None
+            stall_repair_done = False
+            deferred_logged = False
+        elif any(rpm != 0 for rpm in fan_rpms):
+            announced_shortage = False
+            now = monotonic()
+            if nonzero_since is None:
+                nonzero_since = now
+            elif now - nonzero_since >= nonzero_clear_seconds:
+                marker = read_stall_marker(marker_path)
+                if marker is not None:
+                    remember_previous_reboot(marker_path.parent, boot_id, marker)
+                    clear_stall_marker(marker_path)
+                    LOG.info(
+                        "fan stall: fans have been nonzero for %.0fs; "
+                        "cleared the true-zero reboot marker",
+                        nonzero_clear_seconds,
+                    )
+            zero_since = None
+            last_stall_wall = None
+            stall_repair_done = False
+            reboot_requested = False
+            deferred_logged = False
+            try:
+                spinning_hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                spinning_hottest = None
+            note_observed_rise(spinning_hottest, now)
+            # Fans are spinning, so this sample is not on the poweroff path.
+            # The budget is what keeps it from delaying the next fan read.
+            # The startup grace skips it entirely.
+            sample_work(now, fan_rpms, spinning_hottest)
+        else:
+            announced_shortage = False
+            nonzero_since = None
+            now = monotonic()
+            if zero_since is None:
+                zero_since = now
+            held = now - zero_since
+            LOG.warning(
+                "fan stall: ACPI fans still read %s RPM for %.1fs",
+                fan_rpms, held,
+            )
+            try:
+                hottest = read_hottest_temperature_c(thermal_root)
+            except (OSError, RuntimeError, ValueError):
+                hottest = None
+                LOG.error(
+                    "fan stall: hottest zone unreadable; not using temperature",
+                )
+            note_observed_rise(hottest, now)
+            # Poweroff does not depend on whether work is running. Sample
+            # the GPU only after this decision so a hung nvidia-smi cannot
+            # delay it, and so the temperature is not stale from before
+            # that delay.
+            if hottest is not None and hottest >= zero_fan_celsius:
+                # Last job-watch sample only. No nvidia-smi or other probe.
+                try:
+                    recorded = last_recorded_work_note(job_state, marker_path.parent)
+                except Exception:
+                    recorded = "not sampled now; no earlier work-state record"
+                LOG.critical(
+                    "fan stall: hottest zone is %.1fC; running %s (%s)",
+                    hottest, action, recorded,
+                )
+                status = runner(action)
+                if status != 0:
+                    LOG.critical("fan-stall action exited %s", status)
+                    return status if isinstance(status, int) else 1
+                return 0
+            if held > stall_seconds:
+                repeat_due = (
+                    last_stall_wall is None
+                    or now - last_stall_wall >= alert_repeat_seconds
+                )
+                if last_stall_wall is None or repeat_due:
+                    message = (
+                        f"dgx-fan-control: ACPI fans read {fan_rpms} RPM "
+                        f"for {held:.1f}s"
+                        + (f" at {hottest:.1f}C" if hottest is not None else "")
+                        + "; fans are stopped"
+                    )
+                    LOG.critical(message)
+                    _wall(notifier, message, "fan-stall alert")
+                    last_stall_wall = now
+                if not stall_repair_done:
+                    stall_repair_done = True
+                    loaded = module_is_loaded() if module_loaded is None else module_loaded
+                    LOG.info(
+                        "fan stall: attempting repair; module loaded=%s",
+                        loaded,
+                    )
+                    recover_fan_stall(thermal_root, module_loaded=loaded)
+            busy, busy_how = sample_work(now, fan_rpms, hottest)
+            if (busy_how != "startup-grace" and held >= reboot_seconds
+                    and not acpi_incident_latched()):
+                if busy:
+                    detail = (
+                        "a GPU job is running and the fans are still at 0 RPM"
+                        if busy_how.startswith("nvidia-smi")
+                        else "BUSY_CHECK reports work in progress"
+                    )
+                    zero_defer_since, zero_defer_wall, deferred_logged = (
+                        note_deferred_reboot(
+                            "fan stall", detail, now, zero_defer_since,
+                            zero_defer_wall, max_defer_seconds,
+                            alert_repeat_seconds, notifier, deferred_logged,
+                        )
+                    )
+                else:
+                    marker = read_stall_marker(marker_path)
+                    if marker is not None and boot_id is not None and marker[0] != boot_id:
+                        LOG.critical(
+                            "fan stall: already rebooted once for a true-zero "
+                            "stall; running %s",
+                            action,
+                        )
+                        status = runner(action)
+                        if status != 0:
+                            LOG.critical("fan-stall action exited %s", status)
+                            return status if isinstance(status, int) else 1
+                        return 0
+                    if reboot_requested or (
+                        marker is not None and boot_id is not None and marker[0] == boot_id
+                    ):
+                        LOG.info(
+                            "fan stall: reboot already requested this boot; "
+                            "not requesting another",
+                        )
+                    else:
+                        if boot_id is None:
+                            LOG.critical(
+                                "fan stall: boot id is unreadable, so a reboot "
+                                "cannot be limited to one; running %s",
+                                action,
+                            )
+                            status = runner(action)
+                            if status != 0:
+                                LOG.critical("fan-stall action exited %s", status)
+                                return status if isinstance(status, int) else 1
+                            return 0
+                        write_stall_marker(
+                            marker_path, boot_id, wall_time(), reason="true-zero",
+                        )
+                        reboot_requested = True
+                        idle = (
+                            "no GPU job" if busy_how.startswith("nvidia-smi")
+                            else "no work in progress"
+                        )
+                        LOG.critical(
+                            "fan stall: %s and fans still at 0 RPM "
+                            "after %.1fs; running %s",
+                            idle, held, reboot_action,
+                        )
+                        status = runner(reboot_action)
+                        if status != 0:
+                            LOG.critical("fan-stall action exited %s", status)
+                            return status if isinstance(status, int) else 1
+                        return 0
+        if stop_requested.is_set():
+            break
+        stop_requested.wait(poll_seconds)
+    LOG.info("fan-stall watchdog stopped")
+    return 0
+
+
+def missing_cooling_reason(module_loaded: bool, log_text: str,
+                           record: tuple[int, int | None] | None = None) -> str:
+    """Why status has no dgx_ec_fan_floor device. Never the bare count 'found 0'."""
+    if not module_loaded:
+        return (
+            "no dgx_ec_fan_floor cooling device: kernel module "
+            "dgx_ec_fan_control is not loaded"
+        )
+    if "refusing to replace existing lower floor" in log_text:
+        live = latest_refused_floor(log_text)
+        if floor_matches_last_set(live, record) == "ours" and record is not None:
+            return (
+                "no dgx_ec_fan_floor cooling device: existing floor matches "
+                f"last-set {record[0]}. Probe did not adopt it. Reload the "
+                "module so owned_floor is passed. This is not a foreign floor."
+            )
+        return (
+            "no dgx_ec_fan_floor cooling device: probe refused a foreign lower floor. "
+            "ACPI cur_state writes the same EC register. This driver will not clear it. "
+            "a reboot clears the ACPI floor. "
+            "Fans stay high until then; do not write ACPI level 0."
+        )
+    if "EC mailbox did not complete" in log_text:
+        return (
+            "no dgx_ec_fan_floor cooling device: the EC mailbox did not complete. "
+            "On EC 3.5.8 the ACPI Fan device is the fallback when that happens. "
+            "Do not write an ACPI level below 35; level 0 stops both fans."
+        )
+    return "no dgx_ec_fan_floor cooling device: probe did not register one"
+
+
+def require_control(thermal_root: Path, hwmon_root: Path, *,
+                    module_loaded: bool | None = None,
+                    log_text: str | None = None,
+                    record: tuple[int, int | None] | None = None) -> Path:
+    matches = cooling_devices(thermal_root)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"expected one {COOLING_DEVICE_TYPE!r} cooling device, found {len(matches)}"
+        )
+    if find_fan_hwmon(hwmon_root) is not None:
+        raise ControlUnsupported(CONTROL_UNSUPPORTED)
+    if module_loaded is None:
+        module_loaded = module_is_loaded()
+    if log_text is None:
+        log_text = read_kernel_log()
+    if record is None and "refusing to replace existing lower floor" in log_text:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
+        record = read_manual_record(STALL_MARKER_DIR, defaults, pinned_ec_name(log_text))
+    reason = missing_cooling_reason(module_loaded, log_text, record)
+    if "probe refused a foreign lower floor" in reason:
+        raise ForeignFloor(reason)
+    raise RuntimeError(reason)
+
+
+def read_hottest_temperature_c(thermal_root: Path) -> float:
+    names = scandir_names(thermal_root)
+    if names is None:
+        raise PermissionError(errno.EACCES, "thermal zones are not readable")
+    readings = []
+    denied = False
+    for name in names:
+        if not name.startswith("thermal_zone"):
+            continue
+        path = thermal_root / name / "temp"
         try:
             millidegrees = int(path.read_text(encoding="ascii").strip())
-        except (OSError, UnicodeError, ValueError):
+        except OSError as exc:
+            if access_denied(exc):
+                denied = True
+            continue
+        except (UnicodeError, ValueError):
             continue
         if 0 < millidegrees <= 200_000:
             readings.append(millidegrees / 1000.0)
     if not readings:
+        if denied:
+            raise PermissionError(errno.EACCES, "thermal zones are not readable")
         raise RuntimeError("no valid kernel thermal-zone readings are available")
     return max(readings)
 
 
-def curve_state(temperature_c: float) -> int:
+def curve_name(explicit: str | None = None) -> str:
+    raw = explicit if explicit else os.environ.get("DGX_FAN_CURVE", "performance")
+    name = raw.strip().lower()
+    if name not in CURVES:
+        raise ValueError(f"unknown fan curve {raw!r}; choose performance or quiet")
+    return name
+
+
+def curve_state(temperature_c: float, curve: tuple = PERFORMANCE_CURVE) -> int:
     if not math.isfinite(temperature_c) or temperature_c <= 0:
         raise ValueError("temperature must be finite and positive")
     state = 0
-    for threshold_c, threshold_state in PERFORMANCE_CURVE:
+    for threshold_c, threshold_state in curve:
+        if threshold_state < MIN_CURVE_STATE:
+            raise ValueError("performance curve requested state 0")
         if temperature_c < threshold_c:
             break
         state = threshold_state
-    return state
+    return max(state, MIN_CURVE_STATE)
 
 
-def next_state(current: int, filtered_temperature_c: float) -> int:
+def retry_delay_seconds(exc: OSError, failures: int) -> float:
+    if exc.errno == errno.EPROTO:
+        return RECOVERY_COOLDOWN_SECONDS
+    return RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
+
+
+def next_state(current: int, filtered_temperature_c: float,
+               curve: tuple = PERFORMANCE_CURVE) -> int:
     """Rate-limit the curve, with prompt increases and slow hysteretic falls."""
     if not 0 <= current <= MAX_STATE:
         raise ValueError("current cooling state is outside the driver contract")
-    rising_target = curve_state(filtered_temperature_c)
+    rising_target = curve_state(filtered_temperature_c, curve)
     if rising_target > current:
-        return min(rising_target, current + UP_STATES_PER_POLL)
-    falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C)
-    if falling_target < current:
-        return max(falling_target, current - DOWN_STATES_PER_POLL)
-    return current
+        chosen = min(rising_target, current + UP_STATES_PER_POLL)
+    else:
+        falling_target = curve_state(filtered_temperature_c + DOWN_HYSTERESIS_C, curve)
+        if falling_target < current:
+            chosen = max(falling_target, current - DOWN_STATES_PER_POLL)
+        else:
+            chosen = current
+    return max(chosen, MIN_CURVE_STATE)
+
+
+def read_kernel_log() -> str:
+    try:
+        completed = subprocess.run(
+            ["dmesg"], check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired, OfflineGuardError):
+        return ""
+    return completed.stdout or ""
+
+
+def latest_floor_mismatch(log_text: str) -> tuple[int | None, int | None]:
+    """RPM pair from the newest ownership-mismatch line, if the log has one."""
+    observed = expected = None
+    for match in re.finditer(
+        r"floor ownership mismatch: observed=0x[0-9a-fA-F]+ \((\d+) RPM\)"
+        r"(?: confirmed=0x[0-9a-fA-F]+ \((\d+) RPM\))?",
+        log_text,
+    ):
+        observed = int(match.group(1))
+        expected = int(match.group(2)) if match.group(2) else None
+    return observed, expected
+
+
+def floor_changed_message(observed: int | None = None,
+                          expected: int | None = None) -> str:
+    """ESTALE (-116) means the floor value changed, not that the mailbox timed out."""
+    if observed is not None and expected is not None:
+        numbers = f"observed {observed} RPM, expected {expected}"
+    elif observed is not None:
+        numbers = f"observed {observed} RPM"
+    else:
+        numbers = "the EC floor does not match the floor this driver set"
+    if observed == 4350:
+        owner = "4350 RPM is 0x10fe, ACPI level 100."
+    else:
+        owner = "This value is not proof of which client owns the floor."
+    return (
+        f"floor was changed outside this driver ({numbers}); -ESTALE is an ownership change, not a mailbox timeout. "
+        f"{owner} "
+        "This driver will not clear a floor it does not own. "
+        "Reboot restores the EC curve. "
+        "Do not write ACPI level 0; it stops both fans and does not clear the floor."
+    )
+
+
+def normalize_cooling_error(exc: OSError) -> Exception:
+    """Turn a sysfs ESTALE into one sentence. Other OSErrors pass through."""
+    if exc.errno != errno.ESTALE:
+        return exc
+    observed, expected = latest_floor_mismatch(read_kernel_log())
+    return RuntimeError(floor_changed_message(observed, expected))
 
 
 def read_state(cooling_device: Path) -> int:
-    state = int((cooling_device / "cur_state").read_text(encoding="ascii").strip())
-    maximum = int((cooling_device / "max_state").read_text(encoding="ascii").strip())
+    try:
+        state = int((cooling_device / "cur_state").read_text(encoding="ascii").strip())
+        maximum = int((cooling_device / "max_state").read_text(encoding="ascii").strip())
+    except OSError as exc:
+        raise normalize_cooling_error(exc) from None
     if maximum != MAX_STATE or not 0 <= state <= maximum:
         raise RuntimeError(
             f"unexpected cooling-device contract: state={state} max_state={maximum}"
@@ -108,16 +3842,76 @@ def read_state(cooling_device: Path) -> int:
 def write_state(cooling_device: Path, state: int) -> None:
     if not 0 <= state <= MAX_STATE:
         raise ValueError(f"state must be between 0 and {MAX_STATE}")
-    (cooling_device / "cur_state").write_text(f"{state}\n", encoding="ascii")
+    refuse_host_write(cooling_device)
+    try:
+        (cooling_device / "cur_state").write_text(f"{state}\n", encoding="ascii")
+    except OSError as exc:
+        raise normalize_cooling_error(exc) from None
     observed = read_state(cooling_device)
     if observed != state:
         raise RuntimeError(f"cooling-state readback mismatch: wrote {state}, read {observed}")
 
 
-def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
+def format_cooling_status(state: int, hottest_c: float) -> str:
+    """State 0 is the EC curve. The label says so, so it does not read as fans off."""
+    text = f"state={state}/{MAX_STATE}"
+    if state == 0:
+        text += " (daemon not setting a floor; EC's own curve)"
+    return f"{text} hottest={hottest_c:.1f}C"
+
+
+WATCHDOG_NOT_FOUND_HINT = (
+    "watchdog-hint: unit not installed; see "
+    "docs/installation.md#5-choose-your-startup-mode"
+)
+
+
+def format_watchdog_status(active: str, enabled: str) -> str:
+    text = f"watchdog-active: {active}\nwatchdog-enabled: {enabled}\n"
+    if enabled == "not-found":
+        text += WATCHDOG_NOT_FOUND_HINT + "\n"
+    return text
+
+
+def watchdog_unit_state() -> tuple[str, str]:
+    return (
+        systemctl_query("is-active", WATCHDOG_UNIT),
+        systemctl_query("is-enabled", WATCHDOG_UNIT),
+    )
+
+
+def run_daemon(thermal_root: Path, poll_seconds: float,
+               hwmon_root: Path | None = None, curve: str | None = None,
+               state_dir: Path | None = None,
+               defaults: dict[str, str] | None = None) -> int:
     if not math.isfinite(poll_seconds) or poll_seconds <= 0:
         raise ValueError("poll interval must be finite and positive")
-    cooling_device = find_cooling_device(thermal_root)
+    if hwmon_root is None:
+        hwmon_root = Path("/sys/class/hwmon")
+    if state_dir is None:
+        state_dir = STALL_MARKER_DIR
+    if defaults is None:
+        try:
+            defaults = read_defaults()
+        except OSError:
+            defaults = {}
+    if acpi_incident_latched(state_dir):
+        LOG.critical("ACPI incident latched; not starting fan curve; explicit acpi-incident-reset required")
+        return HELD_FLOOR_EXIT
+    dismiss_unsupported_firmware_flag(STALL_MARKER_DIR / INTERVENTION_NAME)
+    selected = CURVES[curve_name(curve)]
+    # Telemetry-only firmware raises here and main() returns exit 69.
+    # That stays ahead of the held-floor refusal.
+    cooling_device = require_control(thermal_root, hwmon_root)
+    held, source = resolved_manual_state(defaults, state_dir)
+    if source in {"last-set", "override"} and held is not None:
+        label = "MANUAL_STATE" if source == "override" else "last-set"
+        LOG.error(
+            "held floor %s recorded (%s); not starting the curve; "
+            "run dgx-fan-control automatic first",
+            held, label,
+        )
+        return HELD_FLOOR_EXIT
     filtered_temperature_c: float | None = None
     stop_requested = Event()
     failures = 0
@@ -128,7 +3922,10 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    LOG.info("controller starting; authenticating the current cooling state")
+    LOG.info(
+        "controller starting curve=%s; authenticating the current cooling state",
+        curve_name(curve),
+    )
 
     try:
         while not stop_requested.is_set():
@@ -144,9 +3941,12 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
                         filtered_temperature_c += FILTER_ALPHA * (
                             hottest - filtered_temperature_c
                         )
-                    desired = next_state(current, filtered_temperature_c)
-                except (OSError, RuntimeError, ValueError):
-                    LOG.exception("temperature observation failed; requesting maximum cooling")
+                    desired = next_state(current, filtered_temperature_c, selected)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    LOG.error(
+                        "temperature observation failed; requesting maximum cooling: %s",
+                        exc,
+                    )
                     hottest = math.nan
                     filtered_temperature_c = None
                     desired = MAX_STATE
@@ -165,6 +3965,12 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
                 if failures:
                     LOG.info("fan communication recovered after %d failed attempts", failures)
                 failures = 0
+            except RuntimeError as exc:
+                if "floor was changed outside this driver" not in str(exc):
+                    raise
+                LOG.error("%s", exc)
+                mark_reported(exc)
+                raise
             except OSError as exc:
                 failures += 1
                 filtered_temperature_c = None
@@ -174,8 +3980,9 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
                         "stopping for operator recovery, current floor is unverified",
                         failures, exc,
                     )
+                    mark_reported(exc)
                     raise
-                delay = RETRY_INITIAL_SECONDS * 2 ** (failures - 1)
+                delay = retry_delay_seconds(exc, failures)
                 LOG.warning(
                     "fan communication failed (%d/%d): %s; retrying in %.1fs",
                     failures, TRANSPORT_FAILURE_LIMIT, exc, delay,
@@ -189,13 +3996,1764 @@ def run_daemon(thermal_root: Path, poll_seconds: float) -> int:
     finally:
         try:
             write_state(cooling_device, 0)
-        except Exception:
-            LOG.exception("automatic restoration failed; current fan floor is unverified")
+        except Exception as exc:
+            # The ownership failure is already logged. A second copy, or a
+            # traceback, is the line operators saw as a bare ESTALE.
+            duplicate = (
+                primary_failure and "floor was changed outside this driver" in str(exc)
+            )
+            if not duplicate:
+                LOG.error(
+                    "automatic restoration failed; current fan floor is unverified: %s",
+                    exc,
+                )
+            mark_reported(exc)
             if not primary_failure:
                 raise
         else:
             LOG.info("automatic NVIDIA fan policy restored")
     return 0
+
+
+def acpi_fan_devices(thermal_root: Path) -> list[Path]:
+    matches = []
+    for candidate in sorted(thermal_root.glob("cooling_device*")):
+        try:
+            device_type = (candidate / "type").read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            continue
+        if device_type == ACPI_COOLING_TYPE:
+            matches.append(candidate)
+    return matches
+
+
+ACPI_RPM_NOTE = (
+    "firmware may accept this write without changing RPM "
+    "(EC 3.13.7 does); check fan RPM afterward"
+)
+
+
+def acpi_fan_result_line(device: Path) -> str:
+    """cur_state/max_state after a write, for example 'cooling_device0 (Fan): 100/100'."""
+    current = (device / "cur_state").read_text(encoding="ascii").strip()
+    maximum = (device / "max_state").read_text(encoding="ascii").strip()
+    kind = (device / "type").read_text(encoding="ascii").strip()
+    return f"{device.name} ({kind}): {current}/{maximum}"
+
+
+def write_acpi_fan_level(device: Path, level: int) -> None:
+    if not ACPI_MIN_LEVEL <= level <= ACPI_MAX_LEVEL:
+        raise ValueError("ACPI levels must be 35 through 100; never write 0")
+    refuse_host_write(device)
+    with acpi_write_lock():
+        maximum = int((device / "max_state").read_text(encoding="ascii").strip())
+        if level > maximum:
+            raise RuntimeError(f"ACPI fan level {level} is outside max_state {maximum}")
+        if acpi_protection_phase() == "ec":
+            raise RuntimeError("EC-only phase refuses ACPI writes")
+        if level < ACPI_MAX_LEVEL and acpi_record_current(ACPI_MAX_NAME):
+            raise RuntimeError("ACPI thermal level 100 is latched until reboot; refusing lower level")
+        (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
+        observed = int((device / "cur_state").read_text(encoding="ascii").strip())
+        if observed != level:
+            raise RuntimeError(f"ACPI fan readback mismatch: wrote {level}, read {observed}")
+
+
+def pinned_ec_name(log_text: str) -> str | None:
+    match = re.search(r"pinned (EC \d+\.\d+\.\d+) capabilities", log_text)
+    return match.group(1) if match else None
+
+
+def ec_release_name(version: str) -> str | None:
+    """Turn an fwupd version into major.minor.patch.
+
+    0x03000508 is EC 3.5.8 and 0x03000d07 is EC 3.13.7. The second byte is
+    skipped; that is the encoding these versions use.
+    """
+    text = version.strip()
+    if re.fullmatch(r"\d+\.\d+\.\d+", text):
+        return text
+    hex_text = text.lower().removeprefix("0x")
+    if not re.fullmatch(r"[0-9a-f]{8}", hex_text):
+        return None
+    major = int(hex_text[0:2], 16)
+    minor = int(hex_text[4:6], 16)
+    patch = int(hex_text[6:8], 16)
+    return f"{major}.{minor}.{patch}"
+
+
+def _device_guids(device: dict) -> list[str]:
+    guids = device.get("Guid", device.get("Guids", device.get("guid", [])))
+    if isinstance(guids, str):
+        return [guids.strip().lower()]
+    if isinstance(guids, list):
+        return [str(item).strip().lower() for item in guids]
+    return []
+
+
+def find_ec_fwupd_device(payload: object) -> dict | None:
+    """The device object whose own Guid list contains the EC GUID."""
+    if isinstance(payload, dict):
+        if EC_FWUPD_GUID in _device_guids(payload):
+            return payload
+        for value in payload.values():
+            found = find_ec_fwupd_device(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = find_ec_fwupd_device(item)
+            if found is not None:
+                return found
+    return None
+
+
+def ec_version_in_devices(text: str) -> str | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    device = find_ec_fwupd_device(payload)
+    if device is None:
+        return None
+    version = device.get("Version", device.get("version", ""))
+    return ec_release_name(str(version))
+
+
+def verbose_says_ec_disabled(text: str) -> bool:
+    return f"is disabled [{EC_FWUPD_GUID}]" in text.lower()
+
+
+def ec_probe_succeeded(log_text: str) -> bool:
+    if pinned_ec_name(log_text):
+        return True
+    return "registering hwmon telemetry only" in log_text
+
+
+def classify_ec_update_block(*, devices_text: str | None, devices_ok: bool,
+                             verbose_text: str | None, log_text: str,
+                             fwupd_missing: bool = False,
+                             timed_out: bool = False,
+                             as_root: bool = True) -> tuple[str, str]:
+    """pass, warn, or note. Never fail. A note detail starts with unknown.
+
+    Present in get-devices means not blocked. The verbose 'is disabled'
+    line is the positive block signal. Absence plus a successful EC probe
+    is only 'likely blocked'. A missing or slow fwupd is unknown. Without
+    root, fwupdtool cannot print the 'is disabled' line, so an absent EC
+    says that root is needed to confirm the block.
+    """
+    if devices_ok and devices_text and EC_FWUPD_GUID in devices_text.lower():
+        version = ec_version_in_devices(devices_text)
+        on_358 = version == "3.5.8" or (
+            version is None and pinned_ec_name(log_text) == "EC 3.5.8"
+        )
+        if on_358:
+            return (
+                "warn",
+                "not blocked; EC 3.5.8 can be replaced by 3.13.7",
+            )
+        if version:
+            return "pass", f"not blocked (EC {version})"
+        return "pass", "not blocked"
+    if verbose_text and verbose_says_ec_disabled(verbose_text):
+        return "pass", "blocked"
+    if timed_out:
+        return "note", "unknown (fwupd timed out)"
+    if fwupd_missing:
+        return "note", "unknown (fwupd not installed)"
+    if devices_ok:
+        if ec_probe_succeeded(log_text):
+            return (
+                "pass",
+                "likely blocked; absent from get-devices while the EC probe succeeded",
+            )
+        if not as_root:
+            return "note", "unknown (needs root to confirm the block)"
+        return "note", "unknown (EC not in get-devices)"
+    return "note", "unknown (fwupd failed)"
+
+
+def _run_fwupd(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            argv, check=False, capture_output=True, text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+        )
+    except OfflineGuardError as exc:
+        raise FileNotFoundError(argv[0] if argv else "fwupd") from exc
+
+
+def read_ec_update_block(log_text: str, run=None,
+                         as_root: bool | None = None) -> tuple[str, str]:
+    """Read-only. Does not change fwupd config or restart the daemon."""
+    if run is None:
+        run = _run_fwupd
+    if as_root is None:
+        as_root = os.geteuid() == 0
+    devices_text = None
+    devices_ok = False
+    verbose_text = None
+    fwupd_missing = False
+    timed_out = False
+    saw_fwupd = False
+    try:
+        completed = run(["fwupdmgr", "get-devices", "--json"])
+        saw_fwupd = True
+    except FileNotFoundError:
+        completed = None
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        completed = None
+    except OSError:
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        devices_ok = True
+        devices_text = completed.stdout or ""
+    visible = (
+        devices_ok and devices_text is not None
+        and EC_FWUPD_GUID in devices_text.lower()
+    )
+    if not visible and not timed_out:
+        try:
+            verbose = run(["fwupdtool", "get-devices", "--show-all", "--verbose"])
+            saw_fwupd = True
+        except FileNotFoundError:
+            verbose = None
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            verbose = None
+        except OSError:
+            verbose = None
+        if verbose is not None:
+            verbose_text = (verbose.stdout or "") + (verbose.stderr or "")
+    if not saw_fwupd and not timed_out:
+        fwupd_missing = True
+    return classify_ec_update_block(
+        devices_text=devices_text, devices_ok=devices_ok,
+        verbose_text=verbose_text, log_text=log_text,
+        fwupd_missing=fwupd_missing, timed_out=timed_out,
+        as_root=as_root,
+    )
+
+
+def classify_fan_binding(thermal_root: Path, hwmon_root: Path) -> str:
+    """supported, unsupported (telemetry only), or absent."""
+    if cooling_devices(thermal_root):
+        return "supported"
+    if find_fan_hwmon(hwmon_root) is not None:
+        return "unsupported"
+    return "absent"
+
+
+def describe_control(kind: str, profile: str | None = None) -> str:
+    if kind == "supported":
+        return "supported"
+    if kind == "unsupported":
+        if profile:
+            return f"unsupported ({profile}, telemetry only)"
+        return "unsupported (telemetry only)"
+    return "unknown"
+
+
+def module_is_loaded(module: str = MODULE_NAME, module_root: Path | None = None) -> bool:
+    root = module_root if module_root is not None else Path("/sys/module")
+    if module_root is None and offline_guard_active():
+        return False
+    return (root / module).is_dir()
+
+
+def uncommented_lines(text: str) -> list[str]:
+    lines = []
+    for raw in text.splitlines():
+        stripped = raw.split("#", 1)[0].strip()
+        if stripped:
+            lines.append(stripped)
+    return lines
+
+
+def conf_blocks_module(text: str, module: str = MODULE_NAME) -> bool:
+    """True for a blacklist line or an install override of this module."""
+    for line in uncommented_lines(text):
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        if parts[0] == "blacklist" and module in parts[1:]:
+            return True
+        if parts[0] == "install" and parts[1] == module:
+            return True
+    return False
+
+
+def text_selects_module(text: str, module: str = MODULE_NAME) -> bool:
+    for line in uncommented_lines(text):
+        if module in line.split():
+            return True
+    return False
+
+
+def modules_load_is_project_file(text: str, module: str = MODULE_NAME) -> bool:
+    """True when the file only loads this module, or only comments that name."""
+    active = uncommented_lines(text)
+    if active:
+        return active == [module]
+    return module in text
+
+
+def foreign_blacklist_files(modprobe_dir: Path, module: str = MODULE_NAME) -> list[Path]:
+    if not modprobe_dir.is_dir():
+        return []
+    found = []
+    for path in sorted(modprobe_dir.glob("*.conf")):
+        if path.name == MANAGED_BLACKLIST_NAME:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if conf_blocks_module(text, module):
+            found.append(path)
+    return found
+
+
+def initramfs_module_files(etc: Path, module: str = MODULE_NAME) -> list[Path]:
+    """Files under etc that would put this module in an early boot image."""
+    found = []
+    singles = (
+        etc / "initramfs-tools" / "modules",
+        etc / "dracut.conf",
+    )
+    directories = (
+        etc / "initramfs-tools" / "modules.d",
+        etc / "dracut.conf.d",
+    )
+    for path in singles:
+        if path.is_file() and text_selects_module(_read_text(path), module):
+            found.append(path)
+    for directory in directories:
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and text_selects_module(_read_text(path), module):
+                found.append(path)
+    return found
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def write_text_if_changed(path: Path, text: str) -> None:
+    refuse_host_write(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        try:
+            if path.read_text(encoding="utf-8") == text:
+                return
+        except (OSError, UnicodeError):
+            pass
+    path.write_text(text, encoding="utf-8")
+
+
+def warn_about_foreign_blacklists(modprobe_dir: Path, *, on_enable: bool = False) -> list[Path]:
+    foreign = foreign_blacklist_files(modprobe_dir)
+    for path in foreign:
+        if on_enable:
+            LOG.warning(
+                "%s blacklists or install-overrides %s. module enable will not "
+                "edit or delete it, so it can still block loading",
+                path, MODULE_NAME,
+            )
+        else:
+            LOG.warning(
+                "leaving %s in place; it blacklists or install-overrides %s "
+                "and was not created by this command",
+                path, MODULE_NAME,
+            )
+    return foreign
+
+
+def note_initramfs(etc: Path) -> list[Path]:
+    listed = initramfs_module_files(etc)
+    if not listed:
+        return []
+    names = ", ".join(str(path) for path in listed)
+    LOG.warning(
+        "%s is listed for the initramfs in %s. This project does not install "
+        "it there and does not run update-initramfs or dracut. After changing "
+        "mode, rebuild that image (sudo update-initramfs -u, or sudo dracut -f) "
+        "or early boot can still load the module.",
+        MODULE_NAME, names,
+    )
+    return listed
+
+
+def module_paths(etc: Path) -> tuple[Path, Path, Path]:
+    modprobe_dir = etc / "modprobe.d"
+    modules_load = etc / "modules-load.d" / MODULES_LOAD_NAME
+    managed = modprobe_dir / MANAGED_BLACKLIST_NAME
+    return modprobe_dir, modules_load, managed
+
+
+def neutralize_modules_load(modules_load: Path) -> None:
+    if not modules_load.exists():
+        return
+    text = _read_text(modules_load)
+    if not modules_load_is_project_file(text):
+        LOG.warning(
+            "not editing %s; it is not the modules-load.d file this project installs",
+            modules_load,
+        )
+        return
+    write_text_if_changed(modules_load, MODULES_LOAD_DISABLED_TEXT)
+
+
+def restore_modules_load(modules_load: Path) -> None:
+    if modules_load.exists():
+        text = _read_text(modules_load)
+        if not modules_load_is_project_file(text):
+            LOG.warning(
+                "not editing %s; it is not the modules-load.d file this project installs",
+                modules_load,
+            )
+            return
+    write_text_if_changed(modules_load, MODULES_LOAD_TEXT)
+
+
+def run_module_command(argv: list[str], runner) -> None:
+    if runner is None:
+        completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+        if completed.returncode == 0:
+            return
+        detail = (completed.stderr or completed.stdout or "").strip()
+        lowered = detail.lower()
+        if any(token in lowered for token in ("not currently loaded", "does not exist", "not found", "not loaded")):
+            return
+        raise RuntimeError(f"{' '.join(argv)} failed: {detail or completed.returncode}")
+    runner(argv)
+
+
+def disable_kernel_module(etc: Path, *, runner, loaded: bool) -> None:
+    """Stop autoload and the service. Idempotent. Does not delete foreign files."""
+    run_module_command(["systemctl", "disable", "--now", DAEMON_UNIT], runner)
+    if loaded:
+        run_module_command(["modprobe", "-r", MODULE_NAME], runner)
+    _modprobe_dir, modules_load, managed = module_paths(etc)
+    write_text_if_changed(managed, MANAGED_BLACKLIST_TEXT)
+    neutralize_modules_load(modules_load)
+    warn_about_foreign_blacklists(_modprobe_dir)
+    note_initramfs(etc)
+
+
+def enable_kernel_module(etc: Path, *, runner, loaded: bool,
+                         control_supported: bool | None = None,
+                         force_service: bool = False,
+                         start_service: bool = False,
+                         profile: str | None = None) -> None:
+    """Undo a managed disable and load the module.
+
+    The performance service is not enabled unless start_service or
+    force_service is set. On a telemetry-only bind the service stays
+    disabled unless force_service is set. Exit 69 is reserved for that
+    startup check, not for later crashes.
+    """
+    modprobe_dir, modules_load, managed = module_paths(etc)
+    if managed.is_file():
+        managed.unlink()
+    warn_about_foreign_blacklists(modprobe_dir, on_enable=True)
+    restore_modules_load(modules_load)
+    if not loaded:
+        run_module_command(["modprobe", MODULE_NAME], runner)
+    if control_supported is None:
+        kind = classify_fan_binding(Path("/sys/class/thermal"), Path("/sys/class/hwmon"))
+        supported = kind != "unsupported"
+    else:
+        supported = control_supported
+    if not supported and profile is None:
+        try:
+            logged = subprocess.run(
+                ["dmesg"], check=False, capture_output=True, text=True,
+            )
+            profile = pinned_ec_name(logged.stdout or "")
+        except OSError:
+            profile = None
+    if not supported and not force_service:
+        run_module_command(["systemctl", "disable", "--now", DAEMON_UNIT], runner)
+        label = profile or "this firmware"
+        # Printed once. Logging the same sentence as well showed it twice
+        # on the EC 3.13.7 enable path.
+        print(
+            f"fan control unsupported on {label}; telemetry only, "
+            "service left disabled; use acpi-max on EC 3.5.8"
+        )
+        note_initramfs(etc)
+        return
+    if not (start_service or force_service):
+        print(
+            "module loaded; dgx-fan-control.service was not enabled. "
+            "Enable the performance curve only if you want it: "
+            "sudo dgx-fan-control module enable --start-service"
+        )
+        note_initramfs(etc)
+        return
+    if not supported and force_service:
+        LOG.warning("starting the service despite unsupported fan control")
+    run_module_command(["systemctl", "enable", "--now", DAEMON_UNIT], runner)
+    note_initramfs(etc)
+
+
+def module_status(etc: Path, *, loaded: bool, service_active: str, service_enabled: str,
+                  control: str = "unknown", exec_status: int | None = None,
+                  exit_timestamp: str | None = None,
+                  start_monotonic_us: int | None = None,
+                  exit_monotonic_us: int | None = None,
+                  watchdog_active: str = "unknown",
+                  watchdog_enabled: str = "unknown") -> str:
+    modprobe_dir, _modules_load, managed = module_paths(etc)
+    foreign = foreign_blacklist_files(modprobe_dir)
+    initramfs = initramfs_module_files(etc)
+    managed_on = managed.is_file()
+    if managed_on and not loaded and service_enabled == "disabled":
+        mode = "ACPI-only"
+    elif loaded or service_enabled == "enabled":
+        mode = "module"
+    else:
+        mode = "ACPI-only"
+    if managed_on and loaded:
+        mode = "inconsistent"
+    lines = [
+        f"loaded: {'yes' if loaded else 'no'}",
+        f"managed-blacklist: {'yes' if managed_on else 'no'}",
+        "other-blacklists: " + (", ".join(str(path) for path in foreign) if foreign else "none"),
+        f"service-enabled: {service_enabled}",
+        f"service-active: {service_active}",
+        f"watchdog-enabled: {watchdog_enabled}",
+        f"watchdog-active: {watchdog_active}",
+        *([WATCHDOG_NOT_FOUND_HINT] if watchdog_enabled == "not-found" else []),
+        f"control: {control}",
+        f"mode: {mode}",
+        "initramfs: " + (", ".join(str(path) for path in initramfs) if initramfs else "none"),
+        "service-exit: " + format_service_exit(
+            service_active, service_enabled, exec_status, exit_timestamp,
+            start_monotonic_us, exit_monotonic_us,
+        ),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def acpi_result_note(profile: str | None) -> str:
+    """3.13.7 accepts the write and ignores RPM. 3.5.8 does change RPM."""
+    if profile == "EC 3.5.8":
+        return "check fan RPM"
+    return ACPI_RPM_NOTE
+
+
+def acpi_write_refusal(module_loaded: bool, service_active: str) -> str | None:
+    """ACPI cur_state and this module write the same EC lower-floor register."""
+    if service_active == "active":
+        return (
+            "refusing ACPI write: dgx-fan-control.service is active and shares "
+            "the EC lower-floor register with ACPI cur_state. "
+            "Stop the service and unload the module first, or pass --force. "
+            "Do not write ACPI level 0."
+        )
+    if module_loaded:
+        return (
+            "refusing ACPI write: kernel module dgx_ec_fan_control is loaded and "
+            "shares the EC lower-floor register with ACPI cur_state. "
+            "Run 'dgx-fan-control module disable' first, or pass --force. "
+            "Do not write ACPI level 0."
+        )
+    return None
+
+
+
+# ACPI holds survive the writer. These boot-scoped records deliberately do not
+# clear on tool exit, service restart, or cooling; only a new boot disarms them.
+ACPI_HOLD_NAME = "acpi-hold-boot"
+ACPI_MAX_NAME = "acpi-max-boot"
+ACPI_INCIDENT_NAME = "acpi-incident"
+ACPI_PHASE_NAME = "acpi-phase"
+ACPI_EC_STOP_NAME = "acpi-ec-stop"
+ACPI_ADVISORY_NAME = "acpi-advisory"
+ACPI_ADVISORY_SCHEMA = 1
+ACPI_RESUME_NAME = "acpi-resume-boot"
+ACPI_RESUME_TIMEOUT_SECONDS = 30.0
+
+
+def acpi_incident_latched(state_dir=None) -> bool:
+    return ((state_dir or STALL_MARKER_DIR) / ACPI_INCIDENT_NAME).exists()
+
+
+def reset_acpi_incident(thermal_root):
+    if os.geteuid() != 0:
+        raise PermissionError("acpi-incident-reset requires root")
+    if not acpi_incident_latched():
+        return
+    if not read_boot_id():
+        raise RuntimeError("ACPI incident reset refused: boot ID unreadable")
+    if acpi_record_current(ACPI_INCIDENT_NAME) or acpi_record_current(ACPI_HOLD_NAME):
+        raise RuntimeError("ACPI incident cannot be reset until after reboot; EC control has not been restored")
+    guard = AcpiThermalGuard(read_defaults())
+    hot = read_hottest_temperature_c(thermal_root)
+    if hot is None or hot >= guard.fan_c - guard.hysteresis:
+        raise RuntimeError("ACPI incident reset refused: hottest zone must be below MAX minus HYSTERESIS")
+    (STALL_MARKER_DIR / ACPI_INCIDENT_NAME).unlink()
+    phase = STALL_MARKER_DIR / ACPI_PHASE_NAME
+    if phase.exists():
+        phase.unlink()
+    try:
+        _fsync_existing(STALL_MARKER_DIR)
+    except OSError as exc:
+        LOG.warning("ACPI incident reset: directory sync failed: %s", exc)
+    LOG.warning("ACPI incident reset explicitly; no fan level written and no job/service started")
+
+
+def acpi_record_current(name: str) -> bool:
+    boot = read_boot_id()
+    try:
+        return bool(boot) and (STALL_MARKER_DIR / name).read_text().strip() == boot
+    except OSError:
+        return False
+
+
+@contextmanager
+def acpi_write_lock():
+    ensure_state_dir(STALL_MARKER_DIR)
+    with (STALL_MARKER_DIR / "acpi-write.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+# (path, boot id) records whose file and directory have been fsynced.
+# A new process, boot, or missing file tries again. This is not a substitute
+# for the on-disk boot-id check.
+_DURABLE_ACPI_RECORDS: set[tuple[str, str]] = set()
+
+
+def _fsync_existing(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def record_acpi_boot(name: str, state_dir: Path | None = None) -> None:
+    """Persist a boot-scoped ACPI record and push it to disk.
+
+    The incident file has to still be there after a power loss, so the next
+    boot can refuse another ACPI hold. A failed sync leaves the key uncached
+    and the caller retries.
+    """
+    boot = read_boot_id()
+    if not boot:
+        raise RuntimeError("cannot arm ACPI thermal protection: boot ID unreadable")
+    directory = state_dir or STALL_MARKER_DIR
+    with acpi_write_lock():
+        path = directory / name
+        key = (str(path), boot)
+        try:
+            current = path.read_text(encoding="ascii").strip() == boot
+        except OSError:
+            current = False
+        if key in _DURABLE_ACPI_RECORDS and current:
+            return
+        if not current:
+            temporary = path.with_suffix(".tmp")
+            write_state_text(temporary, boot + "\n")
+            _fsync_existing(temporary)
+            temporary.replace(path)
+        _fsync_existing(path)
+        _fsync_existing(path.parent)
+        _DURABLE_ACPI_RECORDS.add(key)
+
+
+def _phase_file_ec_boot(state_dir: Path) -> str | None:
+    """incident_boot from acpi-phase when it records phase=ec, else None.
+
+    The incident file's boot id is what selects the phase. This file records
+    the same reboot request for operators and for reset. It does not by itself
+    enable EC-only monitoring.
+    """
+    try:
+        text = (state_dir / ACPI_PHASE_NAME).read_text(encoding="ascii")
+    except OSError:
+        return None
+    phase = None
+    incident_boot = None
+    for line in text.splitlines():
+        if line.startswith("phase="):
+            phase = line.split("=", 1)[1].strip()
+        elif line.startswith("incident_boot="):
+            incident_boot = line.split("=", 1)[1].strip()
+    if phase != "ec" or not incident_boot:
+        return None
+    return incident_boot
+
+
+def acpi_protection_phase(state_dir: Path | None = None) -> str:
+    """acpi while this boot holds or owns the incident; ec after that reboot.
+
+    The incident file's boot id selects the phase. ``acpi-phase`` records the
+    phase-1 reboot request (``phase=ec`` and ``incident_boot``). It does not
+    override the incident file and does not enable monitoring by itself.
+    A missing boot id does not select acpi, because that phase may force
+    level 100. A surviving incident latch then stays on the no-write path.
+    """
+    directory = state_dir or STALL_MARKER_DIR
+    boot = read_boot_id()
+    hold = _acpi_record_boot(ACPI_HOLD_NAME, directory)
+    incident = _acpi_record_boot(ACPI_INCIDENT_NAME, directory)
+    phase_boot = _phase_file_ec_boot(directory)
+    if boot and (hold == boot or incident == boot):
+        return "acpi"
+    if not acpi_incident_latched(directory):
+        return "off"
+    if phase_boot and boot and phase_boot != incident and incident not in (None, boot):
+        LOG.error(
+            "acpi-phase incident_boot=%s disagrees with acpi-incident %s; "
+            "the incident file selects the phase",
+            phase_boot, incident,
+        )
+    # Latch present, and this boot does not own it (or the boot id is unknown).
+    return "ec"
+
+
+def mark_ec_protection_phase(state_dir: Path | None = None) -> None:
+    """Remember that the next boot is EC-only protection, not another ACPI hold."""
+    boot = read_boot_id()
+    if not boot:
+        raise RuntimeError("cannot record EC-only phase: boot ID unreadable")
+    directory = state_dir or STALL_MARKER_DIR
+    text = f"phase=ec\nincident_boot={boot}\n"
+    with acpi_write_lock():
+        path = directory / ACPI_PHASE_NAME
+        temporary = path.with_suffix(".tmp")
+        write_state_text(temporary, text)
+        _fsync_existing(temporary)
+        temporary.replace(path)
+        _fsync_existing(path)
+        _fsync_existing(path.parent)
+
+
+def _acpi_record_boot(name: str, state_dir: Path) -> str | None:
+    try:
+        text = (state_dir / name).read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return text or None
+
+
+def _kill_resume_group(process) -> None:
+    """Kill a timed-out resume hook and its session, if the leader is still ours."""
+    fd = None
+    try:
+        fd = os.pidfd_open(process.pid)
+    except (OSError, AttributeError):
+        return
+    try:
+        if offline_blocks_real(os.killpg):
+            raise OfflineGuardError("offline tests refuse to signal a process group")
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError as exc:
+        LOG.error("ACPI resume hook: process-group kill failed: %s", exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _run_resume_hook(argv, env) -> int:
+    process = subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        return process.wait(timeout=ACPI_RESUME_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill_resume_group(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise
+
+
+def maybe_run_acpi_resume_hook(defaults: dict[str, str], *,
+                               state_dir: Path | None = None,
+                               runner=None,
+                               health_ok: bool = False,
+                               hottest_c: float | None = None) -> str:
+    """Optionally resume work after the reboot that restored EC control.
+
+    Disabled unless ACPI_THERMAL_RESUME_HOOK is set. The hook is the user's
+    command; this does not reconstruct a killed command line. It runs at most
+    once per boot, only after health has passed, the zone is below the hook
+    threshold (80 C), and this boot's EC-only stop ladder has not already
+    started. An advisory between 70 C and that threshold does not block it.
+    The incident latch is left in place.
+    """
+    command = defaults.get("ACPI_THERMAL_RESUME_HOOK", "").strip()
+    if not command:
+        return "disabled"
+    if os.geteuid() != 0:
+        return "skipped-not-root"
+    directory = state_dir or STALL_MARKER_DIR
+    boot = read_boot_id()
+    if not boot:
+        return "skipped-no-boot-id"
+    incident_boot = _acpi_record_boot(ACPI_INCIDENT_NAME, directory)
+    if incident_boot is None:
+        return "skipped-no-incident"
+    if incident_boot == boot:
+        return "skipped-same-boot"
+    if _acpi_record_boot(ACPI_HOLD_NAME, directory) == boot:
+        return "skipped-acpi-hold"
+    if _acpi_record_boot(ACPI_EC_STOP_NAME, directory) == boot:
+        return "skipped-thermal-stop"
+    if not health_ok:
+        return "skipped-health"
+    try:
+        hook_c = float(defaults.get("ACPI_THERMAL_MAX_C", 80))
+    except (TypeError, ValueError):
+        hook_c = 80.0
+    # 80 C is where the stop ladder starts. The advisory band below that
+    # is not a reason to refuse resume.
+    if hottest_c is None or not math.isfinite(hottest_c) or hottest_c >= hook_c:
+        return "skipped-temperature"
+    if _acpi_record_boot(ACPI_RESUME_NAME, directory) == boot:
+        return "already"
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        LOG.error("ACPI resume hook is not a valid command: %s", exc)
+        return "skipped-bad-command"
+    if not argv:
+        return "disabled"
+    try:
+        record_acpi_boot(ACPI_RESUME_NAME, directory)
+    except (OSError, RuntimeError) as exc:
+        LOG.error("ACPI resume hook not started; cannot record this boot: %s", exc)
+        return "skipped-marker"
+    env = os.environ.copy()
+    env.update({
+        "DGX_ACPI_INCIDENT": "1",
+        "DGX_ACPI_INCIDENT_BOOT": incident_boot,
+        "DGX_ACPI_INCIDENT_PATH": str(directory / ACPI_INCIDENT_NAME),
+        "DGX_ACPI_RESUME_BOOT": boot,
+    })
+    if runner is None:
+        runner = _run_resume_hook
+    LOG.critical(
+        "ACPI resume hook starting once for boot %s; incident from boot %s "
+        "still blocks ACPI writes; the killed command is not relaunched",
+        boot, incident_boot,
+    )
+    try:
+        status = runner(argv, env)
+    except subprocess.TimeoutExpired:
+        LOG.error(
+            "ACPI resume hook timed out after %.0fs; not running it again this boot",
+            ACPI_RESUME_TIMEOUT_SECONDS,
+        )
+        return "failed"
+    except OSError as exc:
+        LOG.error("ACPI resume hook failed to start: %s", exc)
+        return "failed"
+    if status != 0:
+        LOG.error(
+            "ACPI resume hook exited %s; not running it again this boot", status,
+        )
+        return "failed"
+    LOG.critical("ACPI resume hook exited 0; not running it again this boot")
+    return "ran"
+
+
+def acpi_ec_version(esrt_root: Path = Path("/sys/firmware/efi/esrt/entries")) -> str | None:
+    # ESRT remains readable when ProtectKernelLogs hides dmesg from the
+    # watchdog. Prefer the kernel's pinned version when it is available.
+    pinned = pinned_ec_name(read_kernel_log())
+    if pinned:
+        return pinned.removeprefix("EC ")
+    if offline_hides_host_path(esrt_root):
+        return None
+    for entry in esrt_root.glob("entry*"):
+        try:
+            if (entry / "fw_class").read_text().strip().lower() != EC_FWUPD_GUID:
+                continue
+            raw = int((entry / "fw_version").read_text().strip(), 0)
+            return ec_release_name(f"{raw:08x}")
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def arm_acpi_monitor(thermal_root: Path, hwmon_root: Path = Path("/sys/class/hwmon")) -> None:
+    """Fail closed before a persistent ACPI write without an independent monitor."""
+    if acpi_incident_latched():
+        raise RuntimeError("ACPI incident latched; reboot, inspect cooling, then run acpi-incident-reset")
+    version = acpi_ec_version()
+    if (classify_fan_binding(thermal_root, hwmon_root) == "unsupported"
+            or version == "3.13.7"):
+        raise ControlUnsupported("EC 3.13.7: telemetry only, no ACPI write")
+    if version != "3.5.8":
+        raise RuntimeError("ACPI write refused: cannot positively identify EC 3.5.8 from kernel log or ESRT")
+    if systemctl_query("is-active", WATCHDOG_UNIT) != "active":
+        raise RuntimeError("ACPI write refused: start dgx-fan-watchdog.service first")
+    AcpiThermalGuard(read_defaults())
+    record_acpi_boot(ACPI_HOLD_NAME)
+
+
+class AcpiThermalGuard:
+    """Independent ACPI emergency policy; does not change the true-zero policy.
+
+    Dependency injection keeps every destructive operation fake in tests.
+    70 C is an advisory only. 80 C starts a configured stop hook and, in the
+    ACPI phase, forces level 100. 85 C is SIGTERM. 90 C is SIGKILL. A
+    confirmed stop reboots immediately to restore the EC curve. That reboot
+    is not workload resume. Shutdown is only the failure path when the stop
+    cannot be verified, the recovery reboot fails and the ceiling holds, or
+    phase-2 heat stays uncontrolled after a confirmed stop.
+    """
+    def __init__(self, defaults, *, targets=None, send=None, hook=None, shutdown=None, reboot=None):
+        self.defaults = defaults
+        self.advisory_c = self.number("ACPI_THERMAL_ADVISORY_C", 70)
+        self.fan_c = self.number("ACPI_THERMAL_MAX_C", 80)
+        self.stop_c = self.number("ACPI_THERMAL_STOP_C", 85)
+        self.kill_c = self.number("ACPI_THERMAL_KILL_C", 90)
+        self.shutdown_c = self.number("ACPI_THERMAL_SHUTDOWN_C", 90)
+        self.hook_s = self.number("ACPI_THERMAL_HOOK_SECONDS", 10)
+        self.term_s = self.number("ACPI_THERMAL_TERM_SECONDS", 10)
+        self.shutdown_s = self.number("ACPI_THERMAL_SHUTDOWN_SECONDS", 15)
+        legacy_kill = defaults.get("ACPI_THERMAL_KILL_SECONDS")
+        if legacy_kill is not None and str(legacy_kill).strip() != "":
+            # Reject a bad value, then ignore it. SIGKILL timing is KILL_C
+            # and TERM_SECONDS. Poweroff timing is SHUTDOWN_SECONDS.
+            self.number("ACPI_THERMAL_KILL_SECONDS", 5)
+            LOG.warning(
+                "ACPI_THERMAL_KILL_SECONDS=%s is deprecated and ignored; "
+                "it does not delay SIGKILL or poweroff. SIGKILL is at "
+                "KILL_C or after ACPI_THERMAL_TERM_SECONDS. Poweroff waits "
+                "ACPI_THERMAL_SHUTDOWN_SECONDS at or above "
+                "ACPI_THERMAL_SHUTDOWN_C",
+                legacy_kill,
+            )
+        # ACPI_THERMAL_COOL_SECONDS is ignored. Recovery does not wait for a
+        # temperature hold; a confirmed stop reboots on the verifying poll.
+        self.hysteresis = self.number("ACPI_THERMAL_HYSTERESIS_C", 2)
+        if not 35 <= self.advisory_c < self.fan_c < self.stop_c < self.kill_c <= self.shutdown_c <= 100:
+            raise ValueError(
+                "ACPI thermal thresholds must satisfy "
+                "35 <= ADVISORY < MAX < STOP < KILL <= SHUTDOWN <= 100"
+            )
+        if not 0 < self.hysteresis < self.stop_c - self.fan_c:
+            raise ValueError("ACPI thermal hysteresis must be positive and less than STOP - MAX")
+        if not self.hysteresis < self.fan_c - self.advisory_c:
+            raise ValueError(
+                "ACPI thermal hysteresis must be less than MAX - ADVISORY "
+                "so the advisory can clear before the stop hook"
+            )
+        enabled = defaults.get("ACPI_THERMAL_SHUTDOWN", "yes").strip().lower()
+        if enabled not in ("yes", "no"):
+            raise ValueError("ACPI_THERMAL_SHUTDOWN must be yes or no")
+        self.shutdown_enabled = enabled == "yes"
+        self.targets = targets or self.discover_targets
+        self.send = send or self.signal_targets
+        self.hook = hook or self.start_hook
+        self.shutdown = shutdown or (lambda: run_watchdog_action(WATCHDOG_DEFAULT_ACTION))
+        self.reboot = reboot or (lambda: run_watchdog_action(WATCHDOG_REBOOT_ACTION))
+        self.discovery_complete = True
+        self.blocked_targets = set()
+        self.stage = "incident" if acpi_record_current(ACPI_INCIDENT_NAME) else "idle"
+        self.since = 0.0
+        self.hook_process = None
+        self.selected = {}
+        self.max_logged = False
+        self.ec_logged = False
+        self.advisory_logged = False
+        self.advisory_sequence = 0
+        self.advisory_process = None
+        self.advisory_hook_busy_logged = False
+        self.advisory_hook = self.start_advisory_hook
+        self.reaction_logged = False
+        self.ceiling_since = None
+        self.retired_hooks = []
+
+    def hook_command(self) -> str:
+        return self.defaults.get("ACPI_THERMAL_STOP_HOOK", "").strip()
+
+    def advisory_fields(self, hot, ec_only) -> dict[str, str]:
+        """Stable schema for one advisory episode. It is not a stop command."""
+        incident = _acpi_record_boot(ACPI_INCIDENT_NAME, STALL_MARKER_DIR)
+        return {
+            "event": "acpi_thermal_advisory",
+            "schema": str(ACPI_ADVISORY_SCHEMA),
+            "phase": "ec" if ec_only else "acpi",
+            "zone_c": f"{hot:.1f}",
+            "advisory_c": f"{self.advisory_c:.1f}",
+            "hook_c": f"{self.fan_c:.1f}",
+            "term_c": f"{self.stop_c:.1f}",
+            "kill_c": f"{self.kill_c:.1f}",
+            "boot_id": read_boot_id() or "-",
+            "incident_boot": incident or "-",
+            "sequence": str(self.advisory_sequence),
+            "action": "none",
+            "timer": "no",
+        }
+
+    def advisory_text(self, fields: dict[str, str]) -> str:
+        order = (
+            "event", "schema", "phase", "zone_c", "advisory_c", "hook_c",
+            "term_c", "kill_c", "boot_id", "incident_boot", "sequence",
+            "action", "timer",
+        )
+        return "".join(f"{key}={fields[key]}\n" for key in order)
+
+    def publish_advisory(self, hot, ec_only) -> None:
+        """Journal, state file, and optional hook. None of these is waited on.
+
+        The flag is already set, so a failed write or a dead hook is not
+        retried on the next poll. Escalation does not wait for either.
+        """
+        self.advisory_sequence += 1
+        fields = self.advisory_fields(hot, ec_only)
+        text = self.advisory_text(fields)
+        LOG.warning(
+            "%s; checkpoint or reduce load if you can; this is not a failure "
+            "and it does not stop the workload",
+            " ".join(f"{key}={fields[key]}" for key in fields),
+        )
+        path = STALL_MARKER_DIR / ACPI_ADVISORY_NAME
+        try:
+            temporary = path.with_suffix(".tmp")
+            write_state_text(temporary, text)
+            _fsync_existing(temporary)
+            temporary.replace(path)
+            os.chmod(path, 0o644)
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory record was not written: %s", exc)
+        try:
+            self.advisory_hook(fields)
+        except Exception as exc:
+            LOG.error("ACPI thermal advisory hook failed: %s", exc)
+
+    def clear_advisory_record(self) -> None:
+        path = STALL_MARKER_DIR / ACPI_ADVISORY_NAME
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory record was not cleared: %s", exc)
+        process = self.advisory_process
+        if process is not None:
+            try:
+                process.poll()
+            except Exception as exc:
+                LOG.error("ACPI thermal advisory hook status failed: %s", exc)
+
+    def start_advisory_hook(self, fields: dict[str, str]) -> None:
+        """Spawn the optional listener. Return as soon as it has been started.
+
+        A hook that is still running is left alone. This does not wait for
+        it, kill it, or signal the workload.
+        """
+        command = self.defaults.get("ACPI_THERMAL_ADVISORY_HOOK", "").strip()
+        if not command:
+            return
+        previous = self.advisory_process
+        if previous is not None and previous.poll() is None:
+            if not self.advisory_hook_busy_logged:
+                LOG.error(
+                    "ACPI thermal advisory hook still running; "
+                    "not starting another and not waiting"
+                )
+                self.advisory_hook_busy_logged = True
+            return
+        self.advisory_hook_busy_logged = False
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            LOG.error("ACPI thermal advisory hook is not a valid command: %s", exc)
+            return
+        if not argv:
+            return
+        env = os.environ.copy()
+        env.update({
+            "DGX_ACPI_ADVISORY": "1",
+            "DGX_ACPI_ADVISORY_PHASE": fields["phase"],
+            "DGX_ACPI_ADVISORY_ZONE_C": fields["zone_c"],
+            "DGX_ACPI_ADVISORY_C": fields["advisory_c"],
+            "DGX_ACPI_ADVISORY_HOOK_C": fields["hook_c"],
+            "DGX_ACPI_ADVISORY_TERM_C": fields["term_c"],
+            "DGX_ACPI_ADVISORY_KILL_C": fields["kill_c"],
+            "DGX_ACPI_ADVISORY_BOOT": fields["boot_id"],
+            "DGX_ACPI_ADVISORY_INCIDENT_BOOT": fields["incident_boot"],
+            "DGX_ACPI_ADVISORY_SEQUENCE": fields["sequence"],
+            "DGX_ACPI_ADVISORY_PATH": str(STALL_MARKER_DIR / ACPI_ADVISORY_NAME),
+        })
+        try:
+            self.advisory_process = subprocess.Popen(
+                argv, env=env, start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            LOG.error("ACPI thermal advisory hook failed to start: %s", exc)
+
+    def note_advisory(self, hot, ec_only) -> None:
+        """Publish one advisory. It does not arm a latch, a timer, or a stop."""
+        if hot < self.advisory_c - self.hysteresis:
+            if self.advisory_logged:
+                self.advisory_logged = False
+                self.clear_advisory_record()
+            return
+        # At the hook threshold the stop ladder speaks for itself. The
+        # advisory must not claim action=none on that same poll.
+        if hot < self.advisory_c or hot >= self.fan_c or self.advisory_logged:
+            return
+        self.advisory_logged = True
+        try:
+            self.publish_advisory(hot, ec_only)
+        except Exception as exc:
+            LOG.error("ACPI thermal advisory was not published: %s", exc)
+
+    def clear_poweroff_clock(self) -> None:
+        """Drop the poweroff observation. It does not change since."""
+        self.ceiling_since = None
+
+    def ceiling_held(self, hot, now) -> bool:
+        """True only after continuous measured heat at or above the ceiling.
+
+        since is the workload-stage clock (hook, SIGTERM, SIGKILL, watch).
+        ceiling_since belongs only to ec-watch, kill, and reboot-wait.
+        A caller clears it when that stage begins, when a measured sample
+        is below the ceiling, when an EC sample is unreadable, and when a
+        poll is skipped. Phase 1 does not clear it for an unreadable zone:
+        that sample is treated as the ceiling and can continue the clock.
+        """
+        if hot < self.shutdown_c:
+            self.clear_poweroff_clock()
+            return False
+        if self.ceiling_since is None:
+            self.ceiling_since = now
+            return False
+        return now - self.ceiling_since >= self.shutdown_s
+
+    def post_stop_reason(self, hot, now):
+        """Phase-2 reason to power off, or None.
+
+        Only a zone that stays at or above the shutdown threshold. A sample
+        below that threshold never powers off, however long it lasts.
+        """
+        if self.ceiling_held(hot, now):
+            return (
+                "zone stayed at or above %.1fC after the stop"
+                % self.shutdown_c
+            )
+        return None
+
+    def number(self, key, fallback):
+        value = float(self.defaults.get(key, fallback))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be finite and positive")
+        return value
+
+    def start_hook(self):
+        command = self.defaults.get("ACPI_THERMAL_STOP_HOOK", "").strip()
+        if not command:
+            return None
+        # As with the existing hooks, this is trusted root configuration.
+        # Asynchronous: a hung hook cannot block the thermal/true-zero poll.
+        # The pidfd is taken immediately so a later stop cannot hit a reused PID.
+        process = subprocess.Popen(shlex.split(command), start_new_session=True,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        process.hook_pidfd = None
+        try:
+            process.hook_pidfd = os.pidfd_open(process.pid)
+        except (OSError, AttributeError, TypeError) as exc:
+            LOG.error("ACPI thermal: hook pidfd unavailable (%s); a hung hook will not be signaled by PID", exc)
+        return process
+
+    def finish_hook(self):
+        process = self.hook_process
+        if process is None:
+            return
+        # Only the pidfd captured at spawn. Popen.kill() is a numeric PID and
+        # can land on a reused process. No process-group signal: the hook may
+        # have started unrelated work, and it must reap its own descendants.
+        fd = getattr(process, "hook_pidfd", None)
+        if not isinstance(fd, int):
+            fd = None
+        try:
+            if process.poll() is None:
+                if fd is None:
+                    LOG.error(
+                        "ACPI thermal: hook still running without a spawn-time "
+                        "pidfd; not signaling by numeric PID"
+                    )
+                else:
+                    try:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    except (OSError, AttributeError) as exc:
+                        LOG.error("ACPI thermal: hook pidfd kill failed: %s", exc)
+        finally:
+            if fd is not None:
+                os.close(fd)
+                process.hook_pidfd = None
+            self.retired_hooks.append(process)
+            self.hook_process = None
+
+    def ensure_incident_latched(self) -> None:
+        """Retry the incident file until this boot's copy is durable."""
+        if self.stage == "idle" or acpi_record_current(ACPI_INCIDENT_NAME):
+            return
+        try:
+            record_acpi_boot(ACPI_INCIDENT_NAME)
+        except (OSError, RuntimeError) as exc:
+            LOG.critical(
+                "ACPI thermal: cannot persist incident; recovery reboot inhibited: %s",
+                exc,
+            )
+
+    @staticmethod
+    def identity(pid, proc_root=Path("/proc")):
+        """Return an identity only for a non-root, non-system workload process."""
+        ancestors = {os.getpid()}
+        parent = os.getppid()
+        while parent > 1 and parent not in ancestors:
+            ancestors.add(parent)
+            try:
+                text = (proc_root / str(parent) / "stat").read_text()
+                parent = int(text[text.rindex(")") + 2:].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+        if pid <= 1 or pid in ancestors:
+            return None
+        try:
+            base = proc_root / str(pid)
+            status = (base / "status").read_text()
+            uids = re.search(r"^Uid:\s+(.*)$", status, re.M)
+            if not uids or 0 in [int(v) for v in uids[1].split()]:
+                return None
+            stat_text = (base / "stat").read_text()
+            end = stat_text.rindex(")")
+            name = stat_text[stat_text.index("(") + 1:end]
+            fields = stat_text[end + 2:].split()
+            if fields[0] == "Z" or not (base / "cmdline").read_bytes():
+                return None
+            cgroup = (base / "cgroup").read_text()
+            if any(part in cgroup for part in ("/system.slice", "/init.scope")):
+                return None
+            critical = {"systemd", "init", "sshd", "dbus-daemon", "dbus-broker",
+                        "sudo", "login", "agetty", "polkitd", "NetworkManager",
+                        "dgx-fan-control", "nvidia-persist", "nvidia-persiste"}
+            if name in critical:
+                return None
+            # Linux stat field 22 (starttime); fields[0] is field 3.
+            return (int(fields[19]), name)
+        except (OSError, ValueError, IndexError):
+            return None
+
+    def discover_targets(self):
+        candidates = set()
+        self.discovery_complete = True
+        self.blocked_targets = set()
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+                check=False)
+            if result.returncode != 0:
+                self.discovery_complete = False
+                LOG.error("ACPI thermal: nvidia-smi compute PID query failed: %s", result.stderr)
+            else:
+                for line in result.stdout.splitlines():
+                    value = line.strip()
+                    if value.isdigit():
+                        candidates.add(int(value))
+                    elif value:
+                        self.discovery_complete = False
+                        LOG.error("ACPI thermal: unparseable compute PID %r; recovery reboot inhibited", value)
+        except (OSError, subprocess.TimeoutExpired, OfflineGuardError) as exc:
+            self.discovery_complete = False
+            LOG.error("ACPI thermal: nvidia-smi unavailable or timed out: %s", exc)
+        for value in self.defaults.get("ACPI_THERMAL_PIDS", "").replace(",", " ").split():
+            if value.isdigit():
+                candidates.add(int(value))
+            else:
+                LOG.error("ACPI thermal: ignoring invalid PID %r", value)
+        names = set(self.defaults.get("ACPI_THERMAL_PROCESS_NAMES", "").replace(",", " ").split())
+        if names and not offline_guard_active():
+            for path in Path("/proc").glob("[0-9]*"):
+                try:
+                    if (path / "comm").read_text().strip() in names:
+                        candidates.add(int(path.name))
+                except OSError:
+                    pass
+        # Explicit PID and process-name lists never bypass these exclusions.
+        found = {}
+        for pid in candidates:
+            identity = self.identity(pid)
+            if identity is not None:
+                found[pid] = identity
+            else:
+                if (Path("/proc") / str(pid)).exists():
+                    self.blocked_targets.add(pid)
+                LOG.warning("ACPI thermal: protected, exited, or unreadable PID %s; not signaling", pid)
+        return found
+
+    def signal_targets(self, targets, sig):
+        for pid, expected in targets.items():
+            fd = None
+            try:
+                # pidfds pin a process, preventing a PID-reuse race between
+                # inspection and signaling. No unsafe os.kill fallback.
+                if offline_blocks_real(os.pidfd_open):
+                    raise OfflineGuardError("offline tests refuse to signal a process")
+                fd = os.pidfd_open(pid)
+                if self.identity(pid) != expected:
+                    LOG.warning("ACPI thermal: PID %s changed/protected; skipped", pid)
+                    continue
+                if offline_blocks_real(signal.pidfd_send_signal):
+                    raise OfflineGuardError("offline tests refuse to signal a process")
+                signal.pidfd_send_signal(fd, sig)
+                LOG.critical("ACPI thermal: sent %s to workload PID %s", sig.name, pid)
+            except (OSError, AttributeError) as exc:
+                LOG.error("ACPI thermal: cannot safely signal PID %s: %s", pid, exc)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
+    def step(self, hot, now, force_max, ec_only=False):
+        snapshot = None
+        def targets():
+            # One bounded compute query per poll, even when a hot sample
+            # preempts several stages. Every signal still rechecks identity.
+            nonlocal snapshot
+            if snapshot is None:
+                snapshot = self.targets()
+            return dict(snapshot)
+
+        self.retired_hooks = [p for p in self.retired_hooks if p.poll() is None]
+        if ec_only:
+            if not self.ec_logged:
+                LOG.critical(
+                    "EC-only thermal phase: monitoring stock EC control; "
+                    "no ACPI writes and no second reboot"
+                )
+                self.ec_logged = True
+        else:
+            # A failed persist must be retried before this poll decides to reboot.
+            # EC-only mode must not rewrite the incident boot id.
+            self.ensure_incident_latched()
+        measured = hot is not None and math.isfinite(hot)
+        if not measured:
+            # An accepted recovery reboot stands. A missing sample must not
+            # turn it into poweroff, and neither must residual heat.
+            if self.stage == "reboot":
+                self.clear_poweroff_clock()
+                LOG.critical(
+                    "ACPI thermal: hottest zone unreadable after recovery "
+                    "reboot was requested; leaving the reboot in place"
+                )
+                return
+            if ec_only:
+                # Not a measured sample. It breaks the poweroff clock and
+                # does not count as time at the ceiling.
+                self.clear_poweroff_clock()
+                LOG.critical(
+                    "EC-only thermal phase: hottest zone unreadable; "
+                    "not writing ACPI and not powering off on this sample"
+                )
+                return
+            LOG.critical(
+                "ACPI thermal: hottest zone unreadable; escalating "
+                "conservatively as %.1fC. This phase-1 sample can continue "
+                "a poweroff clock; an EC-only unreadable sample cannot",
+                self.shutdown_c,
+            )
+            hot = self.shutdown_c
+        else:
+            # Advisory only. It must not fall through into a latch or a timer.
+            self.note_advisory(hot, ec_only)
+            if hot < self.shutdown_c:
+                self.clear_poweroff_clock()
+        # The poweroff clock is owned by ec-watch, kill, and reboot-wait.
+        # Every other stage, including reboot, drops it.
+        if self.stage not in ("ec-watch", "kill", "reboot-wait"):
+            self.clear_poweroff_clock()
+        if not ec_only and hot >= self.fan_c:
+            # The latch is persisted BEFORE the writes. A failed/partial write
+            # is retried next poll; no lower-level writer can undo escalation.
+            try:
+                record_acpi_boot(ACPI_MAX_NAME)
+            except (OSError, RuntimeError) as exc:
+                LOG.critical("ACPI thermal: cannot persist maximum latch: %s", exc)
+            try:
+                force_max()
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.critical("ACPI thermal: level 100 request failed: %s", exc)
+            if not self.max_logged:
+                LOG.critical("ACPI thermal: hottest %.1fC >= %.1fC; forcing level 100; EC curve remains replaced", hot, self.fan_c)
+                self.max_logged = True
+        if self.stage == "reboot":
+            self.clear_poweroff_clock()
+            return
+        # Below 80 C the advisory is the whole policy. Do not query targets,
+        # arm the incident, or start a stop-stage timer from it.
+        if self.stage == "idle" and hot < self.fan_c:
+            return
+
+        def stopped():
+            remaining = targets()
+            survivors = any(
+                self.identity(pid) == ident for pid, ident in self.selected.items()
+            )
+            return (
+                not remaining and not survivors and not self.blocked_targets
+                and self.discovery_complete
+            )
+
+        def begin_term(reason):
+            self.finish_hook()
+            self.selected = targets()
+            LOG.critical("ACPI thermal: %s; SIGTERM workload targets", reason)
+            self.send(self.selected, signal.SIGTERM)
+            self.stage, self.since = "term", now
+
+        if self.stage == "reboot-wait":
+            if not stopped():
+                self.clear_poweroff_clock()
+                self.stage = "idle"
+            else:
+                status = self.reboot()
+                if status == 0:
+                    self.clear_poweroff_clock()
+                    self.stage = "reboot"
+                elif self.ceiling_held(hot, now):
+                    self._last_resort_shutdown(
+                        hot,
+                        "recovery reboot failed and the zone stayed at or "
+                        "above %.1fC" % self.shutdown_c,
+                    )
+                return
+        if self.stage == "ec-watch":
+            if not stopped():
+                # The stop is no longer confirmed. A cool sample or a new
+                # process ends the observation, including when discovery fails.
+                self.clear_poweroff_clock()
+                if hot >= self.fan_c:
+                    self.stage = "idle"
+                else:
+                    return
+            else:
+                reason = self.post_stop_reason(hot, now)
+                if reason:
+                    self._last_resort_shutdown(hot, reason)
+                return
+        if self.stage == "incident" and hot >= self.fan_c and not stopped():
+            self.stage = "idle"
+        if self.stage == "idle" and hot >= self.fan_c:
+            if ec_only:
+                # Before any signal, so a concurrent health --record cannot
+                # resume a job this phase has already started to stop.
+                try:
+                    record_acpi_boot(ACPI_EC_STOP_NAME)
+                except (OSError, RuntimeError) as exc:
+                    LOG.error(
+                        "EC-only phase: cannot record thermal stop; "
+                        "resume remains possible until the marker is written: %s",
+                        exc,
+                    )
+            else:
+                try:
+                    record_acpi_boot(ACPI_INCIDENT_NAME)
+                except (OSError, RuntimeError) as exc:
+                    LOG.critical("ACPI thermal: cannot persist incident; recovery reboot inhibited: %s", exc)
+            command = self.hook_command()
+            # A poll that is already at SIGTERM or SIGKILL does not spend the
+            # hook grace. The hook runs only in the band under STOP.
+            if command and hot < self.stop_c:
+                failed = False
+                try:
+                    self.hook_process = self.hook()
+                except (OSError, ValueError) as exc:
+                    LOG.error("ACPI thermal: stop hook failed to start: %s", exc)
+                    self.hook_process = None
+                    failed = True
+                else:
+                    process = self.hook_process
+                    if process is None or process.poll() not in (None, 0):
+                        failed = True
+                if failed:
+                    begin_term(
+                        "stop hook failed; this is not the no-hook reaction window"
+                    )
+                else:
+                    LOG.critical(
+                        "%s: hottest %.1fC >= %.1fC; stop hook started",
+                        "EC-only phase" if ec_only else "ACPI thermal",
+                        hot, self.fan_c,
+                    )
+                    self.since = now
+                    self.stage = "hook"
+            else:
+                self.stage = "reaction"
+                if not command and hot < self.stop_c and not self.reaction_logged:
+                    LOG.critical(
+                        "%s: no stop hook configured; SIGTERM waits for "
+                        "%.1fC (now %.1fC). Time spent under %.1fC does "
+                        "not send SIGTERM",
+                        "EC-only phase" if ec_only else "ACPI thermal",
+                        self.stop_c, hot, self.stop_c,
+                    )
+                    self.reaction_logged = True
+        if self.stage == "reaction" and hot >= self.stop_c and not stopped():
+            begin_term(
+                "no-hook reaction window ended at %.1fC" % self.stop_c
+                if not self.hook_command()
+                else "temperature reached %.1fC before the stop hook" % self.stop_c
+            )
+        if self.stage == "hook":
+            process = self.hook_process
+            code = None if process is None else process.poll()
+            failed = process is None or (code is not None and code != 0)
+            timed_out = now - self.since >= self.hook_s
+            if failed:
+                begin_term("stop hook failed; this is not the no-hook reaction window")
+            elif code == 0 and stopped():
+                self.finish_hook()
+            elif timed_out or hot >= self.stop_c:
+                self.finish_hook()
+                if not stopped() and hot >= self.stop_c - self.hysteresis:
+                    if hot >= self.stop_c:
+                        begin_term("temperature reached %.1fC" % self.stop_c)
+                    else:
+                        begin_term(
+                            "stop hook grace of %.0fs ended at %.1fC, "
+                            "still under %.1fC" % (self.hook_s, hot, self.stop_c)
+                        )
+                elif not stopped():
+                    self.stage = "cooling"
+        if self.stage == "cooling" and hot >= self.stop_c and not stopped():
+            begin_term("temperature returned to %.1fC" % self.stop_c)
+        entered_kill = False
+        if self.stage == "term" and (now - self.since >= self.term_s or hot >= self.kill_c):
+            if not stopped():
+                live = targets()
+                survivors = {p: ident for p, ident in self.selected.items()
+                             if self.identity(p) == ident}
+                if survivors or hot >= self.stop_c - self.hysteresis:
+                    live.update(survivors)
+                    self.selected = live
+                    LOG.critical(
+                        "ACPI thermal: load survived or insufficient cooling; "
+                        "SIGKILL workload targets"
+                    )
+                    self.send(live, signal.SIGKILL)
+                    # since is this SIGKILL. The poweroff clock starts over;
+                    # it does not keep time from an earlier watch.
+                    self.clear_poweroff_clock()
+                    self.stage, self.since = "kill", now
+                    entered_kill = True
+        if (ec_only and self.stage not in ("idle", "reboot", "shutdown", "ec-watch")
+                and stopped()):
+            self.finish_hook()
+            LOG.critical(
+                "EC-only phase: workload confirmed stopped; not rebooting and "
+                "not resuming; watching the stock EC curve"
+            )
+            self.ceiling_since = None
+            self.stage, self.since = "ec-watch", now
+        elif (not ec_only and self.stage not in (
+                "idle", "reboot", "shutdown", "reboot-wait")
+                and acpi_record_current(ACPI_INCIDENT_NAME) and stopped()):
+            self.finish_hook()
+            try:
+                mark_ec_protection_phase()
+            except (OSError, RuntimeError) as exc:
+                LOG.critical("ACPI thermal: cannot persist EC-only phase: %s", exc)
+            LOG.critical(
+                "ACPI thermal: workload confirmed stopped; running systemctl "
+                "reboot to restore EC control; incident remains latched"
+            )
+            status = self.reboot()
+            if status == 0:
+                self.clear_poweroff_clock()
+                self.stage = "reboot"
+            else:
+                LOG.critical(
+                    "ACPI thermal: recovery reboot failed (%s); "
+                    "poweroff waits for a new %.0fs at or above %.1fC",
+                    status, self.shutdown_s, self.shutdown_c,
+                )
+                # Drop any SIGKILL clock. This poll can start the new one
+                # and cannot complete it.
+                self.clear_poweroff_clock()
+                self.stage = "reboot-wait"
+                self.since = now
+                self.ceiling_held(hot, now)
+        elif self.stage == "kill":
+            # SIGKILL already happened. Staying under the shutdown threshold
+            # does not power off. The first sample at the threshold only
+            # starts the clock.
+            held = self.ceiling_held(hot, now)
+            if held and not entered_kill:
+                self._last_resort_shutdown(
+                    hot,
+                    "workload stop not verified and the zone stayed at or "
+                    "above %.1fC" % self.shutdown_c,
+                )
+
+    def _last_resort_shutdown(self, hot, reason):
+        if self.stage in ("reboot", "shutdown"):
+            return
+        if not self.shutdown_enabled:
+            LOG.critical(
+                "ACPI thermal: shutdown explicitly disabled; machine remains hot at %.1fC (%s)",
+                hot, reason,
+            )
+            self.stage = "disabled"
+            return
+        LOG.critical(
+            "ACPI thermal: %s (%.1fC); running systemctl poweroff", reason, hot,
+        )
+        status = self.shutdown()
+        if status != 0:
+            LOG.critical("ACPI thermal: poweroff failed (%s); will retry next poll", status)
+        else:
+            self.stage = "shutdown"
+
+
+def poll_acpi_thermal(guard, thermal_root, hwmon_root, now, zero_fan_celsius=WATCHDOG_ZERO_FAN_CELSIUS):
+    phase = acpi_protection_phase()
+    if phase == "off":
+        guard.clear_poweroff_clock()
+        return
+    if classify_fan_binding(thermal_root, hwmon_root) == "unsupported":
+        guard.clear_poweroff_clock()
+        return
+    # Preserve the existing true-zero 85 C path and its precedence. This policy
+    # covers spinning or unknown fans. Verified 0/0 at or above the cutoff,
+    # and verified 0/0 with an unreadable zone, stay on that path: the old
+    # rule does not power off when the zone cannot be read.
+    try:
+        rpms = read_named_fan_rpms(hwmon_root)
+        true_zero = rpms is not None and len(rpms) >= 2 and all(r == 0 for r in rpms)
+    except (OSError, RuntimeError, ValueError):
+        true_zero = False
+    try:
+        hot = read_hottest_temperature_c(thermal_root)
+    except (OSError, RuntimeError, ValueError):
+        hot = None
+
+    if true_zero and (
+        hot is None or not math.isfinite(hot) or hot >= zero_fan_celsius
+    ):
+        # The true-zero rule owns this sample. It is not time at 90 C.
+        guard.clear_poweroff_clock()
+        return
+
+    def force_max():
+        if phase == "ec":
+            raise RuntimeError("EC-only phase refuses ACPI writes")
+        devices = acpi_fan_devices(thermal_root)
+        if not devices:
+            raise RuntimeError("no ACPI Fan cooling devices")
+        failures = []
+        for device in devices:
+            try:
+                if (device / "cur_state").read_text().strip() != "100":
+                    write_acpi_fan_level(device, ACPI_MAX_LEVEL)
+            except (OSError, RuntimeError, ValueError) as exc:
+                failures.append(f"{device.name}: {exc}")
+        if failures:
+            raise RuntimeError("; ".join(failures))
+    guard.step(hot, now, force_max, ec_only=(phase == "ec"))
+
+
+def set_acpi_fans(thermal_root: Path, level: int = ACPI_MAX_LEVEL,
+                  module_loaded: bool | None = None,
+                  service_active: str | None = None,
+                  force: bool = False,
+                  profile: str | None = None,
+                  report: bool = True) -> None:
+    """Set every ACPI Fan device. On a failed lower level, rewrite them to 100.
+
+    Refuses while this module is loaded or its daemon is active, unless force
+    is set. A level below 35 is refused before any write. Level 0 stops both
+    fans. EC 3.13.7 accepts the ACPI write and ignores RPM.
+    """
+    if level < ACPI_MIN_LEVEL or level > ACPI_MAX_LEVEL:
+        raise ValueError(
+            f"refusing ACPI fan level {level}: this command only writes "
+            f"{ACPI_MIN_LEVEL} through {ACPI_MAX_LEVEL}. "
+            "Level 35 is the lowest level measured to hold. Level 20 has "
+            "stalled one fan. Level 0 stops both fans immediately "
+            "and they stay stopped. Do not write 0."
+        )
+    if module_loaded is None:
+        module_loaded = module_is_loaded()
+    if service_active is None:
+        service_active = systemctl_is_active()
+    refusal = acpi_write_refusal(module_loaded, service_active)
+    if refusal and not force:
+        raise RuntimeError(refusal)
+    if refusal and force:
+        LOG.warning(
+            "forcing an ACPI write while the kernel module or the fan service "
+            "is active. This overwrites the shared EC lower floor. "
+            "Do not write level 0; it stops both fans."
+        )
+    devices = acpi_fan_devices(thermal_root)
+    if not devices:
+        raise RuntimeError("no ACPI Fan cooling device found")
+
+    arm_acpi_monitor(thermal_root)
+
+    def fail_hot() -> None:
+        if level == ACPI_MAX_LEVEL:
+            return
+        for device in devices:
+            try:
+                write_acpi_fan_level(device, ACPI_MAX_LEVEL)
+            except (OSError, RuntimeError, ValueError) as exc:
+                LOG.error(
+                    "fail-hot ACPI write of %s failed: %s", ACPI_MAX_LEVEL, exc,
+                )
+
+    failures: list[BaseException] = []
+    summaries: list[str] = []
+    try:
+        for device in devices:
+            try:
+                write_acpi_fan_level(device, level)
+                summaries.append(acpi_fan_result_line(device))
+            except (OSError, RuntimeError, ValueError) as exc:
+                failures.append(exc)
+        if failures:
+            raise RuntimeError(
+                f"ACPI fan update to {level} failed on {len(failures)} device(s)"
+            )
+        if report:
+            for line in summaries:
+                print(line)
+            print(acpi_result_note(profile))
+    except BaseException:
+        fail_hot()
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -206,13 +5764,133 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("/sys/class/thermal"),
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--hwmon-root",
+        type=Path,
+        default=Path("/sys/class/hwmon"),
+        help=argparse.SUPPRESS,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("acpi-incident-reset", help="after reboot and cooling, explicitly release the incident startup inhibit")
     daemon = subparsers.add_parser("daemon", help="run the smooth performance curve")
     daemon.add_argument("--poll-seconds", type=float, default=POLL_SECONDS)
+    daemon.add_argument(
+        "--curve",
+        choices=tuple(CURVES),
+        default=None,
+        help="performance (default) or quiet; DGX_FAN_CURVE overrides the default",
+    )
+    watchdog = subparsers.add_parser(
+        "watchdog",
+        help="watch true-zero stalls and armed ACPI thermal escalation",
+    )
+    watchdog.add_argument("--poll-seconds", type=float, default=WATCHDOG_POLL_SECONDS)
+    watchdog.add_argument("--zero-seconds", type=float, default=WATCHDOG_ZERO_SECONDS)
+    watchdog.add_argument(
+        "--stall-seconds",
+        type=float,
+        default=WATCHDOG_STALL_SECONDS,
+        help="alert when every fan stays at 0 RPM this long, at any temperature",
+    )
+    watchdog.add_argument(
+        "--zero-fan-celsius",
+        type=float,
+        default=None,
+        help="power off a true zero when the hottest zone reaches this; default 85. Not used while fans spin",
+    )
+    watchdog.add_argument(
+        "--soc-celsius",
+        type=float,
+        default=None,
+        help="deprecated alias for --zero-fan-celsius",
+    )
+    watchdog.add_argument(
+        "--stuck-seconds",
+        type=float,
+        default=STUCK_SECONDS,
+        help="warn when a hot job shows no progress for this long; default 600. Does not stop the job",
+    )
+    watchdog.add_argument("--action", default=WATCHDOG_DEFAULT_ACTION)
+    watchdog.add_argument(
+        "--reboot-seconds",
+        type=float,
+        default=WATCHDOG_REBOOT_SECONDS,
+        help="reboot when fans are still at 0 RPM this long after the stall began and no GPU job is running",
+    )
+    watchdog.add_argument(
+        "--reboot-action",
+        default=WATCHDOG_REBOOT_ACTION,
+        help="command when a true-zero stall has no GPU job; default systemctl reboot",
+    )
+    watchdog.add_argument(
+        "--alert-repeat-seconds",
+        type=float,
+        default=WATCHDOG_ALERT_REPEAT_SECONDS,
+        help="minimum time between repeated wall broadcasts for one ongoing condition",
+    )
+    watchdog.add_argument(
+        "--max-defer-seconds",
+        type=float,
+        default=WATCHDOG_MAX_DEFER_SECONDS,
+        help="after this long deferred, alert and keep waiting; never reboot through work",
+    )
+    acpi_max = subparsers.add_parser(
+        "acpi-max",
+        help="set ACPI Fan cooling devices without this kernel module",
+    )
+    acpi_max.add_argument("--level", type=int, default=ACPI_MAX_LEVEL)
+    acpi_max.add_argument(
+        "--force",
+        action="store_true",
+        help="write ACPI even if this kernel module or its daemon is active",
+    )
+    module = subparsers.add_parser(
+        "module",
+        help="enable or disable the kernel module for ACPI-only fan control",
+    )
+    module.add_argument("action", choices=("disable", "enable", "status"))
+    module.add_argument(
+        "--force-service",
+        action="store_true",
+        help="start the daemon even when fan control is unsupported",
+    )
+    module.add_argument(
+        "--start-service",
+        action="store_true",
+        help="enable and start the performance service; otherwise leave it disabled",
+    )
     set_state = subparsers.add_parser("set-state", help="set one explicit cooling state")
     set_state.add_argument("state", type=int, choices=range(MAX_STATE + 1))
-    subparsers.add_parser("automatic", help="restore firmware-automatic policy")
+    subparsers.add_parser("automatic", help="restore firmware-automatic policy and clear the held floor")
+    subparsers.add_parser(
+        "manual-apply",
+        help="reapply the last-set floor at boot; does not start the performance curve",
+    )
     subparsers.add_parser("status", help="show the cooling state and hottest sensor")
+    health = subparsers.add_parser(
+        "health",
+        help="check fans and thermals after boot, then the optional READY_CHECK",
+    )
+    health.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the needs-intervention flag; requires root",
+    )
+    health.add_argument(
+        "--settle",
+        type=float,
+        default=0,
+        help=(
+            "seconds to retry; interactive health does one pass, "
+            f"the boot unit passes {HEALTH_SETTLE_SECONDS:.0f}"
+        ),
+    )
+    health.add_argument(
+        "--record",
+        action="store_true",
+        help="write the health file and needs-intervention flag; requires root",
+    )
+    health.add_argument("--poll-seconds", type=float, default=HEALTH_POLL_SECONDS)
     return parser
 
 
@@ -220,24 +5898,218 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "acpi-incident-reset":
+            reset_acpi_incident(args.thermal_root)
+            return 0
+        if args.command == "set-state" and acpi_incident_latched():
+            raise RuntimeError("ACPI thermal incident latched; run acpi-incident-reset after reboot first")
         if args.command == "daemon":
-            return run_daemon(args.thermal_root, args.poll_seconds)
-        cooling_device = find_cooling_device(args.thermal_root)
+            return run_daemon(
+                args.thermal_root, args.poll_seconds, args.hwmon_root, args.curve,
+            )
+        if args.command == "watchdog":
+            return run_watchdog(
+                args.thermal_root,
+                args.hwmon_root,
+                poll_seconds=args.poll_seconds,
+                zero_seconds=args.zero_seconds,
+                stall_seconds=args.stall_seconds,
+                reboot_seconds=args.reboot_seconds,
+                zero_fan_celsius=args.zero_fan_celsius,
+                soc_celsius=args.soc_celsius,
+                alert_repeat_seconds=args.alert_repeat_seconds,
+                action=args.action,
+                reboot_action=args.reboot_action,
+                max_defer_seconds=args.max_defer_seconds,
+                stuck_seconds=args.stuck_seconds,
+            )
+        if args.command == "acpi-max":
+            # Telemetry-only firmware (EC 3.13.7): ACPI cur_state writes are
+            # accepted and ignored for RPM. Do not write; leave set_acpi_fans
+            # unchanged for the watchdog stall-repair caller on supported EC.
+            if classify_fan_binding(args.thermal_root, args.hwmon_root) == "unsupported":
+                profile = pinned_ec_name(read_kernel_log()) or "EC 3.13.7"
+                LOG.info(
+                    "acpi-max: nothing written (%s, telemetry only; "
+                    "EC runs its own curve)",
+                    profile,
+                )
+                return 0
+            set_acpi_fans(
+                args.thermal_root, args.level, force=args.force,
+                profile=pinned_ec_name(read_kernel_log()),
+            )
+            return 0
+        if args.command == "module":
+            if os.geteuid() != 0:
+                raise PermissionError("dgx-fan-control module requires root")
+            etc = Path("/etc")
+            loaded = module_is_loaded()
+            if args.action == "disable":
+                disable_kernel_module(etc, runner=None, loaded=loaded)
+                return 0
+            if args.action == "enable":
+                enable_kernel_module(
+                    etc, runner=None, loaded=loaded,
+                    force_service=args.force_service,
+                    start_service=args.start_service,
+                )
+                return 0
+            kind = classify_fan_binding(
+                Path("/sys/class/thermal"), Path("/sys/class/hwmon"),
+            )
+            profile = None
+            try:
+                logged = subprocess.run(
+                    ["dmesg"], check=False, capture_output=True, text=True,
+                )
+                profile = pinned_ec_name(logged.stdout or "")
+            except OSError:
+                profile = None
+            exec_status, exit_timestamp, start_us, exit_us = read_exec_main()
+            watchdog_active, watchdog_enabled = watchdog_unit_state()
+            show_intervention()
+            print(module_status(
+                etc,
+                loaded=loaded,
+                service_active=systemctl_query("is-active"),
+                service_enabled=systemctl_query("is-enabled"),
+                control=describe_control(kind, profile),
+                exec_status=exec_status,
+                exit_timestamp=exit_timestamp,
+                start_monotonic_us=start_us,
+                exit_monotonic_us=exit_us,
+                watchdog_active=watchdog_active,
+                watchdog_enabled=watchdog_enabled,
+            ), end="")
+            return 0
+        if args.command == "manual-apply":
+            return apply_manual_floor(args.thermal_root, args.hwmon_root)
+        if args.command == "health":
+            if args.clear:
+                if os.geteuid() != 0:
+                    print("dgx-fan-control health --clear requires root")
+                    return 1
+                clear_stall_marker(STALL_MARKER_DIR / INTERVENTION_NAME)
+                print("cleared the needs-intervention flag")
+                return 0
+            record_denied = args.record and os.geteuid() != 0
+            if record_denied:
+                print("dgx-fan-control health --record requires root")
+            code = run_health(
+                args.thermal_root,
+                args.hwmon_root,
+                settle_seconds=args.settle,
+                poll_seconds=args.poll_seconds,
+                record=args.record and os.geteuid() == 0,
+            )
+            if record_denied and code == 0:
+                return 1
+            return code
+        if args.command == "status" and scandir_names(args.thermal_root) is None:
+            show_intervention()
+            print(f"state={NEEDS_ROOT} hottest={NEEDS_ROOT}")
+            active, enabled = watchdog_unit_state()
+            print(format_watchdog_status(active, enabled), end="")
+            print(format_manual_floor_line())
+            return 0
+        cooling_device = require_control(args.thermal_root, args.hwmon_root)
         if args.command == "set-state":
             write_state(cooling_device, args.state)
+            remember_manual_floor(
+                args.state,
+                systemctl_query("is-active"),
+                STALL_MARKER_DIR,
+                profile=pinned_ec_name(read_kernel_log()),
+            )
             return 0
         if args.command == "automatic":
             write_state(cooling_device, 0)
+            clear_persisted_manual_floor(STALL_MARKER_DIR)
             return 0
         if args.command == "status":
-            print(
-                f"state={read_state(cooling_device)}/{MAX_STATE} "
-                f"hottest={read_hottest_temperature_c(args.thermal_root):.1f}C"
+            try:
+                state = read_state(cooling_device)
+            except OSError as exc:
+                if not access_denied(exc):
+                    raise
+                state = None
+            except RuntimeError as exc:
+                if "floor was changed outside this driver" in str(exc):
+                    show_intervention()
+                    print(exc)
+                    return 1
+                raise
+            try:
+                hottest = read_hottest_temperature_c(args.thermal_root)
+            except OSError as exc:
+                if not access_denied(exc):
+                    raise
+                hottest = None
+            active, enabled = watchdog_unit_state()
+            show_intervention()
+            if state is None or hottest is None:
+                state_text = NEEDS_ROOT if state is None else f"{state}/{MAX_STATE}"
+                hottest_text = NEEDS_ROOT if hottest is None else f"{hottest:.1f}C"
+                print(f"state={state_text} hottest={hottest_text}")
+            else:
+                print(format_cooling_status(state, hottest))
+            print(format_watchdog_status(active, enabled), end="")
+            print(format_manual_floor_line())
+            return 0
+    except ControlUnsupported as exc:
+        # status is interactive: print the reason once. Logging it as well
+        # repeated the line (ERROR on stderr, then the same text on stdout).
+        # The daemon and the write commands only log, so the journal has one
+        # line. Exit 69 is only the daemon's startup check.
+        if args.command == "status":
+            active, enabled = watchdog_unit_state()
+            show_intervention()
+            print(TELEMETRY_ONLY_STATUS)
+            print(f"clock-cap: {CLOCK_CAP_HINT}")
+            print(format_watchdog_status(active, enabled), end="")
+            return 0
+        # automatic on telemetry-only firmware: there is no floor to clear in
+        # ACPI/sysfs. Still drop a stale last-set record, then exit 0.
+        if args.command == "automatic":
+            clear_persisted_manual_floor(STALL_MARKER_DIR)
+            profile = pinned_ec_name(read_kernel_log()) or "EC 3.13.7"
+            LOG.info(
+                "automatic: nothing to do (%s, telemetry only; "
+                "EC runs its own curve)",
+                profile,
             )
             return 0
-    except (OSError, RuntimeError, ValueError) as exc:
         LOG.error("%s", exc)
-        return CONTROLLER_UNAVAILABLE_EXIT if args.command == "daemon" else 1
+        if args.command == "daemon":
+            return UNSUPPORTED_FIRMWARE_EXIT
+        return 1
+    except ForeignFloor as exc:
+        # One journal line. Exit 78 is not restarted: another start cannot
+        # clear a floor the probe refused. A reboot clears the ACPI floor.
+        if args.command == "status":
+            active, enabled = watchdog_unit_state()
+            show_intervention()
+            print(exc)
+            print(format_watchdog_status(active, enabled), end="")
+            return 1
+        LOG.error("%s", exc)
+        if args.command == "daemon":
+            return FOREIGN_FLOOR_EXIT
+        return 1
+    except (OSError, RuntimeError, ValueError) as exc:
+        if args.command == "status" and (
+            str(exc).startswith("no dgx_ec_fan_floor")
+            or "floor was changed outside this driver" in str(exc)
+        ):
+            active, enabled = watchdog_unit_state()
+            show_intervention()
+            print(exc)
+            print(format_watchdog_status(active, enabled), end="")
+            return 1
+        if not was_reported(exc):
+            LOG.error("%s", exc)
+        return 1
     raise AssertionError(f"unhandled command: {args.command}")
 
 

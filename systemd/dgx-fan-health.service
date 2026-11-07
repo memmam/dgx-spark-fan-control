@@ -1,0 +1,30 @@
+[Unit]
+Description=DGX Spark fan and thermal health check
+# Oneshot after login and SSH are up. The watchdog is a long-running
+# safety loop and must not wait on this check.
+# After= the watchdog is ordering only. No Requires, Wants, BindsTo, or
+# PartOf: this check must not pull the watchdog in, and the watchdog must
+# not depend on this result.
+After=multi-user.target dgx-fan-watchdog.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dgx-fan-control health --record --settle 45
+TimeoutStartSec=120s
+
+# READY_CHECK, the notify hook, and the optional ACPI resume hook may be a
+# URL or another networked command. PrivateNetwork is left unset so that
+# optional check can run. The resume hook is a child of this unit, so
+# ProtectHome still hides home directories.
+# ProtectKernelLogs is left unset so a missing cooling device can be
+# classified from the probe line in the kernel log.
+# RestrictAddressFamilies is left unset for the same optional URL.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=-/var/lib/dgx-fan-control
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

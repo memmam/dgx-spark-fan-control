@@ -1,0 +1,22 @@
+[Unit]
+Description=Reapply the held DGX fan floor
+# Runs after the module can load and before the health check. Before= orders
+# this oneshot ahead of the performance daemon when both are started. It does
+# not start that daemon. An empty last-set record exits without writing.
+After=systemd-modules-load.service
+Before=dgx-fan-health.service
+Before=dgx-fan-control.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dgx-fan-control manual-apply
+# Writes the cooling device only. It does not write an ACPI fan level.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/sys -/var/lib/dgx-fan-control
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

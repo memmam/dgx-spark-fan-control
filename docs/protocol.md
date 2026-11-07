@@ -30,13 +30,64 @@ own services. It does not map the eSPI controller or access EC memory directly.
 | FF-A API | 1.2, 64-bit service |
 | Partition ID / properties | `0x8003` / `0x0109` |
 | Capabilities discriminator | 1 (exact vendor name is unknown) |
-| Unit mode | 0 (RPM) |
-| Fan 0 / fan 1 ranges | 1260–9000 / 1890–13500 RPM |
+| Unit mode | 0 |
+| Capability profiles | Exact match only. See below. |
 
 Submit messages start with command byte `0x01`, then operation, input length,
 output length, and any input bytes. Poll uses command byte `0x02`. The secure
 relay maps this to EC packet family 7. Poll responses begin with a state byte:
-0 complete, 1 EC error, 2 pending; output follows at byte 1.
+0 complete, 1 EC error, 2 pending; output follows at byte 1. The family-7
+mailbox status byte is `0x00` on success and `0xFF` when the command is
+unsupported. Success status `0x00` is the same encoding as poll state 0. This
+driver treats poll state `0xFF` as `-EOPNOTSUPP` rather than as a malformed
+packet. Whether EC 3.13.7's relay forwards `0xFF` in that byte has not been
+confirmed on this driver's path. Probe does not send a floor command on
+EC 3.13.7 unless `allow_unverified_writes=1` was set when the module was loaded.
+
+### Capability profiles
+
+Both known profiles require revision 1 and unit mode 0. Any other combination,
+including a one-count change to any endpoint, is `-EBADMSG`. Probe logs the
+parsed fields and, at debug level, the raw capability bytes.
+
+| Profile | Fan 0 | Fan 1 | Floor commands |
+| --- | --- | --- | --- |
+| EC 3.5.8 | 1260–9000 | 1890–13500 | Required. A rejection fails probe. |
+| EC 3.13.7 | 975–4350 | 975–4350 | Not sent. Probe reads capabilities and telemetry only. |
+
+The 3.5.8 numbers are RPM-mode control ranges. The EC converts a floor to PWM
+against each fan's range. They are not a tachometer scale. The 3.13.7 numbers
+match the ACPI target formula `975 + 33.75 * level` (level 100 is 4350). Public
+comparison of the EC images shows the override handlers and dispatch table
+unchanged between these versions. The handlers return **-5 unsupported** or
+**-116 timeout** when an enable bit is clear. Host command `0xEB` now applies a
+permission table that already marked the fan/thermal block read-only, so the
+host can no longer set that bit. Probe on this profile does not read or write
+the floor. It registers hwmon only, with no cooling device. Floor writes are
+possible only when the module is loaded with `allow_unverified_writes=1`.
+That logs a warning. Do not set the parameter to discover whether writes work.
+
+The 3.13.7 state table is not the bottom of the 975–4350 span. On EC 3.5.8,
+ACPI measurements in [NVIDIA forum topic 386805, post 21](https://forums.developer.nvidia.com/t/new-dgx-spark-fans-barely-speed-up-at-high-temps-and-cant-be-adjusted-critical-please-open-fan-control/386805)
+were about 1620 RPM at level 20 with the second fan stalled, about 1940 at
+level 30, about 2270 at level 40, and about 4320 at level 100. State 1 is
+2000 RPM, above that stall, and state 12 is the reported maximum 4350.
+States 2–11 are `2000 + (4350 - 2000) * (state - 1) / 11`. The profile
+validator rejects any EC 3.13.7 state 1–12 entry below 2000. The numbers are
+still unverified as floor-register values.
+
+EC 3.5.8 fan-floor support was first validated with pre-October SoC firmware.
+Upstream's README does not name one SoC build. Those original notes, in
+[Original hardware work](validation.md#original-hardware-work), record SoC
+**2.155.11** (`0x02009b0b`) on board P4242. October SoC **2.158.15**
+(`0x02009e0f`) has both completed probe on DGX Spark and timed out the
+first read-only query on other boots. `-ETIMEDOUT` during probe refuses the device and names the ACPI `Fan`
+cooling device as the fallback. This driver does not write that ACPI device,
+and it does not clear a non-zero floor it does not own.
+
+RPM readings above 30,000 are still rejected. The driver does not also cap
+readings at the capability maximum: the two profiles do not share one unit,
+and a capability maximum is not a proven tachometer ceiling.
 
 In SoC 2.155.11, that poll reads a **cached secure-partition flag and response**.
 It does not read the physical EC mailbox. Offline replay found completion
@@ -78,9 +129,10 @@ effective_request = max(min(automatic_request, upper_clamp), lower_clamp)
 ```
 
 `0xffff` denotes an unset clamp. This driver only writes the lower clamp,
-through a fixed 13-entry state table. It never writes the upper clamp. Its
-additive guarantee is relative to the firmware policy and any existing upper
-clamp; it does not audit or repair changes made by other software.
+through the 13-entry table of the profile matched at probe. It never writes
+the upper clamp. Its additive guarantee is relative to the firmware policy and
+any existing upper clamp; it does not audit or repair changes made by other
+software.
 
 Probe accepts an unset lower clamp, or a clamp of exactly 0. Any other
 existing value is refused. State changes authenticate the floor and read back
@@ -88,12 +140,18 @@ the result. Before submitting a write, the driver records its attempted floor
 as uncertain. A later completed read may reconcile the last confirmed floor,
 that exact attempted floor, or an unset clamp. This allows recovery when a
 write was applied but its acknowledgement or readback failed. An unrelated
-non-zero value returns `ESTALE` and is never overwritten. A second writer
+non-zero value returns `ESTALE` and is never overwritten. A reply-guard
+refusal, where the shared response does not match the read, returns `EPROTO`
+instead. The daemon retries that after the driver's 30-second recovery
+cooldown. Idle-guard refusal stays `EAGAIN`, with the short userspace retry,
+because that errno already meant "the canaries failed; try again soon."
+Status `0xFF` on the reply returns `EOPNOTSUPP` and is not
+retried. A timed-out setter is still never replayed. A second writer
 using the same value cannot be distinguished, so exclusive relay ownership
 remains required.
 
-A clamp of 0 is not an owner. The fan minima are 1260 and 1890 RPM, and 0
-leaves both fans stopped. The EC retains it across a warm reboot. Probe,
+A clamp of 0 is not an owner. Every accepted profile reports a non-zero
+minimum, and 0 leaves both fans stopped. The EC retains it across a warm reboot. Probe,
 `automatic`, and every other restoration write the unset value over it, so a
 loaded module whose performance service is not running is NVIDIA's curve.
 Registration of the cooling device can itself apply a state (the thermal core's
@@ -146,7 +204,9 @@ shared by all callers, including lifecycle cleanup. Both successful and failed
 attempts are paced. After successful recovery, ordinary healthy transactions
 can continue during cooldown. A failed recovery fences all subsequent
 transactions until another verified recovery succeeds, even if the cached
-pending flag clears in the meantime. This prevents cleanup or another sysfs
+pending flag clears in the meantime, except an unsupported floor reply
+(`-EOPNOTSUPP`), which clears that fence and is not retried. This prevents
+cleanup or another sysfs
 caller from accepting a reply whose physical cross-check failed. No further
 OEM diagnosis or recovery submission starts until cooldown expires.
 Failure retains an error and cannot claim restoration. Successful
@@ -159,6 +219,16 @@ specific to recovery; this version does not add OEM reads to healthy polling.
 Version 0.1.3 adds [incident evidence](incident-logging.md) around the same
 recovery path, including the triggering transaction history and the existing
 physical observations, without additional EC requests.
+Version 0.1.7 does not enter this path after a timeout unless
+`automatic_floor_recovery=1`. A profile that has not been matched, and the
+EC 3.13.7 telemetry profile, never enter it. There is no captured incident
+in which mailbox status bits 0–1 were clear while the packet poll stayed
+pending, which is the guard this path requires before it submits operation
+0x04. The call into secure firmware is not given a host timeout: the
+one-second figure is the poll loop only, and a call that never returns holds
+the transaction mutex. Another FF-A client can still own the floor. A reply
+that matches in both places can still be stale; the host cannot prove it was
+produced by this attempt.
 
 ## Related primary documentation
 

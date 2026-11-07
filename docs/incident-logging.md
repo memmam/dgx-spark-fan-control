@@ -1,7 +1,11 @@
 # Investigating a pending-state incident
 
 Version **0.1.3** records a small history in the driver and prints it when a
-pending timeout admits a recovery attempt. Successful polling adds no journal
+pending timeout admits a recovery attempt. Version 0.1.7 admits that attempt
+only when `automatic_floor_recovery=1` and the matched profile is allowed to
+write a floor. EC 3.13.7, and a probe that has not matched a profile, do not.
+A skipped timeout logs `not submitting a floor read` and does not open an
+incident. Successful polling adds no journal
 messages. The history is fixed at 16 entries per driver instance; it allocates
 no memory per request and adds no EC/FF-A calls. Existing state-change messages
 remain unchanged.
@@ -17,10 +21,12 @@ can still appear.
 
 The `begin` line identifies the requested operation and failure phase:
 `preflight`, `completion`, or `blocked` by an earlier unverified recovery.
-It records driver version, monotonic time, confirmed cooling state, attempted
-floor, uncertain-write and recovery flags, and cached RPM with its validity
-and age. Cached values are not fresh sensor observations. Temperature is not
-sampled as part of diagnosis.
+It records driver version, monotonic time, `CLOCK_REALTIME` (`realtime=`),
+`CLOCK_BOOTTIME` (`uptime=`), confirmed cooling state, attempted floor,
+uncertain-write and recovery flags, and cached RPM with its validity and age.
+The wall clock and uptime are there so a wedge can be compared with other
+tools on the same machine. Cached values are not fresh sensor observations.
+Temperature is not sampled as part of diagnosis.
 
 `totals` contains cumulative submitted capabilities reads, floor reads, floor
 writes, and telemetry reads since module load. These include recovery requests
@@ -37,7 +43,9 @@ steady two-second floor polling usually retains about eight requests. Each
 - Operation, input/output lengths, and requested floor for setters. A zero
   `floor` in a read/preflight entry is a placeholder, not a requested setting.
 - Calling thread ID (`pid`) and CPU at entry; CPU migration afterward is possible.
-- Kernel monotonic `start_ns`, submit-path duration in microseconds, and total
+- Kernel monotonic `start_ns`, plus the incident `begin` line's `realtime=`
+  (`CLOCK_REALTIME`, seconds and nanoseconds) and `uptime=` (`CLOCK_BOOTTIME`).
+  Submit-path duration is in microseconds, and total
   elapsed time through completion or failure. The submit duration includes
   the small bookkeeping immediately around the FF-A call, not just EC work.
 - Submit transport return and raw secure-partition status. `sp` is meaningful

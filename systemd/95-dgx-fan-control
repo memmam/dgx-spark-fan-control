@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Print the needs-intervention flag on later SSH logins. The flag is mode
+# 0644. This script does not decide health; dgx-fan-health.service does.
+flag=/var/lib/dgx-fan-control/needs-intervention
+if [ -s "$flag" ]; then
+  echo
+  echo "DGX fan control needs intervention:"
+  sed -n 's/^reason=//p' "$flag"
+  echo
+fi
+exit 0
