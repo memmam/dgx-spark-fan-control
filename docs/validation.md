@@ -456,7 +456,8 @@ parameters at `N`.
 | saved floor 6 reapplied after reboot | kensaki | boot | **PASS** | `applied manual floor state 6 from last-set` at 19:28:27 PST | already shown; not notifier proof |
 | shutdown reboot notifier | kensaki | boot | **UNVERIFIED** | previous-boot grep had neither success nor failure line. Not a recorded failure | a log that survives shutdown |
 | suspend | kensaki | blocked | **BLOCKED** | `systemctl suspend` refused; no sleep occurred | the NVIDIA drop-in is removed on purpose |
-| sustained load of this module's control path | kensaki | not run | **NOT RUN** | 19:49 PST preflight only: state 0, manual none, 41.8°C, watchdog active, performance service inactive, no GPU job. Not a load pass. Older `gpu_burn` notes are a different EC-curve record | a real session under this module |
+| performance curve under `gpu_burn` | kensaki | supervised | **OBSERVED** | 19:57–20:04 PST. Idle state 1 at 41.9°C, then state 12 at hottest 80.4°C with `dgx_ec_fan` 9000/13500. Cooldown to state 1 at 44.8°C, then stop to state 0 at 42.7°C. The 70°C hottest bound was exceeded. Not a bounded pass and not a module failure. No kernel log. Do not repeat this ramp | source change, or a new bound with a different goal |
+| fixed state 12, idle, service stopped | kensaki | not run | **NOT RUN** | the curve ramp above is not this row. `set-state 12` while the performance service is running is not this row | one idle soak with the service stopped |
 | natural mailbox timeout on 0.1.7 | either | not run | **UNOBSERVED** | do not induce one | one appears in ordinary use |
 | foreign floor `0x10fe` | kensaki | earlier live | **PASS** refuse | module did not clear it; reboot cleared it. Date not recorded | source or regression |
 | state 6 then `automatic` | kensaki | earlier live | **PASS** | returned to the EC curve. Date not recorded | source or regression |
@@ -529,6 +530,43 @@ inactive, `nvidia-smi --query-compute-apps` empty, parameters `N`/`N`.
 No workload was started. This is not a load pass. Fan RPM was not in this
 reading, so the external rig is not taken from the earlier 2700/4050 sample.
 
+### 6 Nov 2026, 19:56–20:04 PST performance curve under load
+
+Checkout `5e7cf1f`. Module 0.1.7. Kensaki. Parameters stayed `N`/`N`.
+No ACPI write. At 19:56 both `/var/lib/dgx-fan-control/acpi-hold-boot` and
+`acpi-incident` were absent. The installed `PERFORMANCE_CURVE` matched the
+checkout: `(0, 1)`, `(50, 3)`, `(55, 5)`, `(60, 8)`, `(65, 10)`, `(70, 12)`.
+The defaults grep printed only `BUSY_CHECK=` with an empty value. `gpu_burn`
+was not on `PATH`. The executable was
+`/home/tipsygnostalgic/gpu-burn/gpu_burn`, 81712 bytes.
+
+At 19:57 the performance service was started and left running. Six seconds
+later it was active, state 1, hottest 41.9°C, watchdog active, and manual
+floor none. The operator then ran foreground `cd ~/gpu-burn && ./gpu_burn 600`,
+with status, the service, and `sensors` watched about every 2 seconds.
+The bound was to stop at 70°C on the hottest zone. At 20:00 the operator
+reported 70 and that it was holding. At 20:02 `gpu_burn` still showed 70°C
+while `status` was state 12, hottest 80.4°C, service active, watchdog
+active, manual floor none. `sensors` read `dgx_ec_fan` 9000/13500 RPM,
+`acpitz` 0 = 80.4°C, 6 = 63.7°C, 4 = 59.8°C, 2 = 60.2°C, and each mlx5 ASIC
+at 60°C. The burn was interrupted. No exit text and no duration were
+supplied, so this is not a completed 600 second run.
+
+With the service still running, the next status in the same minute was
+state 1, hottest 44.8°C, watchdog active, manual floor none. At 20:04
+`nvidia-smi --query-compute-apps` was empty. `systemctl stop` returned
+without an error. Status was state 0, manual floor none, 42.7°C, watchdog
+active and enabled, and `dgx-fan-manual.service` was enabled. The
+performance service's final `is-active` line was not supplied. No kernel
+log was captured, so a mailbox timeout is not ruled in or out.
+
+State 12 at 80.4°C and 9000/13500 RPM is the top of this curve, and the
+fall to state 1 at 44.8°C is the idle point below 50°C. Stop returned
+state 0. That behavior is supported. The run is not a bounded pass,
+because the hottest zone went past the 70°C stop. It is not a module
+failure. The older stock-curve and ACPI-hold `gpu_burn` notes are a
+different record. Do not repeat this ramp.
+
 ### Earlier 0.1.7 observations
 
 The calendar date of these runs was not recorded. They are earlier than
@@ -552,10 +590,11 @@ kept and was not applied.
 These are the open hardware rows. This list is not a request to run them
 from this commit.
 
-- Sustained load while this module is the floor controller on EC 3.5.8.
-  The 19:49 PST reading is preflight only. The passed `service-start-stop`
-  stopped the service and is not this row. Older `gpu_burn` notes describe
-  the stock EC curve and an ACPI hold. They are not this row.
+- Fixed state 12 while idle, with the performance service stopped.
+  The 19:57–20:04 curve ramp already reached state 12 under load and is
+  not repeated. A later burn on that fixed floor is a separate comparison
+  and is not part of the idle soak. Older stock-curve and ACPI-hold
+  `gpu_burn` notes are not either row.
 - A natural mailbox timeout on 0.1.7, only if ordinary use produces one.
   Do not induce it. The open question is still a log line that a floor read
   was not submitted, and that the next read is not operation `0x04`.
