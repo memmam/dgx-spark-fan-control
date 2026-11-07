@@ -96,23 +96,61 @@ confirms the idle pair returned. It is not a load sweep and it does not
 make the 4500/4590 reading a verified shaft speed. No further Kensaki fan
 write is authorized from this row.
 
-## Atarime direct `_FSL` 110
+## Atarime direct `_FSL` 110, 7 Nov 2026 about 14:17 PST
 
-Status: **UNRUN**. No build output and no call output from Atarime are in
-hand. Kensaki's reboot cleanup is already PASS and is a separate row.
+Owner chat time. Do not relabel host-log timestamps as PST. Atarime, EC
+3.13.7. The controller was fully uninstalled. No GPU load. This does not
+repeat on Kensaki. `build-sign-atarime.sh` printed `SIGNED` and
+`BUILD_SIGNED_NOT_LOADED`.
 
-The same `research/fsl110` module is the caller. `run-once.sh` stays
-Kensaki-only. Atarime is `build-sign-atarime.sh` then
-`run-once-atarime.sh`, and only after the build script prints
-`BUILD_SIGNED_NOT_LOADED`. The build script signs with the DKMS-configured
-certificate only when `mokutil --test-key` says that certificate is already
-enrolled. It does not generate or enroll a key. The run script requires
-hostname `atarime`, the controller absent, exactly two nonzero `acpi_fan`
-readings, every thermal zone in 25–60 °C, and GPU utilization 0. It does
-not require 2700/4050. One `run` only. `interpreter_ok` is not an EC accept
-or reject. Speeds that stay near the idle tach are no observed effect, not
-a protocol rejection. Unload does not clear a hold. Reboot after the trial
-whatever the speeds do. Do not mark this PASS from the script existing.
+`run-once-atarime.sh` zones before, millidegrees C: 43500, 40800, 41700,
+40800, 41700, 43500, 40800. GPU utilization 0 and 41 °C. Fans 2066 and
+2156. Status `interpreter_ok`. Samples 2066/2156, 2071/2155, 2066/2156.
+Zones after: 43500, 40800, 41600, 40800, 41800, 43500, 40800. The module
+was unloaded.
+
+Before the reboot, about a minute of fanwatch at 42–43 °C stayed near
+2061–2077 and 2148–2162. One sample showed fan 2 at 0 between normal
+samples, and the next second was normal again. That zero is not a verified
+physical stop, and it is not attributed. The kernel log was saved at
+`~/atarime-fsl110-kernel.log`. The full file was not supplied. The posted
+warnings match startup lines also seen on Kensaki, plus an unclean FAT
+mount of `sda1`. `lsblk` showed that device as the recovery USB `BOOTME`,
+not an internal disk. No fan-specific error was reported. Kensaki's
+current `-b` log is from after its reboot, so it cannot be compared with
+the trial.
+
+The operator then rebooted. About two minutes of fanwatch at 43 °C stayed
+near 2070/2155 with no zeros, and fanwatch was then stopped. The idle tach
+looks intact. That is not proof that every hold bit was released.
+
+`interpreter_ok` means the interpreter returned. It does not mean the EC
+accepted or rejected argument 110. There was no observed sustained speed
+change. That is not a proven protocol rejection. Kensaki's 4500/4590
+reading and Atarime's tach are different readouts. A change in one is not
+physical evidence about the other. Do not repeat argument 110 without a
+new question.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- evaluation: PASS
+- sustained speed response: no observed effect
+- protocol rejection: NOT PROVEN
+- physical RPM and the transient zero: UNVERIFIED
+- post-reboot idle tach: recorded, hold release not fully proven
+
+## Next research calls, not yet run
+
+Kensaki ramp and the Atarime level-120 probe are **UNRUN**. Argument 110
+is not part of either. The encoded Kensaki requests are 120, then 130,
+then 140 (5025, 5362, and 5700). The ramp stops there. It does not
+approach the 16-bit wrap near level 1913. The Atarime probe is argument
+120 only (5025). Published Kensaki numbers are still not shaft RPM. The
+EC 3.5.8 telemetry endpoints 9000 and 13500 are not a license to request
+them.
+
+## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and
 the EC blocked in `DisabledDevices`. SoC/UEFI stayed October `0x02009e0f`.

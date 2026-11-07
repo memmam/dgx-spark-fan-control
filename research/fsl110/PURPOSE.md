@@ -22,8 +22,12 @@ EC kept 4687. Unload does not undo a hold. The release that has restored
 
 `run-once.sh` is Kensaki only and still requires the 2700/4050 pair. Atarime
 uses `build-sign-atarime.sh` and `run-once-atarime.sh`. Those refuse any other
-hostname. The module is unchanged: one `run` still calls `\_SB.FAN0._FSL`
+hostname. The 110 module is unchanged: one `run` still calls `\_SB.FAN0._FSL`
 with 110 and a second `run` is refused before ACPI.
+
+`fsl_ramp_kensaki` accepts only `step`, and only for arguments 120, then 130,
+then 140. `fsl_probe_atarime` accepts one `run` and only argument 120. A
+failed ramp step latches and refuses the rest. Neither module is the 110 helper.
 
 ## Cleanup
 
