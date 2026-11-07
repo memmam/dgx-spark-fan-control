@@ -1,5 +1,5 @@
 #!/bin/bash
-# Kensaki only. Continuation from argument 160 through 237.
+# EC 3.5.8 continuation from argument 160 through 237.
 # 120-150 already ran; this binary does not issue them.
 # Does not insmod until the baseline is clean. Does not wrap the ACPI write
 # in a timeout.
@@ -16,14 +16,15 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ramp-temps-lib.sh
 source ./ramp-temps-lib.sh
-exec > >(tee -a kensaki-ramp-hostlog.txt) 2>&1
+# shellcheck source=ec-profile.sh
+source ./ec-profile.sh
+exec > >(tee -a ramp-ec358-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "host local clock, not labeled PST"
 echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
-test "${DGX_FSL_RAMP_KENSAKI:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+test "${DGX_FSL_RAMP_EC358:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
+require_ec 3.5.8
 steps=(160 170 180 190 200 210 220 225 230 232 234 236 237)
 gpu_idle() {
   local utils
@@ -36,8 +37,8 @@ gpu_idle() {
 stepped=0
 loaded_by_us=0
 cleanup() {
-  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_ramp_kensaki '; then
-    rmmod fsl_ramp_kensaki || true
+  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_ramp '; then
+    rmmod fsl_ramp || true
     echo "unloaded; this did not undo a hold"
   fi
   if [ "$stepped" = 1 ]; then
@@ -52,9 +53,7 @@ for u in dgx-fan-control dgx-fan-watchdog dgx-fan-manual dgx-fan-health; do
     echo STOP_CONTROLLER; exit 1
   }
 done
-for p in /proc/fsl110 /proc/fsl_ramp_kensaki /proc/fsl120_atarime; do
-  test ! -e "$p" || { echo "STOP_ALREADY_LOADED $p"; exit 1; }
-done
+refuse_loaded_research
 mapfile -t paths < <(
   for h in /sys/class/hwmon/hwmon*; do
     test "$(cat "$h/name" 2>/dev/null || true)" = acpi_fan || continue
@@ -126,15 +125,15 @@ done
 pre_a=$(med5 "${samples_a[@]:10:5}")
 pre_b=$(med5 "${samples_b[@]:10:5}")
 echo "baseline_median_last5 $pre_a $pre_b"
-test -f ./fsl_ramp_kensaki.ko || { echo STOP_NO_MODULE; exit 1; }
-insmod ./fsl_ramp_kensaki.ko || { echo STOP_INSMOD; exit 1; }
+test -f ./fsl_ramp.ko || { echo STOP_NO_MODULE; exit 1; }
+insmod ./fsl_ramp.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
 echo "loaded; unload will not restore fans"
 for expect in "${steps[@]}"; do
   echo "writing step for $expect; the write blocks until the interpreter returns"
   stepped=1
-  printf '%s\n' step > /proc/fsl_ramp_kensaki || { echo STOP_WRITE; exit 1; }
-  status=$(cat /proc/fsl_ramp_kensaki || true)
+  printf '%s\n' step > /proc/fsl_ramp || { echo STOP_WRITE; exit 1; }
+  status=$(cat /proc/fsl_ramp || true)
   printf 'status %s\n' "$status"
   test "$status" = "ok $expect" || { echo "STOP_STATUS raw=$status"; exit 1; }
   echo "=== dwell after $expect ==="

@@ -1,7 +1,7 @@
 # fsl110
 
-Research-only one-shot for Kensaki. It is not the fan controller, it is not
-DKMS, and nothing in the controller install path loads it.
+Research-only callers. They are not the fan controller, not DKMS, and
+nothing in the controller install path loads them.
 
 Ubuntu `acpi-call` 1.2.2-2.1 is the nix-community 1.2.2 source with no patch
 to `do_acpi_call`. After `acpi_evaluate_object` succeeds it always calls
@@ -17,21 +17,29 @@ Init and exit do not evaluate AML. A write is evaluated only when the text is
 exactly `run`, and a second `run` returns `-EBUSY` before ACPI.
 
 `interpreter_ok` means the interpreter returned success. It does not mean the
-EC kept 4687. Unload does not undo a hold. The release that has restored
-2700/4050 is a reboot, seen after level 100 through this same method.
+EC kept the requested speed. Unload does not undo a hold.
 
-`run-once.sh` is Kensaki only and still requires the 2700/4050 pair. Atarime
-uses `build-sign-atarime.sh` and `run-once-atarime.sh`. Those refuse any other
-hostname. The 110 module is unchanged: one `run` still calls `\_SB.FAN0._FSL`
-with 110 and a second `run` is refused before ACPI.
+`build-sign-ec358.sh` and `run-once.sh` are the EC 3.5.8 one-shot. The
+launcher requires `DGX_FSL_EC358=yes` and the 2700/4050 pair.
+`build-sign-ec3137.sh` and `run-once-ec3137.sh` are the same module for an
+EC 3.13.7 machine, with `DGX_FSL_EC3137=yes`. Each launcher reads fwupd and
+the current kernel pin and stops unless one of those reports the expected
+version and neither reports a different one. A hidden Embedded Controller
+with no pin stops the launcher. The scripts do not change fwupd's block and
+do not infer a profile from the machine name.
 
-`fsl_ramp_kensaki` accepts only `step`, from argument 160 through 237
-(request 8973). Levels 120–150 are not in this binary. `fsl_probe_atarime` accepts one `run` and only argument
-120. A failed ramp step latches and refuses the rest. Neither module is the
-110 helper.
+`fsl_ramp` accepts only `step`, from argument 160 through 237 (request
+8973). Levels 120–150 are not in this binary. `fsl_probe` accepts one `run`
+and only argument 120. A failed ramp step latches and refuses the rest.
+`fst_status` only reads `_FST`.
+
+Signing uses `DGX_MOK_KEY` and `DGX_MOK_CERT` when both are set, otherwise
+the single DKMS mok path. The scripts do not print those paths, create a
+key, or enroll one.
 
 ## Cleanup
 
-`rmmod fsl110` removes `/proc/fsl110` and does not change the fan. Delete this
-directory when the module is unloaded. Do not add it to DKMS or
-`modules-load.d`.
+`rmmod` of the module this script loaded removes its proc entry and does
+not change the fan. Do not add these modules to DKMS or `modules-load.d`.
+Rebuild after this tree's module names change, and do not leave an older
+research module loaded beside the new one.

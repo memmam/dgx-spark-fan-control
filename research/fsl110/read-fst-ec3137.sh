@@ -1,5 +1,5 @@
 #!/bin/bash
-# Atarime only. One read of the existing _FST methods. No _FSL and no SMC.
+# EC 3.13.7 only. One read of the existing _FST methods. No _FSL write.
 # Test environment variables stop the script before any hardware read.
 set -u
 if [ -n "${THERMAL_ROOT+x}" ] || [ -n "${NVIDIA_SMI_STUB+x}" ] || [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
@@ -9,18 +9,19 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ramp-temps-lib.sh
 source ./ramp-temps-lib.sh
-exec > >(tee -a atarime-fst-read-hostlog.txt) 2>&1
+# shellcheck source=ec-profile.sh
+source ./ec-profile.sh
+exec > >(tee -a fst-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "host local clock, not labeled PST"
 echo "nvidia_gpu_temp is temperature.gpu, not an SoC reading"
-test "${DGX_FST_READ_ATARIME:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+test "${DGX_FST_READ_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-test "$hn" = atarime || { echo STOP_HOST; exit 1; }
+require_ec 3.13.7
 loaded_by_us=0
 cleanup() {
-  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fst_status_atarime '; then
-    rmmod fst_status_atarime || true
+  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fst_status '; then
+    rmmod fst_status || true
     echo "unloaded; _FST was only read"
   fi
 }
@@ -32,9 +33,7 @@ for u in dgx-fan-control dgx-fan-watchdog dgx-fan-manual dgx-fan-health; do
     echo STOP_CONTROLLER; exit 1
   }
 done
-for p in /proc/fsl110 /proc/fsl_ramp_kensaki /proc/fsl120_atarime /proc/fst_status_atarime; do
-  test ! -e "$p" || { echo "STOP_ALREADY_LOADED $p"; exit 1; }
-done
+refuse_loaded_research
 zones_ok /sys/class/thermal || exit 1
 echo "$(date -Is) zones$ZONE_LINE hottest=$HOTTEST"
 utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null) || {
@@ -56,12 +55,12 @@ b=$(cat "${paths[1]}") || { echo "STOP_READ unreadable ${paths[1]}"; exit 1; }
 echo "fans ${paths[0]}=$a ${paths[1]}=$b"
 [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || { echo "STOP_READ nonnumeric $a $b"; exit 1; }
 test "$a" -gt 0 && test "$b" -gt 0 || { echo "STOP_READ zero $a $b"; exit 1; }
-test -f ./fst_status_atarime.ko || { echo STOP_NO_MODULE; exit 1; }
-insmod ./fst_status_atarime.ko || { echo STOP_INSMOD; exit 1; }
+test -f ./fst_status.ko || { echo STOP_NO_MODULE; exit 1; }
+insmod ./fst_status.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
-printf '%s\n' read > /proc/fst_status_atarime || { echo STOP_WRITE; exit 1; }
+printf '%s\n' read > /proc/fst_status || { echo STOP_WRITE; exit 1; }
 echo -n "fst "
-cat /proc/fst_status_atarime || true
+cat /proc/fst_status || true
 echo
 echo "FST_READ_DONE"
 echo "This did not send a fan setpoint. The three numbers are revision, cached control, and speed."

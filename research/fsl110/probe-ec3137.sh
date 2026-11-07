@@ -1,21 +1,26 @@
 #!/bin/bash
-# Atarime only. One argument, 120. No second write.
+# EC 3.13.7 only. One argument, 120. No second write.
 # interpreter_ok is not an EC accept or reject.
 # Cleanup only unloads a module this script loaded. It does not write a release.
 set -u
+if [ -n "${THERMAL_ROOT+x}" ] || [ -n "${NVIDIA_SMI_STUB+x}" ] || [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
+  echo STOP_TEST_ENV
+  exit 1
+fi
 cd "$(dirname "$0")"
-exec > >(tee -a atarime-probe120-hostlog.txt) 2>&1
+# shellcheck source=ec-profile.sh
+source ./ec-profile.sh
+exec > >(tee -a probe-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "host local clock, not labeled PST"
-test "${DGX_FSL_PROBE_ATARIME:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+test "${DGX_FSL_PROBE_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-test "$hn" = atarime || { echo STOP_HOST; exit 1; }
+require_ec 3.13.7
 armed=0
 loaded_by_us=0
 cleanup() {
-  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_probe_atarime '; then
-    rmmod fsl_probe_atarime || true
+  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_probe '; then
+    rmmod fsl_probe || true
     echo "unloaded; this did not undo a hold"
   fi
   if [ "$armed" = 1 ]; then
@@ -30,9 +35,7 @@ for u in dgx-fan-control dgx-fan-watchdog dgx-fan-manual dgx-fan-health; do
     echo STOP_CONTROLLER; exit 1
   }
 done
-for p in /proc/fsl110 /proc/fsl_ramp_kensaki /proc/fsl120_atarime; do
-  test ! -e "$p" || { echo "STOP_ALREADY_LOADED $p"; exit 1; }
-done
+refuse_loaded_research
 zones_ok() {
   local z t
   for z in /sys/class/thermal/thermal_zone*; do
@@ -117,15 +120,15 @@ while [ "$i" -le 15 ]; do
   test "$i" = 15 || sleep 2
   i=$((i + 1))
 done
-test -f ./fsl_probe_atarime.ko || { echo STOP_NO_MODULE; exit 1; }
-insmod ./fsl_probe_atarime.ko || { echo STOP_INSMOD; exit 1; }
+test -f ./fsl_probe.ko || { echo STOP_NO_MODULE; exit 1; }
+insmod ./fsl_probe.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
 echo "loaded; unload will not restore fans"
 echo "writing run; the write blocks until the interpreter returns"
 armed=1
-printf '%s\n' run > /proc/fsl120_atarime || { echo STOP_WRITE; exit 1; }
+printf '%s\n' run > /proc/fsl_probe || { echo STOP_WRITE; exit 1; }
 echo -n "status "
-cat /proc/fsl120_atarime || true
+cat /proc/fsl_probe || true
 echo
 echo "=== after 15 x 2s ==="
 i=1

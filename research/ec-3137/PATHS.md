@@ -1,7 +1,10 @@
 # EC 3.13.7 fan paths
 
-No new Atarime write. Unchanged tach at arguments 110 and 120 is not a
-firmware rejection. `interpreter_ok` is not an acknowledgement.
+Observations below are from unit-b while it reported EC 3.13.7. unit-b is
+not a name for that firmware; unit-a has run other versions. Host names and
+home-directory paths are omitted. No new unit-b write follows from this
+note. Unchanged tach at arguments 110 and 120 is not a firmware rejection.
+`interpreter_ok` is not an acknowledgement.
 
 ## What the bytes show
 
@@ -16,8 +19,8 @@ the 64-bit path). If the function id is a fast 64-bit STANDARD, SIP, or
 OEM call, it issues the SMC, copies the result registers back, and returns
 success. It does not read those registers and it does not log them. The
 research caller passes a NULL return buffer, so the reply is gone when the
-method ends. `~/atarime-fsl110-kernel.log` was not supplied in full. The
-probe module would not have printed the reply anyway.
+method ends. The saved kernel log was not supplied in full. The probe
+module would not have printed the reply anyway.
 
 Family 7 through SoC service `0x81` is a different command. On EC 3.13.7,
 selectors 3 and 5 return `0xff` and do not store a floor or ceiling. The
@@ -45,9 +48,9 @@ ACPI SMC. They are not in the saved captures.
 | --- | --- |
 | Another `_FSL` level, including 110 and 120 | Not prepared. Same-boot `_FST` control is fixed by AML. See below. |
 | kprobe or handler replacement to grab the SMC reply | Not used. Replacing `acpi_ffh_address_space_arch_handler` would affect every fixed-hardware region. |
-| `fst_status_atarime` | PASS as a read, 7 Nov 2026 15:11:56 PST. Package was `0 0 2068` and `0 0 2156`. Cached control is 0. Speeds match `fan1_input`. Not a write acknowledgement, not a clear floor, not a reboot confirmation. Do not repeat. |
+| `fst_status` | PASS as a read, 7 Nov 2026 15:11:56 PST. Package was `0 0 2068` and `0 0 2156`. Cached control is 0. Speeds match `fan1_input`. Not a write acknowledgement, not a clear floor, not a reboot confirmation. Not repeated from this record. |
 
-## What Atarime's fwupd report adds
+## What unit-b's fwupd report adds
 
 Embedded Controller `0x03000d07` (minimum `0x02003400`), GUID
 `3d13c989-e6a8-4ead-95ee-921f09868f65`, updated `0x03000508` to
@@ -121,7 +124,7 @@ listing, and neither is a new fan level.
    above. Until one of those images is available, static inspection cannot
    show a consumer of `0x06000790`.
 
-The Kensaki continuation stays blocked on the 2610/3915 baseline. No new
+The unit-a continuation stays blocked on the 2610/3915 baseline. No new
 module follows from this inventory.
 
 ## Same-boot `_FST` control, not prepared
@@ -136,7 +139,8 @@ every SMC is ignored. `_FSL(110)` leaves 110. The 15:11 package control 0 is
 the `Name (FLVL, Zero)` initializer. A later 0 is what a rebuilt namespace
 shows. The store itself does not need another setpoint to establish that.
 
-No launcher is added. Do not rerun 110 or 120 for this question.
+No launcher was added for that comparison. Arguments 110 and 120 are not
+repeated from this record.
 
 Keeping the `WRB` reply would be a separate observation. A kretprobe on
 `acpi_ffh_address_space_arch_handler` can read the buffer after the existing

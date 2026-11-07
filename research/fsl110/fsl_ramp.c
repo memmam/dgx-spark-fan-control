@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Kensaki continuation. Hardcoded \_SB.FAN0._FSL arguments from 160
+ * EC 3.5.8 continuation. Hardcoded \_SB.FAN0._FSL arguments from 160
  * through 237. Levels 120-150 already ran and are not in this list.
  * Level 237 requests 8973, the greatest request still at or below 9000.
  * Level 238 would request 9007 and is not present. Nothing near the
@@ -103,7 +103,7 @@ static const struct proc_ops fsl_ramp_ops = {
 
 static int __init fsl_ramp_init(void)
 {
-	fsl_ramp_ent = proc_create("fsl_ramp_kensaki", 0600, NULL, &fsl_ramp_ops);
+	fsl_ramp_ent = proc_create("fsl_ramp", 0600, NULL, &fsl_ramp_ops);
 	if (!fsl_ramp_ent)
 		return -ENOMEM;
 	return 0;
@@ -118,5 +118,5 @@ module_init(fsl_ramp_init);
 module_exit(fsl_ramp_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Kensaki research ramp for \\_SB.FAN0._FSL up through argument 237");
+MODULE_DESCRIPTION("Research ramp for \\_SB.FAN0._FSL up through argument 237");
 MODULE_AUTHOR("research");

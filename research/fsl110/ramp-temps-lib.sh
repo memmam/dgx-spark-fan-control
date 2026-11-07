@@ -1,5 +1,5 @@
 #!/bin/bash
-# Temperature and GPU-text checks for the Kensaki ramp.
+# Temperature and GPU-text checks for the EC 3.5.8 ramp.
 # This file does not insmod, write a fan, or read a default hardware path.
 # The launcher passes /sys/class/thermal and the nvidia-smi text explicitly.
 zones_ok() {

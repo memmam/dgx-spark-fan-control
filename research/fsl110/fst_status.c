@@ -109,7 +109,7 @@ static const struct proc_ops fst_ops = {
 
 static int __init fst_init(void)
 {
-	fst_ent = proc_create("fst_status_atarime", 0600, NULL, &fst_ops);
+	fst_ent = proc_create("fst_status", 0600, NULL, &fst_ops);
 	if (!fst_ent)
 		return -ENOMEM;
 	return 0;
@@ -123,5 +123,5 @@ static void __exit fst_exit(void)
 module_init(fst_init);
 module_exit(fst_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Read-only _FST package capture for Atarime research");
+MODULE_DESCRIPTION("Read-only _FST package capture");
 MODULE_AUTHOR("research");

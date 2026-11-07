@@ -658,7 +658,7 @@ before that reboot do not come back by themselves:
 ## ACPI fan levels
 
 This tree does not write ACPI `cur_state`. There is no `acpi-max` command
-and the floor sweep does not write. Kensaki measurements of those levels
+and the floor sweep does not write. Recorded measurements of those levels
 stay research evidence: level 100 read about 4320/4320 RPM, which is not
 module state 12, and on EC 3.5.8 an ACPI write replaces the EC curve until
 reboot. Level 0 stops both fans. The watchdog still reads `acpi_fan`

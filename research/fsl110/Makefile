@@ -1,9 +1,9 @@
 # Out-of-tree build against the running kernel's headers.
 # Not a DKMS package and not installed by the fan controller.
 obj-m += fsl110.o
-obj-m += fsl_ramp_kensaki.o
-obj-m += fsl_probe_atarime.o
-obj-m += fst_status_atarime.o
+obj-m += fsl_ramp.o
+obj-m += fsl_probe.o
+obj-m += fst_status.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

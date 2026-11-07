@@ -229,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     del argv
     print(
         "acpi-floor-sweep: this tree does not write ACPI Fan cur_state. "
-        "Earlier Kensaki samples stay research evidence.",
+        "Earlier recorded samples stay research evidence.",
         file=sys.stderr,
     )
     return 2

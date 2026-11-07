@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Atarime research probe. One hardcoded \_SB.FAN0._FSL argument: 120.
+ * EC 3.13.7 research probe. One hardcoded \_SB.FAN0._FSL argument: 120.
  * The request is 5025. Write the exact text "run" once. Load and unload
  * do not evaluate AML. The return buffer is NULL.
  */
@@ -88,7 +88,7 @@ static const struct proc_ops fsl120_ops = {
 
 static int __init fsl120_init(void)
 {
-	fsl120_ent = proc_create("fsl120_atarime", 0600, NULL, &fsl120_ops);
+	fsl120_ent = proc_create("fsl_probe", 0600, NULL, &fsl120_ops);
 	if (!fsl120_ent)
 		return -ENOMEM;
 	return 0;
@@ -103,5 +103,5 @@ module_init(fsl120_init);
 module_exit(fsl120_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Atarime research caller for \\_SB.FAN0._FSL argument 120");
+MODULE_DESCRIPTION("Research caller for \\_SB.FAN0._FSL argument 120");
 MODULE_AUTHOR("research");

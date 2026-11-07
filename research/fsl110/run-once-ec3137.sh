@@ -1,13 +1,18 @@
 #!/bin/bash
-# Atarime only. One insmod, one "run", one rmmod.
-# Requires DGX_FSL110_ATARIME=yes and a module already signed on this host.
+# EC 3.13.7 only. One insmod, one "run", one rmmod.
+# Requires DGX_FSL_EC3137=yes and a module already signed on this host.
 # interpreter_ok is not an EC accept or reject. Unload does not release a hold.
 set -euo pipefail
+if [ -n "${THERMAL_ROOT+x}" ] || [ -n "${NVIDIA_SMI_STUB+x}" ] || [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
+  echo STOP_TEST_ENV
+  exit 1
+fi
 cd "$(dirname "$0")"
-test "${DGX_FSL110_ATARIME:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+# shellcheck source=ec-profile.sh
+source ./ec-profile.sh
+test "${DGX_FSL_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-test "$hn" = atarime || { echo STOP_HOST; exit 1; }
+require_ec 3.13.7
 if lsmod | grep -q '^dgx_ec_fan_control'; then echo STOP_CONTROLLER; exit 1; fi
 if [ -e /usr/local/sbin/dgx-fan-control ]; then echo STOP_CONTROLLER; exit 1; fi
 for u in dgx-fan-control dgx-fan-watchdog dgx-fan-manual dgx-fan-health; do
@@ -43,8 +48,8 @@ for h in /sys/class/hwmon/hwmon*; do
   done
 done
 test "${#fans[@]}" -eq 2 || { echo "STOP_FAN_COUNT ${#fans[@]}"; exit 1; }
+refuse_loaded_research
 test -f ./fsl110.ko || { echo STOP_NO_MODULE; exit 1; }
-test ! -e /proc/fsl110 || { echo STOP_ALREADY_LOADED; exit 1; }
 insmod ./fsl110.ko
 echo "loaded; unload will not restore fans"
 set +e

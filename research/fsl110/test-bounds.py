@@ -18,10 +18,10 @@ assert request(238) == 9007
 assert request(1912) == 65505
 assert request(1913) == 65538
 
-ramp_c = (ROOT / "fsl_ramp_kensaki.c").read_text()
-probe_c = (ROOT / "fsl_probe_atarime.c").read_text()
-ramp_sh = (ROOT / "ramp-kensaki.sh").read_text()
-probe_sh = (ROOT / "probe-atarime.sh").read_text()
+ramp_c = (ROOT / "fsl_ramp.c").read_text()
+probe_c = (ROOT / "fsl_probe.c").read_text()
+ramp_sh = (ROOT / "ramp-ec358.sh").read_text()
+probe_sh = (ROOT / "probe-ec3137.sh").read_text()
 
 c_levels = [int(x) for x in re.findall(r"(\d+)ULL", ramp_c)]
 assert c_levels[0] == 160
@@ -50,5 +50,9 @@ assert "NVIDIA_SMI_STUB" not in ramp_sh.split("STOP_TEST_ENV", 1)[-1]
 assert "STOP_READ" in ramp_sh and "gpu_idle" in ramp_sh
 assert "zones_ok" in probe_sh and "gpu_idle" in probe_sh
 assert "STOP_READ" in probe_sh and "STOP_TEMP" in probe_sh
+assert "require_ec 3.5.8" in ramp_sh and "require_ec 3.13.7" in probe_sh
+assert "hostname" not in ramp_sh and "hostname" not in probe_sh
+for script in (ramp_sh, probe_sh):
+    assert script.index("require_ec") < script.index("insmod ./")
 
 print("bounds_ok", [(level, request(level)) for level in c_levels])

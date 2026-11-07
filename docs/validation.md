@@ -5,7 +5,7 @@
 `e57001b9adaf1ca5695da447939c8def68eb51f5`, author date 2026-11-06 11:26:42
 −0800, is the git tip before `3fdcc4d` (13:46 −0800 the same day), the first
 ACPI thermal-escalation commit. History from there back is linear. Nothing
-was committed during the Kensaki step-down searches (about 11:31–13:03
+was committed during unit-a's step-down searches (about 11:31–13:03
 −0800), so this commit is the tree those searches ran against. It is not a
 hardware-proven last-working module. The later loaded module was 0.1.7.
 This commit is module 0.1.6. Its parent `2955201` differs only in install
@@ -36,33 +36,39 @@ Carry-forward, decided on this branch:
   true-zero cutoff are unchanged.
 - The module version is 0.1.8 so it is not labeled as stock 0.1.6 or as
   the loaded 0.1.7.
-- `scripts/kensaki-regression` is the Kensaki check for this delta. With
-  no `DGX_FAN_SUPERVISED=1` it does not touch the host. `floor` is
-  set-state 6 then automatic, and it checks that ACPI Fan `cur_state`
-  does not change. Atarime is refused. No GPU load.
+- `scripts/ec358-regression` is the EC 3.5.8 check for this delta. With
+  no `DGX_FAN_SUPERVISED=1` it does not touch the host. It stops unless
+  fwupd or a current kernel pin shows EC 3.5.8 and the other source does
+  not show a different version. `floor` is set-state 6 then automatic, and
+  it checks that ACPI Fan `cur_state` does not change. No GPU load.
 
-## Kensaki script, 6 Nov 2026 23:22 PST
+November rows below use unit-a and unit-b for the two machines. Those ids
+are not firmware versions; each row states the firmware that unit was
+running. Host names and home-directory log paths are omitted. Script and
+log names here are sanitized equivalents of the names used on the machines.
 
-Checkout `0d9b49e` on Kensaki, EC 3.5.8. The operator ran
-`scripts/kensaki-regression` with `DGX_FAN_SUPERVISED=1`. The script
+## unit-a script, 6 Nov 2026 23:22 PST
+
+Checkout `0d9b49e` on unit-a, EC 3.5.8. The run was
+`scripts/ec358-regression` with `DGX_FAN_SUPERVISED=1`. The script
 printed `PASS preflight`, `PASS install`, and `PASS floor`. No status
 text, RPM, temperature, or kernel log was supplied with those lines, so
-this row is the script result only. Atarime was not run. No GPU load was
+this row is the script result only. unit-b was not run. No GPU load was
 run. Do not repeat these three cases unless this command or the installed
 module changes, or a regression is being checked.
 
 Older sections below are the record as it stood at `e57001b`, including
 commands this tree no longer provides.
 
-## Kensaki direct `_FSL` 110, 7 Nov 2026 about 14:11–14:12 PST
+## unit-a direct `_FSL` 110, 7 Nov 2026 about 14:11–14:12 PST
 
-Owner chat times, not a remote `uptime` clock. Kensaki, EC 3.5.8, kernel
-`7.0.0-1024-nvidia`. The controller was fully uninstalled. No GPU load.
-Atarime was not run. No further write is authorized from this row.
+Times in this row are the machine clock stated as PST. unit-a, EC 3.5.8,
+kernel `7.0.0-1024-nvidia`. The controller was fully uninstalled. No GPU
+load. unit-b was not run. No further write follows from this row.
 
 Checkout `ac496545149aa87c413f0eea6224d0480f8918aa`. The temporary module
 is `research/fsl110`. It is not DKMS and it is not the controller. About
-14:11 PST, `build-sign.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc was
+14:11 PST, `build-sign-ec358.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc was
 13.3.0. The signature hash was sha512. `modinfo` signer was `DGX Spark
 local module signing`. The build had no failure. It warned about the
 compiler name only, and it skipped BTF because `vmlinux` was absent.
@@ -93,17 +99,17 @@ Statuses:
 Unload did not clear the hold. About 14:14 PST the operator rebooted and
 answered yes when asked whether fanwatch showed 2700/4050 again. That
 confirms the idle pair returned. It is not a load sweep and it does not
-make the 4500/4590 reading a verified shaft speed. No further Kensaki fan
-write is authorized from this row.
+make the 4500/4590 reading a verified shaft speed. No further unit-a fan
+write follows from this row.
 
-## Atarime direct `_FSL` 110, 7 Nov 2026 about 14:17 PST
+## unit-b direct `_FSL` 110, 7 Nov 2026 about 14:17 PST
 
-Owner chat time. Do not relabel host-log timestamps as PST. Atarime, EC
-3.13.7. The controller was fully uninstalled. No GPU load. This does not
-repeat on Kensaki. `build-sign-atarime.sh` printed `SIGNED` and
+The sample clock is stated as PST. Host-log timestamps that were UTC stay
+UTC. unit-b, EC 3.13.7. The controller was fully uninstalled. No GPU load.
+This does not repeat on unit-a. `build-sign-ec3137.sh` printed `SIGNED` and
 `BUILD_SIGNED_NOT_LOADED`.
 
-`run-once-atarime.sh` zones before, millidegrees C: 43500, 40800, 41700,
+`run-once-ec3137.sh` zones before, millidegrees C: 43500, 40800, 41700,
 40800, 41700, 43500, 40800. GPU utilization 0 and 41 °C. Fans 2066 and
 2156. Status `interpreter_ok`. Samples 2066/2156, 2071/2155, 2066/2156.
 Zones after: 43500, 40800, 41600, 40800, 41800, 43500, 40800. The module
@@ -112,13 +118,12 @@ was unloaded.
 Before the reboot, about a minute of fanwatch at 42–43 °C stayed near
 2061–2077 and 2148–2162. One sample showed fan 2 at 0 between normal
 samples, and the next second was normal again. That zero is not a verified
-physical stop, and it is not attributed. The kernel log was saved at
-`~/atarime-fsl110-kernel.log`. The full file was not supplied. The posted
-warnings match startup lines also seen on Kensaki, plus an unclean FAT
-mount of `sda1`. `lsblk` showed that device as the recovery USB `BOOTME`,
-not an internal disk. No fan-specific error was reported. Kensaki's
-current `-b` log is from after its reboot, so it cannot be compared with
-the trial.
+physical stop, and it is not attributed. A kernel log excerpt was saved.
+The full file was not supplied. The posted warnings match startup lines
+also seen on unit-a, plus an unclean FAT mount of `sda1`. `lsblk` showed
+that device as the recovery USB `BOOTME`, not an internal disk. No
+fan-specific error was reported. unit-a's current `-b` log is from after
+its reboot, so it cannot be compared with the trial.
 
 The operator then rebooted. About two minutes of fanwatch at 43 °C stayed
 near 2070/2155 with no zeros, and fanwatch was then stopped. The idle tach
@@ -126,10 +131,10 @@ looks intact. That is not proof that every hold bit was released.
 
 `interpreter_ok` means the interpreter returned. It does not mean the EC
 accepted or rejected argument 110. There was no observed sustained speed
-change. That is not a proven protocol rejection. Kensaki's 4500/4590
-reading and Atarime's tach are different readouts. A change in one is not
-physical evidence about the other. Do not repeat argument 110 without a
-new question.
+change. That is not a proven protocol rejection. unit-a's 4500/4590
+reading and unit-b's tach are different readouts. A change in one is not
+physical evidence about the other. Argument 110 is not repeated from this
+record.
 
 Statuses:
 
@@ -140,7 +145,7 @@ Statuses:
 - physical RPM and the transient zero: UNVERIFIED
 - post-reboot idle tach: recorded, hold release not fully proven
 
-## Kensaki ramp through 150, 7 Nov 2026 14:43:51 PST
+## unit-a ramp through 150, 7 Nov 2026 14:43:51 PST
 
 Host clock `2026-11-07T22:43:51+00:00`, which is 14:43:51 PST. Checkout
 `7fdc6ca`. Kernel `7.0.0-1024-nvidia`. Build and sign passed on the
@@ -161,9 +166,8 @@ stable. Medians of the last five samples:
 At 150 the second of those channels stayed 5670. The script printed
 `STOP_PLATEAU` and unloaded. That was the single-fan rule, not a measured
 ceiling. Levels 160 and above were not issued. No release write. At about
-14:48 PST the operator said both machines were rebooting. No Kensaki
-post-reboot 2700/4050 pair has been supplied, so this sweep's restore is
-not confirmed.
+14:48 PST a reboot of both units was reported. No unit-a post-reboot
+2700/4050 pair has been supplied, so this sweep's restore is not confirmed.
 
 Statuses:
 
@@ -174,12 +178,12 @@ Statuses:
 - arguments 160–237: UNRUN
 - reboot after this sweep: PENDING
 
-## Kensaki continuation from 160, blocked before any write, 7 Nov 2026 14:55:24 PST
+## unit-a continuation from 160, blocked before any write, 7 Nov 2026 14:55:24 PST
 
 Host clock `2026-11-07T22:55:24+00:00`. The script printed fifteen baseline
 samples, all 2610/3915, then `STOP_NOT_BASELINE raw=2610 3915`. It did not
 print `loaded` or a step write. Zone files were checked and not printed.
-No temperature was supplied for this capture, and none is filled in here. In `research/fsl110/ramp-kensaki.sh` that
+No temperature was supplied for this capture, and none is filled in here. In `research/fsl110/ramp-ec358.sh` that
 exit is in the baseline loop. `insmod` is the next statement after the loop,
 and `stepped=1` is only set inside the step loop. No module was loaded and
 no `_FSL` was issued. The guard is unchanged.
@@ -198,12 +202,12 @@ with the EC curve publishing, and it is not proof the floor register is
 clear, that the machine was damaged, or that 29 percent is the normal idle
 step.
 
-The 14:48 PST reboot was stated. No Kensaki 2700/4050 pair was reported
+The 14:48 PST reboot was stated. No unit-a 2700/4050 pair was reported
 after it. This row does not mark that restore PASS. Arguments 160–237 stay
 **UNRUN**. Do not loosen the baseline check and do not retry from this
 sample alone.
 
-`fanwatch_kensaki_20261107_225801.log` then shows fourteen 1-second samples
+A fanwatch log from unit-a then shows fourteen 1-second samples
 from 22:58:02 through 22:58:15 UTC, which is 14:58:02 through 14:58:15 PST.
 Every sample is the reported SoC at 42 °C and fans 2610/3915, with no zeros.
 That label is the fanwatch SoC reading, not a hottest-zone selection. The
@@ -218,42 +222,42 @@ Statuses:
 - arguments 160–237: UNRUN
 - reboot restore after the 150 sweep: still PENDING
 
-## Atarime argument 120, two runs, 7 Nov 2026
+## unit-b argument 120, two runs, 7 Nov 2026
 
-Same checkout and kernel. The first build attempt used the Kensaki script
-and correctly printed `STOP_HOST`. The Atarime probe then signed and
+Same checkout and kernel. The first build attempt used the unit-a script
+and correctly printed `STOP_HOST`. The unit-b probe then signed and
 printed `BUILD_SIGNED_NOT_LOADED` on the enrolled certificate. Both runs
-were appended to `atarime-probe120-hostlog.txt`. No further Atarime write
-is requested. `interpreter_ok` is not an EC acceptance or rejection.
+were appended to the probe host log. No further unit-b write follows from
+this row. `interpreter_ok` is not an EC acceptance or rejection.
 
-First start 14:44:05 PST, while the Kensaki ramp was also running. The
-operator later identified a shared thermal pad and fan rig, so this run is
-confounded. Drift was already present before the write. The last five
+First start 14:44:05 PST, while the unit-a ramp was also running. The two
+machines shared a thermal pad and fan rig, so this run is confounded.
+Drift was already present before the write. The last five
 baseline pairs were 2079/2173, 2076/2177, 2085/2173, 2081/2170, 2081/2171.
 After the call, fifteen samples stayed about 2071–2084 and 2169–2182. No
 zero.
 
-The operator rebooted and reran with Kensaki not driving the rig. Second
-start 14:48:30 PST. Fifteen baseline samples stayed about 2068–2079 and
+The machine was rebooted and the probe was rerun with unit-a not driving
+the rig. Second start 14:48:30 PST. Fifteen baseline samples stayed about 2068–2079 and
 2149–2165. The last five were 2069/2153, 2070/2159, 2069/2149, 2075/2157,
 2071/2159. After the call, fifteen samples stayed about 2063–2076 and
 2151–2161. The last five were 2076/2155, 2073/2159, 2074/2159, 2072/2161,
 2070/2159. `PROBE_DONE`, then unload. No zeros. No observed sustained
 change. That is not a proven protocol rejection. A reboot after this second
 call was requested and is not yet confirmed. The second run does show that
-Atarime had booted far enough to execute the probe. It is not a Kensaki
+unit-b had booted far enough to execute the probe. It is not a unit-a
 post-reboot fan pair.
 
 A later fanwatch, about 17 seconds, SoC 45–47 °C, showed fan 1 at 2064–2079
 and fan 2 at 2156–2168, with no zeros. The operator did not say this sample
 was after the post-probe reboot, so it does not close that reboot. It is the
-same idle tach band as the isolated probe. No further Atarime write is
-requested. `interpreter_ok` is still only the AML interpreter. The captured
+same idle tach band as the isolated probe. No further unit-b write follows
+from this row. `interpreter_ok` is still only the AML interpreter. The captured
 `WRB` method does not test the SMC response, and the research caller discards
 it. These tach readings do not separate an EC rejection from a write the EC
 accepted and did not apply.
 
-## Atarime `_FST` package read, 7 Nov 2026 15:11:56 PST
+## unit-b `_FST` package read, 7 Nov 2026 15:11:56 PST
 
 Host clock `2026-11-07T23:11:56+00:00`. Checkout `e989d4f`, then the
 temperature-path fix the machine already had from `5cdf3b9`. Kernel
@@ -276,7 +280,7 @@ revision, cached control, speed. Both controls are 0. Both speeds match the
 `fan1_input` values from the same run. This is a successful read only. It
 does not prove the earlier write was rejected, it does not prove an EC floor
 is clear, and it does not confirm the reboot after the second argument-120
-call. Do not repeat this read without a new question. The Kensaki 160
+call. This read is not repeated from this record. The unit-a 160
 continuation stays blocked on the 2610/3915 baseline.
 
 Statuses:
@@ -307,13 +311,14 @@ match a name containing `ffa` or `socfw`. `/usr/src` has no
 `nvidia-ffa-ec*` file. These are filename results, not a content search, so
 they do not prove the SMC handler is missing from the machine. Empty
 capsule directories mean nothing is staged now. They do not identify the
-monitor that answered the earlier SMC. No further listing is requested.
-Acceptance of the setpoint remains unshown. The Kensaki sweep stays blocked.
+monitor that answered the earlier SMC. No further listing is part of this
+record. Acceptance of the setpoint remains unshown. The unit-a sweep stays
+blocked.
 
-## Same-boot `_FST` around one Atarime `_FSL`, not prepared
+## Same-boot `_FST` around one unit-b `_FSL`, not prepared
 
-Asked on 7 Nov 2026: read `_FST` before and after one existing request, 110
-or 120, in the same boot, to see the cached control before a reboot. No
+Recorded 7 Nov 2026. A same-boot `_FST` before and after one existing
+request, 110 or 120, would show the cached control before a reboot. No
 module was added and no command is given. In the captured DSDT, `WFCF`
 assigns `FLVL = Arg0` before its four `WRB` calls. The assignment does not
 read the SMC reply. Both fans' `_FST` methods publish that same name. After
@@ -321,7 +326,7 @@ read the SMC reply. Both fans' `_FST` methods publish that same name. After
 that namespace. Argument 120 leaves 120. Argument 110 leaves 110. The 15:11
 control value 0 is the initializer `Name (FLVL, Zero)`. A reboot rebuilds
 that name. This comparison restates the method. It does not show whether
-the EC kept the setpoint. The Kensaki sweep stays blocked.
+the EC kept the setpoint. The unit-a sweep stays blocked.
 
 Statuses:
 
@@ -329,7 +334,7 @@ Statuses:
 - arguments 110 and 120: no new run
 - EC acceptance: still unshown
 
-## Kensaki continuation from 160, not yet run
+## unit-a continuation from 160, not yet run
 
 **UNRUN.** The module list now starts at 160 and still ends at 237
 (request 8973). It does not repeat 120–150. The next write requires a fresh

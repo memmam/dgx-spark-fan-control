@@ -30,12 +30,14 @@ if zones_ok "$root"; then echo "FAIL accepted hot zone"; exit 1; fi
 rm -f "$root/thermal_zone0/temp"
 if zones_ok "$root"; then echo "FAIL accepted missing temp"; exit 1; fi
 echo "fixture_prewrite_ok"
-base_line=$(grep -n 'STOP_NOT_BASELINE' ramp-kensaki.sh | head -1 | cut -d: -f1)
-insmod_line=$(grep -n 'insmod ./fsl_ramp_kensaki.ko' ramp-kensaki.sh | head -1 | cut -d: -f1)
+base_line=$(grep -n 'STOP_NOT_BASELINE' ramp-ec358.sh | head -1 | cut -d: -f1)
+insmod_line=$(grep -n 'insmod ./fsl_ramp.ko' ramp-ec358.sh | head -1 | cut -d: -f1)
+ec_line=$(grep -n 'require_ec 3.5.8' ramp-ec358.sh | head -1 | cut -d: -f1)
 test "$base_line" -lt "$insmod_line"
+test "$ec_line" -lt "$insmod_line"
 # The launcher must not consult these names after the reject line.
-reject_line=$(grep -n 'STOP_TEST_ENV' ramp-kensaki.sh | head -1 | cut -d: -f1)
-if awk -v n="$reject_line" 'NR>n && /THERMAL_ROOT|NVIDIA_SMI_STUB|RAMP_SOURCE_ONLY/' ramp-kensaki.sh | grep -q .; then
+reject_line=$(grep -n 'STOP_TEST_ENV' ramp-ec358.sh | head -1 | cut -d: -f1)
+if awk -v n="$reject_line" 'NR>n && /THERMAL_ROOT|NVIDIA_SMI_STUB|RAMP_SOURCE_ONLY/' ramp-ec358.sh | grep -q .; then
   echo "FAIL override name remains after the reject"
   exit 1
 fi
@@ -44,7 +46,7 @@ reject_live() {
   shift
   local out rc
   set +e
-  out=$("$@" ./ramp-kensaki.sh 2>&1)
+  out=$("$@" ./ramp-ec358.sh 2>&1)
   rc=$?
   set -e
   printf '%s\n' "$out"

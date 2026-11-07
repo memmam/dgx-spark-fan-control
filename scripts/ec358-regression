@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Bounded Kensaki check for the 0.1.8 delta on top of e57001b.
+"""Bounded EC 3.5.8 check for the 0.1.8 delta on top of e57001b.
 
 With no DGX_FAN_SUPERVISED=1 this process exits 2 and does not run a
 command or open /sys. It never writes an ACPI Fan cur_state.
 
-    python3 scripts/kensaki-regression
-    sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression preflight
-    sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression install
-    sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression floor
-    sudo DGX_FAN_SUPERVISED=1 python3 scripts/kensaki-regression service
+    python3 scripts/ec358-regression
+    sudo DGX_FAN_SUPERVISED=1 python3 scripts/ec358-regression preflight
+    sudo DGX_FAN_SUPERVISED=1 python3 scripts/ec358-regression install
+    sudo DGX_FAN_SUPERVISED=1 python3 scripts/ec358-regression floor
+    sudo DGX_FAN_SUPERVISED=1 python3 scripts/ec358-regression service
 
-preflight is read-only. install is the DKMS 0.1.8 build from
-docs/installation.md section 3A, then one module reload. It does not
-start the performance service and does not restart the manual unit.
-floor requires the installed command to match this checkout, refuses
+preflight is read-only. It requires a fwupd Embedded Controller version
+or a current kernel pin of EC 3.5.8, and stops if those disagree or are
+both missing. It does not change the fwupd block. install is the DKMS
+0.1.8 build from docs/installation.md section 3A, then one module reload.
+It does not start the performance service and does not restart the manual
+unit. floor requires the installed command to match this checkout, refuses
 acpi-max without writing, then does set-state 6 and automatic.
 service starts dgx-fan-control.service, waits for the idle state-1 pin,
 then stops it and requires state 0 again.
 
-Stop on the first failure. Atarime is refused. No GPU load.
+Stop on the first failure. No GPU load.
 """
 
 from __future__ import annotations
@@ -55,16 +57,23 @@ def read_file(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
-def hostname_of(text: str) -> str:
-    return text.strip().split(".", 1)[0]
+def _ec_profile():
+    parent = str(Path(__file__).resolve().parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    import ec_profile
+    return ec_profile
 
 
-def require_kensaki(hostname: str) -> None:
-    name = hostname_of(hostname)
-    if name == "atarime":
-        raise Stop("atarime is out of this check")
-    if name != "kensaki":
-        raise Stop(f"hostname {name!r} is not kensaki")
+def confirm_ec(runner, expect: str = "3.5.8") -> None:
+    """Read-only. Missing and disagreeing profiles both stop."""
+    fw = runner(["fwupdmgr", "get-devices", "--json"])
+    fw_text = (fw.stdout or "") if fw.returncode == 0 else ""
+    kern = runner(["dmesg"])
+    kern_text = (kern.stdout or "") if kern.returncode == 0 else ""
+    verdict = _ec_profile().classify(fw_text, kern_text, expect)
+    if verdict != "OK":
+        raise Stop(verdict)
 
 
 def parse_status(text: str) -> None:
@@ -138,7 +147,7 @@ def _ok(result: subprocess.CompletedProcess[str], what: str) -> str:
 
 
 def preflight(runner, reader) -> str:
-    require_kensaki(_ok(runner(["hostname"]), "hostname"))
+    confirm_ec(runner)
     # is-active exits 3 when the unit is inactive. The text is the check.
     performance = runner(["systemctl", "is-active", DAEMON_UNIT])
     performance_inactive(performance.stdout or "")
@@ -273,7 +282,7 @@ def main(argv: list[str] | None = None, env: dict | None = None,
     environment = os.environ if env is None else env
     if environment.get(OPT_IN) != "1":
         print(
-            "kensaki-regression: not touching services, sysfs, or the module. "
+            "ec358-regression: not touching services, sysfs, or the module. "
             f"Set {OPT_IN}=1 and pass preflight, install, floor, or service.",
             file=sys.stderr,
         )
