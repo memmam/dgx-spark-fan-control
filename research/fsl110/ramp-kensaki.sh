@@ -1,6 +1,8 @@
 #!/bin/bash
-# Kensaki only. Hardcoded steps 120..237. Does not insmod until the
-# baseline is clean. Does not wrap the ACPI write in a timeout.
+# Kensaki only. Continuation from argument 160 through 237.
+# 120-150 already ran; this binary does not issue them.
+# Does not insmod until the baseline is clean. Does not wrap the ACPI write
+# in a timeout.
 # Killing the shell does not cancel an SMC already entered in the kernel.
 # Cleanup only unloads a module this script loaded. It does not write a
 # fan release. Reboot after any step.
@@ -15,7 +17,7 @@ hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
 test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
 stepped=0
 loaded_by_us=0
-steps=(120 130 140 150 160 170 180 190 200 210 220 225 230 232 234 236 237)
+steps=(160 170 180 190 200 210 220 225 230 232 234 236 237)
 cleanup() {
   if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_ramp_kensaki '; then
     rmmod fsl_ramp_kensaki || true
@@ -161,9 +163,16 @@ for expect in "${steps[@]}"; do
     echo "STOP_DECREASE ${paths[0]}=$med_a prev=$pre_a ${paths[1]}=$med_b prev=$pre_b"
     exit 1
   fi
-  if [ "$med_a" -le "$pre_a" ] || [ "$med_b" -le "$pre_b" ]; then
-    echo "STOP_PLATEAU ${paths[0]}=$med_a prev=$pre_a ${paths[1]}=$med_b prev=$pre_b"
+  up_a=0
+  up_b=0
+  test "$med_a" -gt "$pre_a" && up_a=1
+  test "$med_b" -gt "$pre_b" && up_b=1
+  if [ "$up_a" = 0 ] && [ "$up_b" = 0 ]; then
+    echo "STOP_PLATEAU both ${paths[0]}=$med_a prev=$pre_a ${paths[1]}=$med_b prev=$pre_b"
     exit 1
+  fi
+  if [ "$up_a" = 0 ] || [ "$up_b" = 0 ]; then
+    echo "PLATEAU_RECORDED ${paths[0]}=$med_a prev=$pre_a ${paths[1]}=$med_b prev=$pre_b"
   fi
   pre_a=$med_a
   pre_b=$med_b

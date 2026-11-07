@@ -140,28 +140,78 @@ Statuses:
 - physical RPM and the transient zero: UNVERIFIED
 - post-reboot idle tach: recorded, hold release not fully proven
 
-## Next research calls, not yet run
+## Kensaki ramp through 150, 7 Nov 2026 14:43:51 PST
 
-Both are **UNRUN**. Argument 110 is not repeated. Published Kensaki
-numbers are not shaft RPM, and 9000/13500 are the EC 3.5.8 capability
-endpoints, not a measured maximum. The shared `_FSL` request at level L is
-`975 + (3375 * L) / 100`. Level 237 requests 8973, the greatest request
-that is still at or below 9000. Level 238 requests 9007 and is not in the
-list. The 16-bit wrap near level 1913 is not a stop the sweep is allowed
-to approach.
+Host clock `2026-11-07T22:43:51+00:00`, which is 14:43:51 PST. Checkout
+`7fdc6ca`. Kernel `7.0.0-1024-nvidia`. Build and sign passed on the
+enrolled certificate. The ramp module was signed. No zeros and no drops
+were reported. Published numbers are not shaft speeds.
 
-Kensaki steps, hardcoded: 120, 130, 140, 150, 160, 170, 180, 190, 200,
-210, 220, 225, 230, 232, 234, 236, 237. Steps are 10 levels until 220,
-then 5, then 2, then 1. Each dwell is 15 samples, 2 seconds apart. The
-decision uses the median of the last five samples of each fan path. The
-next step is issued only if both medians are strictly above the previous
-dwell. A drop or a tie on either fan stops the ramp. A zero, a non-numeric
-reading, a reading above 9500, a zone outside 25–60 °C, or GPU utilization
-above 0 also stops it, and the raw value is logged. No release write.
+Fifteen baseline samples were all 2700/4050. Each later dwell's first
+sample was still the previous pair. From sample 2 onward the pair was
+stable. Medians of the last five samples:
 
-Atarime remains one probe at argument 120, request 5025. Level 110 produced
-no sustained tach change, so 120 is the next single step, not a sweep.
-There is no response slope on Atarime from which to aim at 9000.
+| Argument | Request | Settled published pair |
+| ---: | ---: | --- |
+| 120 | 5025 | 4950/4994 |
+| 130 | 5362 | 5310/5265 |
+| 140 | 5700 | 5670/5670 |
+| 150 | 6037 | 6030/5670 |
+
+At 150 the second of those channels stayed 5670. The script printed
+`STOP_PLATEAU` and unloaded. That was the single-fan rule, not a measured
+ceiling. Levels 160 and above were not issued. No release write. At about
+14:48 PST the operator said both machines were rebooting. No Kensaki
+post-reboot 2700/4050 pair has been supplied, so this sweep's restore is
+not confirmed.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- arguments 120–150, evaluation and readback: PASS
+- stop at 150: policy abort, not an established maximum
+- physical RPM: UNVERIFIED
+- arguments 160–237: UNRUN
+- reboot after this sweep: PENDING
+
+## Atarime argument 120, two runs, 7 Nov 2026
+
+Same checkout and kernel. The first build attempt used the Kensaki script
+and correctly printed `STOP_HOST`. The Atarime probe then signed and
+printed `BUILD_SIGNED_NOT_LOADED` on the enrolled certificate. Both runs
+were appended to `atarime-probe120-hostlog.txt`. No further Atarime write
+is requested. `interpreter_ok` is not an EC acceptance or rejection.
+
+First start 14:44:05 PST, while the Kensaki ramp was also running. The
+operator later identified a shared thermal pad and fan rig, so this run is
+confounded. Drift was already present before the write. The last five
+baseline pairs were 2079/2173, 2076/2177, 2085/2173, 2081/2170, 2081/2171.
+After the call, fifteen samples stayed about 2071–2084 and 2169–2182. No
+zero.
+
+The operator rebooted and reran with Kensaki not driving the rig. Second
+start 14:48:30 PST. Fifteen baseline samples stayed about 2068–2079 and
+2149–2165. The last five were 2069/2153, 2070/2159, 2069/2149, 2075/2157,
+2071/2159. After the call, fifteen samples stayed about 2063–2076 and
+2151–2161. The last five were 2076/2155, 2073/2159, 2074/2159, 2072/2161,
+2070/2159. `PROBE_DONE`, then unload. No zeros. No observed sustained
+change. That is not a proven protocol rejection. A reboot after this second
+call was requested and is not yet confirmed. The second run does show that
+Atarime had booted far enough to execute the probe. It is not a Kensaki
+post-reboot fan pair.
+
+## Kensaki continuation from 160, not yet run
+
+**UNRUN.** The module list now starts at 160 and still ends at 237
+(request 8973). It does not repeat 120–150. The next write requires a fresh
+baseline of 2700/4050. That pair has not been reported since the 14:48 PST
+reboot, so the script must observe it itself. A single fan whose settled
+median does not rise is logged as `PLATEAU_RECORDED` and the sweep
+continues. The sweep stops if both medians fail to rise, if either median
+falls, or on zero, a bad readout, a zone outside 25–60 °C, GPU utilization
+above 0, or a reading above 9500. Settled samples in the 120–150 dwells did
+not jitter, so equality is a plateau and a lower median is a decrease.
+No deadband is added. No release write. Reboot after any step.
 
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 

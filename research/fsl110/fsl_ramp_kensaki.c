@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Kensaki research ramp. Hardcoded \_SB.FAN0._FSL arguments, in order.
- * The last is 237, whose request is 8973, the greatest request still at or
- * below 9000. Level 238 would request 9007 and is not present. Nothing
- * near the 16-bit wrap is accepted.
+ * Kensaki continuation. Hardcoded \_SB.FAN0._FSL arguments from 160
+ * through 237. Levels 120-150 already ran and are not in this list.
+ * Level 237 requests 8973, the greatest request still at or below 9000.
+ * Level 238 would request 9007 and is not present. Nothing near the
+ * 16-bit wrap is accepted.
  *
  * Write the exact text "step". Any other text is refused before ACPI.
  * A failed evaluation latches; later steps are refused. Load and unload
@@ -18,9 +19,8 @@
 #define FSL_RAMP_PATH		"\\_SB.FAN0._FSL"
 
 static const u64 fsl_ramp_arg[] = {
-	120ULL, 130ULL, 140ULL, 150ULL, 160ULL, 170ULL, 180ULL, 190ULL,
-	200ULL, 210ULL, 220ULL, 225ULL, 230ULL, 232ULL, 234ULL, 236ULL,
-	237ULL
+	160ULL, 170ULL, 180ULL, 190ULL, 200ULL, 210ULL, 220ULL, 225ULL,
+	230ULL, 232ULL, 234ULL, 236ULL, 237ULL
 };
 #define FSL_RAMP_N ((int)(sizeof(fsl_ramp_arg) / sizeof(fsl_ramp_arg[0])))
 static struct proc_dir_entry *fsl_ramp_ent;
