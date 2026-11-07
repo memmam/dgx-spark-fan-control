@@ -87,18 +87,19 @@ Statuses:
 - single request, evaluation, and readback response: PASS
 - physical RPM: UNVERIFIED
 - sustained behavior: UNRUN
-- reboot cleanup: PENDING
+- reboot cleanup: PASS
+- restored idle baseline: PASS
 
-Unload does not clear the hold. The operator was told to reboot and then
-confirm fanwatch is back at 2700/4050. That confirmation is not in hand.
-Do not mark the restore PASS, and do not issue another fan write, until
-that output exists. Reboot was started. No post-reboot fanwatch output has
-arrived, so reboot cleanup stays PENDING.
+Unload did not clear the hold. About 14:14 PST the operator rebooted and
+answered yes when asked whether fanwatch showed 2700/4050 again. That
+confirms the idle pair returned. It is not a load sweep and it does not
+make the 4500/4590 reading a verified shaft speed. No further Kensaki fan
+write is authorized from this row.
 
 ## Atarime direct `_FSL` 110
 
 Status: **UNRUN**. No build output and no call output from Atarime are in
-hand. Kensaki's reboot cleanup stays PENDING and is a separate row.
+hand. Kensaki's reboot cleanup is already PASS and is a separate row.
 
 The same `research/fsl110` module is the caller. `run-once.sh` stays
 Kensaki-only. Atarime is `build-sign-atarime.sh` then
