@@ -7,84 +7,32 @@
 # Cleanup only unloads a module this script loaded. It does not write a
 # fan release. Reboot after any step.
 set -u
-if [ "${RAMP_SOURCE_ONLY:-}" != 1 ]; then
-  cd "$(dirname "$0")"
-  exec > >(tee -a kensaki-ramp-hostlog.txt) 2>&1
-  echo "HOST_DATE $(date -Is)"
-  echo "host local clock, not labeled PST"
-  echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
-  test "${DGX_FSL_RAMP_KENSAKI:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
-  test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
-  hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
-  test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
+# A test variable must not be able to reach insmod. Exit before cd, tee,
+# /sys, or nvidia-smi.
+if [ -n "${THERMAL_ROOT+x}" ] || [ -n "${NVIDIA_SMI_STUB+x}" ] || [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
+  echo STOP_TEST_ENV
+  exit 1
 fi
+cd "$(dirname "$0")"
+# shellcheck source=ramp-temps-lib.sh
+source ./ramp-temps-lib.sh
+exec > >(tee -a kensaki-ramp-hostlog.txt) 2>&1
+echo "HOST_DATE $(date -Is)"
+echo "host local clock, not labeled PST"
+echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
+test "${DGX_FSL_RAMP_KENSAKI:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
+test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
+hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
+test "$hn" = kensaki || { echo STOP_HOST; exit 1; }
 steps=(160 170 180 190 200 210 220 225 230 232 234 236 237)
-# THERMAL_ROOT and NVIDIA_SMI_STUB exist so tests can reuse these reads.
-# One read of each temp file feeds both the guard and the log line.
-THERMAL_ROOT=${THERMAL_ROOT:-/sys/class/thermal}
-zones_ok() {
-  local z t ty name frac
-  ZONE_LINE=""
-  HOTTEST=""
-  local hottest_t="" hottest_name=""
-  local root="${THERMAL_ROOT:-/sys/class/thermal}"
-  for z in "$root"/thermal_zone*; do
-    name=${z##*/}
-    if ! ty=$(cat "$z/type" 2>/dev/null); then
-      echo "STOP_TEMP unreadable_type $z"
-      return 1
-    fi
-    if ! t=$(cat "$z/temp" 2>/dev/null); then
-      echo "STOP_TEMP unreadable $z type=$ty"
-      return 1
-    fi
-    if ! [[ "$t" =~ ^-?[0-9]+$ ]]; then
-      echo "STOP_TEMP nonnumeric $z type=$ty raw=$t"
-      return 1
-    fi
-    if [ "$t" -lt 25000 ] || [ "$t" -gt 60000 ]; then
-      echo "STOP_TEMP out_of_range $z type=$ty raw=${t}mC"
-      return 1
-    fi
-    ZONE_LINE="$ZONE_LINE ${name}:${ty}=${t}mC"
-    if [ -z "$hottest_t" ] || [ "$t" -gt "$hottest_t" ]; then
-      hottest_t=$t
-      hottest_name="${name}:${ty}"
-    fi
-  done
-  if [ -z "$hottest_t" ]; then
-    echo "STOP_TEMP no_zones $root"
-    return 1
-  fi
-  frac=$(printf '%03d' $((hottest_t % 1000)))
-  HOTTEST="${hottest_name}=${hottest_t}mC ($((hottest_t / 1000)).${frac}C)"
-}
 gpu_idle() {
-  local utils util gtemp
-  GPU_LINE=""
-  if [ -n "${NVIDIA_SMI_STUB:-}" ]; then
-    utils=$NVIDIA_SMI_STUB
-  elif ! utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null); then
+  local utils
+  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null); then
     echo "STOP_GPU nvidia-smi_failed"
     return 1
   fi
-  if [ -z "$utils" ]; then
-    echo "STOP_GPU empty"
-    return 1
-  fi
-  while IFS=',' read -r util gtemp; do
-    util=${util// /}
-    gtemp=${gtemp// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util nvidia_gpu_temp=${gtemp}C raw=$utils"
-      return 1
-    fi
-    GPU_LINE="$GPU_LINE nvidia_gpu_temp=${gtemp}C"
-  done <<< "$utils"
+  gpu_parse "$utils"
 }
-if [ "${RAMP_SOURCE_ONLY:-}" = 1 ]; then
-  return 0 2>/dev/null || exit 0
-fi
 stepped=0
 loaded_by_us=0
 cleanup() {
@@ -147,7 +95,7 @@ sample_ok() {
   samples_b=()
   i=1
   while [ "$i" -le 15 ]; do
-    zones_ok || return 1
+    zones_ok /sys/class/thermal || return 1
     gpu_idle || return 1
     if ! pair=$(read_pair); then
       return 1
@@ -214,6 +162,6 @@ for expect in "${steps[@]}"; do
 done
 echo "RAMP_STEPS_DONE"
 echo "=== final zones ==="
-zones_ok || exit 1
+zones_ok /sys/class/thermal || exit 1
 gpu_idle || exit 1
 echo "$(date -Is) final zones$ZONE_LINE hottest=$HOTTEST$GPU_LINE"

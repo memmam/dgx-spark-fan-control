@@ -44,8 +44,11 @@ assert "9500" in ramp_sh
 assert "16000" in probe_sh
 assert "timeout " not in ramp_sh and "timeout " not in probe_sh
 assert "loaded_by_us" in ramp_sh and "loaded_by_us" in probe_sh
-for text in (ramp_sh, probe_sh):
-    assert "zones_ok" in text and "gpu_idle" in text
-    assert "STOP_READ" in text and "STOP_TEMP" in text
+lib = (ROOT / "ramp-temps-lib.sh").read_text()
+assert "STOP_TEMP" in lib and "zones_ok /sys/class/thermal" in ramp_sh
+assert "NVIDIA_SMI_STUB" not in ramp_sh.split("STOP_TEST_ENV", 1)[-1]
+assert "STOP_READ" in ramp_sh and "gpu_idle" in ramp_sh
+assert "zones_ok" in probe_sh and "gpu_idle" in probe_sh
+assert "STOP_READ" in probe_sh and "STOP_TEMP" in probe_sh
 
 print("bounds_ok", [(level, request(level)) for level in c_levels])
