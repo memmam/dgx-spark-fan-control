@@ -43,9 +43,15 @@ ACPI SMC. They are not in the saved captures.
 
 | Item | Status |
 | --- | --- |
-| Another `_FSL` level, including 110 and 120 | Blocked. No new evidence goal. Tach already stayed in the idle band. |
-| Logging the SMC reply during a write | Not prepared. That is a new firmware call, and the reply still would not say whether the EC applied the bytes to the fans. |
-| Read-only `cur_state` or another tach sample | Not requested. `cur_state` is the cached AML level. Tach does not separate rejection from an ignored setpoint. |
+| Another `_FSL` level, including 110 and 120 | Blocked. No new evidence goal. |
+| kprobe or handler replacement to grab the SMC reply | Not used. `acpi_ffh_address_space_arch_handler` is not a supported trace point, and replacing the handler would affect every fixed-hardware region. |
+| `fst_status_atarime` | Ready, **unrun**. One read of the existing `_FST` package: revision, cached control, speed. That is the read path's published result, not `WRB`'s reply registers. |
 
-No live capture is asked for. A sysfs dump cannot recover the discarded
-SMC registers, and a memory dump is not a substitute.
+## Live inventory, read-only
+
+`fwupdmgr get-devices` is the supported list of what this machine's fwupd
+reports (version, GUID, plugin, flags). It does not download or install.
+`findmnt -t vfat` names a mounted EFI partition if the system already
+mounted one; do not guess a disk node. `/lib/firmware` is the ordinary
+Linux firmware directory. None of these is the EL3 SMC handler. If they
+are only the LVFS capsules already studied, the handler is still absent.

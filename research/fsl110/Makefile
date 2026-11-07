@@ -3,6 +3,7 @@
 obj-m += fsl110.o
 obj-m += fsl_ramp_kensaki.o
 obj-m += fsl_probe_atarime.o
+obj-m += fst_status_atarime.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

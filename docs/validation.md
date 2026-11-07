@@ -253,6 +253,15 @@ requested. `interpreter_ok` is still only the AML interpreter. The captured
 it. These tach readings do not separate an EC rejection from a write the EC
 accepted and did not apply.
 
+## Atarime `_FST` package read, not yet run
+
+**UNRUN.** `research/fsl110/fst_status_atarime.c` reads `\_SB.FAN0._FST`
+and `\_SB.FAN1._FST` once. It does not call `_FSL`. The new evidence is
+the raw package (revision, cached control, speed), which `cur_state`
+hides when the control value is above 100. It is not the SMC reply from
+`WRB`. Arguments 110 and 120 are not repeated. The Kensaki 160 continuation
+stays blocked on the 2610/3915 baseline.
+
 ## Kensaki continuation from 160, not yet run
 
 **UNRUN.** The module list now starts at 160 and still ends at 237
