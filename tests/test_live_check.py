@@ -288,6 +288,102 @@ class LiveGateTests(unittest.TestCase):
         self.assertIn("0xffff", text)
         self.assertIn("literal lower clamp of 0", text)
 
+    def _service_run(self, states, start_code=0, stop_code=0, explode=None):
+        calls = []
+        sleeps = []
+        seen = {"status": 0}
+
+        def run(argv, timeout):
+            calls.append(list(argv))
+            self.assertNotIn("enable", argv)
+            self.assertNotIn("disable", argv)
+            if explode is not None and explode(argv, seen):
+                raise RuntimeError("injected failure")
+            if argv[:3] == ["systemctl", "start", LIVE.DAEMON]:
+                err = "" if start_code == 0 else "start failed"
+                return subprocess.CompletedProcess(argv, start_code, "", err)
+            if argv[:3] == ["systemctl", "stop", LIVE.DAEMON]:
+                err = "" if stop_code == 0 else "stop failed"
+                return subprocess.CompletedProcess(argv, stop_code, "", err)
+            if argv[:3] == ["systemctl", "is-active", LIVE.DAEMON]:
+                return subprocess.CompletedProcess(argv, 0, "active\n", "")
+            if argv[:2] == ["dgx-fan-control", "status"]:
+                state = states[min(seen["status"], len(states) - 1)]
+                seen["status"] += 1
+                phrase = " (daemon not setting a floor; EC's own curve)" if state == 0 else ""
+                text = (
+                    f"state={state}/12{phrase} hottest=42.8C\n"
+                    "watchdog-active: active\nmanual-floor: none\n"
+                )
+                return subprocess.CompletedProcess(argv, 0, text, "")
+            raise AssertionError(argv)
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+
+        return calls, sleeps, run, sleep
+
+    def _run_service(self, states, **kwargs):
+        calls, sleeps, run, sleep = self._service_run(states, **kwargs)
+        snaps = [snapshot(manual_unit="enabled"), snapshot(manual_unit="enabled")]
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = LIVE.main(
+                ["--case", "service-start-stop", "--consent", "service-start-stop"],
+                environ={"DGX_FAN_LIVE": "1"},
+                collect=lambda _run: snaps.pop(0),
+                run=run,
+                sleep=sleep,
+            )
+        return code, calls, sleeps, out.getvalue() + err.getvalue()
+
+    def test_delayed_floor_is_accepted_then_stopped(self):
+        code, calls, sleeps, text = self._run_service([0, 0, 1])
+        self.assertEqual(code, 0, text)
+        self.assertEqual(sleeps, [LIVE.SERVICE_READY_INTERVAL, LIVE.SERVICE_READY_INTERVAL])
+        self.assertEqual(calls[0][:3], ["systemctl", "start", LIVE.DAEMON])
+        self.assertEqual(calls[-1][:3], ["systemctl", "stop", LIVE.DAEMON])
+        self.assertNotIn("enable", [part for cmd in calls for part in cmd])
+        self.assertIn("PASS service-start-stop", text)
+
+    def test_never_ready_still_stops_and_keeps_the_primary_error(self):
+        code, calls, sleeps, text = self._run_service([0, 0, 0, 0])
+        self.assertEqual(code, 1, text)
+        self.assertEqual(len(sleeps), LIVE.SERVICE_READY_POLLS - 1)
+        self.assertEqual(calls[-1][:3], ["systemctl", "stop", LIVE.DAEMON])
+        self.assertIn("started service left state 0", text)
+        self.assertIn("is-active=active", text)
+        self.assertIn("does not say the service exited", text)
+        self.assertNotIn("Cleanup failed", text)
+
+    def test_failed_start_still_stops(self):
+        code, calls, _sleeps, text = self._run_service([], start_code=1)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(calls[0][:3], ["systemctl", "start", LIVE.DAEMON])
+        self.assertEqual(calls[-1][:3], ["systemctl", "stop", LIVE.DAEMON])
+        self.assertIn("systemctl start exited 1", text)
+        self.assertNotIn("Cleanup failed", text)
+        self.assertFalse(any(cmd[:2] == ["dgx-fan-control", "status"] for cmd in calls))
+
+    def test_cleanup_failure_is_reported_with_the_primary_error(self):
+        code, calls, _sleeps, text = self._run_service([0], stop_code=1)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(calls[-1][:3], ["systemctl", "stop", LIVE.DAEMON])
+        self.assertIn("started service left state 0", text)
+        self.assertIn("Cleanup failed: systemctl stop exited 1", text)
+        self.assertNotIn("PASS service-start-stop", text)
+
+    def test_exception_during_readiness_still_stops(self):
+        def explode(argv, seen):
+            return argv[:2] == ["dgx-fan-control", "status"]
+
+        code, calls, _sleeps, text = self._run_service([1], explode=explode)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(calls[-1][:3], ["systemctl", "stop", LIVE.DAEMON])
+        self.assertIn("injected failure", text)
+        self.assertNotIn("Cleanup failed", text)
+
     def test_unload_does_not_pass_module_parameters(self):
         self.assertEqual(LIVE.commands_for("unload-reload")[1], ["modprobe", LIVE.MODULE])
         self.assertEqual(

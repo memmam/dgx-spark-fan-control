@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CHECKOUT = Path(__file__).resolve().parents[2]
@@ -32,6 +33,12 @@ PARAM_DIR = Path("/sys/module") / MODULE / "parameters"
 # Idle bound for this harness only. It is not a thermal-policy threshold.
 COOL_C = 60.0
 COMMAND_TIMEOUT = 15
+# The daemon writes its first non-zero floor in the first loop, before the
+# 2s poll wait. systemd Type=simple returns as soon as that process starts.
+# Four samples, 2s apart, cover that startup. They do not wait for the
+# unit's 30s RestartSec.
+SERVICE_READY_POLLS = 4
+SERVICE_READY_INTERVAL = 2.0
 SAFE_PARAM = frozenset({"n", "0", "false", "off"})
 MUTATING = ("floor-automatic", "service-start-stop", "unload-reload")
 MANUAL = (
@@ -463,6 +470,95 @@ def print_snapshot(snap: dict) -> None:
     print("telemetry: " + (" ".join(snap["rpms"]) if snap["rpms"] else "no fan rpm read"))
 
 
+def service_floor_ready(active: str, state: int | None) -> bool:
+    """A running curve has left state 0. State 0 alone is not a daemon exit."""
+    return active == "active" and state not in (None, 0)
+
+
+def read_service_sample(run) -> dict:
+    print("RUN systemctl is-active " + DAEMON)
+    active = run_command(["systemctl", "is-active", DAEMON], run)
+    print("RUN dgx-fan-control status")
+    status = run_command(["dgx-fan-control", "status"], run)
+    parsed = parse_status(status.stdout or "")
+    print((status.stdout or "").rstrip())
+    return {
+        "active": (active.stdout or "").strip() or "unknown",
+        "state": parsed["state"],
+        "status_text": status.stdout or "",
+    }
+
+
+def await_service_floor(run, sleep) -> dict:
+    """Poll until the floor leaves 0, or the bounded window ends."""
+    last = None
+    for index in range(SERVICE_READY_POLLS):
+        if index:
+            sleep(SERVICE_READY_INTERVAL)
+        last = read_service_sample(run)
+        print(
+            f"service sample {index + 1}/{SERVICE_READY_POLLS}: "
+            f"active={last['active']} state={last['state']}"
+        )
+        if service_floor_ready(last["active"], last["state"]):
+            last["ready"] = True
+            last["samples"] = index + 1
+            return last
+    last["ready"] = False
+    last["samples"] = SERVICE_READY_POLLS
+    return last
+
+
+def not_ready_message(sample: dict) -> str:
+    return (
+        f"started service left state {sample['state']} "
+        f"after {sample['samples']} samples "
+        f"({SERVICE_READY_INTERVAL:.0f}s apart); is-active={sample['active']}. "
+        "The status phrase 'daemon not setting a floor' is printed for "
+        "cooling state 0 and does not say the service exited"
+    )
+
+
+def stop_performance_service(run) -> str | None:
+    """Stop the performance service. Do not disable it or the manual unit."""
+    print("RUN systemctl stop " + DAEMON)
+    try:
+        completed = run_command(["systemctl", "stop", DAEMON], run)
+    except Exception as exc:
+        return f"systemctl stop failed: {exc}"
+    if completed.returncode != 0:
+        detail = ((completed.stderr or completed.stdout or "").strip())
+        return f"systemctl stop exited {completed.returncode}: {detail}"
+    return None
+
+
+def run_service_start_stop(run, sleep) -> None:
+    """Start an inactive performance service, then always stop it.
+
+    The original error is kept when the later stop also fails.
+    """
+    primary = None
+    try:
+        print("RUN systemctl start " + DAEMON)
+        started = run_command(["systemctl", "start", DAEMON], run)
+        if started.returncode != 0:
+            detail = ((started.stderr or started.stdout or "").strip())
+            primary = f"systemctl start exited {started.returncode}: {detail}"
+        else:
+            sample = await_service_floor(run, sleep)
+            if not sample["ready"]:
+                primary = not_ready_message(sample)
+    except Exception as exc:
+        primary = primary or f"service-start-stop failed: {exc}"
+    cleanup = stop_performance_service(run)
+    if primary and cleanup:
+        raise Stop(f"{primary} Cleanup failed: {cleanup}")
+    if cleanup:
+        raise Stop(f"Cleanup failed after service-start-stop: {cleanup}")
+    if primary:
+        raise Stop(primary)
+
+
 def finish_mutating(case: str, snap_before: dict, snap_after: dict) -> None:
     if case == "floor-automatic":
         if snap_after["state"] != 0 or snap_after["manual"] != "none":
@@ -487,7 +583,7 @@ def finish_mutating(case: str, snap_before: dict, snap_after: dict) -> None:
 
 
 def main(argv: list[str] | None = None, environ: dict[str, str] | None = None,
-         collect=None, run=None) -> int:
+         collect=None, run=None, sleep=None) -> int:
     env = os.environ if environ is None else environ
     refused = gate(env)
     if refused:
@@ -512,6 +608,8 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None,
             )
     if collect is None:
         collect = live_collect
+    if sleep is None:
+        sleep = time.sleep
     print(
         "live-check: userspace commands time out at "
         f"{COMMAND_TIMEOUT}s. That does not interrupt a stuck secure-firmware call."
@@ -535,6 +633,12 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None,
                 report_manual()
                 return 3
             before_file = snap.get("manual_file")
+            if case == "service-start-stop":
+                run_service_start_stop(run, sleep)
+                after = collect(run)
+                finish_mutating(case, snap, after)
+                snap = after
+                continue
             seen_status = 0
             for argv in commands_for(case):
                 print("RUN " + " ".join(argv))
@@ -548,8 +652,6 @@ def main(argv: list[str] | None = None, environ: dict[str, str] | None = None,
                     seen_status += 1
                     if case == "floor-automatic" and seen_status == 1 and parsed["state"] != 6:
                         raise Stop(f"set-state 6 read back state {parsed['state']}")
-                    if case == "service-start-stop" and seen_status == 1 and parsed["state"] in (None, 0):
-                        raise Stop(f"started service left state {parsed['state']}")
             after = collect(run)
             if case == "unload-reload":
                 finish_mutating(

@@ -422,7 +422,10 @@ pass on both machines, after `c92aa96`, is an operator report: kensaki
 showed 42.5°C and 2700/4050 RPM at state 0 with no manual floor; atarime
 showed 2060/2147 RPM, telemetry only, and no zone temperature because that
 status line does not print one. That missing value was not a cool reading.
-The notes below are the operator's 7 Nov 2026 report.
+A later Kensaki `service-start-stop` at `391abc5` started the performance
+service, read cooling state 0 once, and failed before `systemctl stop`.
+That phrase in status is the state-0 label. It is not evidence the process
+exited. The notes below are the operator's 7 Nov 2026 report.
 Items not listed there are still pending. This tree was not used to load the
 module or to run those steps.
 

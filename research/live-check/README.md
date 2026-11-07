@@ -74,8 +74,17 @@ watched, and clean. EC 3.13.7 prints `MANUAL` for the floor and service
 cases and does not run them.
 
 `floor-automatic` and `service-start-stop` are EC 3.5.8 only. They change
-fan speed. `unload-reload` unloads and reloads the module on either
-profile; on EC 3.5.8 only from state 0 with no manual floor.
+fan speed. `service-start-stop` uses `systemctl start` and later
+`systemctl stop`. It does not enable or disable either unit.
+`systemctl start` returns when the process has started. The daemon writes
+its first non-zero floor in that first loop, before its 2-second wait, so
+one immediate status can still show state 0. The harness then checks up to
+4 samples, 2 seconds apart. That does not wait for the unit's 30-second
+restart delay. The status words "daemon not setting a floor" mean the
+cooling state is 0. If the floor never leaves 0, or start fails, the
+harness still stops the service and reports that stop separately when it
+fails. `unload-reload` unloads and reloads the module on either profile;
+on EC 3.5.8 only from state 0 with no manual floor.
 
 ```sh
 sudo DGX_FAN_LIVE=1 ./research/live-check/live-check \
