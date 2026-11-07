@@ -189,6 +189,14 @@ idle-looking status alone is insufficient. These reads may drain a late
 completion; a transition to complete during observation is allowed. The
 packet sender independently rejects a mailbox that becomes busy afterward.
 
+EC 3.13.7 does not take that read. A telemetry timeout on that profile
+stays the timeout. `allow_unverified_writes` is what would open floor
+commands there, and it stays off. EC 3.5.8 still does the one read. Live
+mailbox status `0x08` was observed while the packet poll stayed 2, and one
+`GET_LOWER_LIMIT` recovered that case. A timeout recorded with the read
+already disabled did not include this status byte, so it is not evidence
+that the read caused the wedge.
+
 At most one operation-4 read is submitted by a recovery attempt. It has the
 normal bounded completion wait, with no recursive recovery. Its cached floor
 must match a physical family-7/operation-4/success reply, with mailbox idle,

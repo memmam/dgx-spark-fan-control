@@ -125,15 +125,10 @@ def hottest_c(thermal_root: Path) -> float | None:
 
 
 def write_level(devices: list[Path], level: int) -> list[str]:
-    if level < HARD_MIN_LEVEL and level != 0:
-        raise ValueError(f"refusing ACPI level {level}: below {HARD_MIN_LEVEL}")
-    if level == 0:
-        raise ValueError("refusing ACPI level 0: it stops both fans")
-    results = []
-    for device in devices:
-        (device / "cur_state").write_text(f"{level}\n", encoding="ascii")
-        results.append(f"{device.name}={read_text(device / 'cur_state')}")
-    return results
+    raise RuntimeError(
+        f"refusing ACPI Fan cur_state write of {level} on {len(devices)} device(s): "
+        "this tree does not write ACPI fan levels"
+    )
 
 
 def abort_reason(rpms: list[int | None], min_rpm: int,
@@ -231,42 +226,13 @@ def preflight(thermal_root: Path | None = None,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("levels", nargs="*", type=int, default=[40, 35, 30])
-    parser.add_argument("--hold", type=float, default=180.0,
-                        help="seconds at each level (default 180)")
-    parser.add_argument("--interval", type=float, default=1.0)
-    parser.add_argument("--min-rpm", type=int, default=1000,
-                        help="stop if any fan reads below this (default 1000)")
-    parser.add_argument("--max-temp", type=float, default=60.0,
-                        help="stop if the hottest zone reaches this C (default 60)")
-    parser.add_argument("--log", type=Path, default=None,
-                        help="CSV path (default ./acpi-floor-sweep-<UTC>.csv)")
-    args = parser.parse_args(argv)
-    problem = preflight()
-    if problem:
-        print(f"acpi-floor-sweep: {problem}", file=sys.stderr)
-        return 1
-    path = args.log or Path(
-        f"acpi-floor-sweep-{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}.csv")
-    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
-    with path.open("w", encoding="ascii") as handle:
-        def log(line: str) -> None:
-            print(line, flush=True)
-            handle.write(line + "\n")
-            handle.flush()
-        try:
-            code = sweep(args.levels, args.hold, args.interval, args.min_rpm,
-                         args.max_temp, Path("/sys/class/thermal"),
-                         Path("/sys/class/hwmon"), log)
-        except KeyboardInterrupt:
-            print("interrupted; level 100 was written", file=sys.stderr)
-            code = 130
-        except (RuntimeError, ValueError) as exc:
-            print(f"acpi-floor-sweep: {exc}", file=sys.stderr)
-            code = 1
-    print(f"log: {path}")
-    return code
+    del argv
+    print(
+        "acpi-floor-sweep: this tree does not write ACPI Fan cur_state. "
+        "Earlier recorded samples stay research evidence.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":

@@ -418,6 +418,17 @@ int main(int argc, char **argv) {
   assert(dgx_ec_set_cur_state(&cdev, 12) == 0 && physical_floor == 4350);
   assert(dgx_ec_set_cur_state(&cdev, 1) == 0 && physical_floor == 2000);
   assert(physical_floor == dgx_ec_profiles[1].floors[1]);
+ } else if (!strcmp(argv[1], "profile_3137_timeout_skips_floor_read")) {
+  data.profile = &dgx_ec_profiles[1];
+  data.current_state = 0;
+  recovery_enabled = 1;
+  wedge_operation = 7;
+  u8 output[64];
+  memset(output, 0xff, sizeof(output));
+  assert(dgx_ec_read_operation(&data, 7, output) == -ETIMEDOUT);
+  assert(submit_count == 1 && get_count == 0 && write_count == 0);
+  assert(data.recovery_count == 0 && peer_gets == 0);
+  assert(last_operation == 7);
  } else { assert(!"unknown case"); }
  return 0;
 }
@@ -461,6 +472,7 @@ class KernelTransactionTests(unittest.TestCase):
             "foreign_during_write", "automatic_recovery", "late_completion",
             "preflight_stuck", "bounded_restore", "unexpected_responses",
             "profile_3137_writes_require_opt_in",
+            "profile_3137_timeout_skips_floor_read",
         ) + tuple(sorted(set(re.findall(r'!strcmp\(argv\[1\], "(recovery_[a-z_]+)"\)', MAIN)))) + (
             "recovery_idle", *(f"recovery_oem_fail_{i}" for i in range(1, 7)),
         ):

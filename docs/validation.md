@@ -1,5 +1,352 @@
 # Validation and provenance
 
+## Rollback point for this branch
+
+`e57001b9adaf1ca5695da447939c8def68eb51f5`, author date 2026-11-06 11:26:42
+−0800, is the git tip before `3fdcc4d` (13:46 −0800 the same day), the first
+ACPI thermal-escalation commit. History from there back is linear. Nothing
+was committed during unit-a's step-down searches (about 11:31–13:03
+−0800), so this commit is the tree those searches ran against. It is not a
+hardware-proven last-working module. The later loaded module was 0.1.7.
+This commit is module 0.1.6. Its parent `2955201` differs only in install
+documentation.
+
+The daemon curves in this commit are the accepted ones: default 50→3, 55→5,
+60→8, 65→10, 70→12 with the state-1 pin, and the opt-in quiet table from
+the tenhkspark patch. ACPI level samples from that afternoon stay research
+evidence. This tree does not write ACPI `cur_state`.
+
+With the module unloaded, a true-zero stall used to write ACPI level 100.
+That write is removed and nothing is substituted for it. The alert, the one
+reboot when no work is running, and the true-zero poweroff at 85 °C remain.
+Those actions were not re-measured on hardware for this commit.
+
+Carry-forward, decided on this branch:
+
+- EC 3.5.8 keeps the one idle-mailbox floor read. Status `0x08` with the
+  packet poll still 2 was measured, and one `GET_LOWER_LIMIT` recovered
+  that case. The floor write is not replayed.
+- The 6 Nov timeout happened while that read was already disabled. Its OEM
+  status was not captured. That log does not make the read unsafe, and it
+  does not show the read would have cleared that wedge.
+- EC 3.13.7 still gets no floor command, including after a telemetry
+  timeout. There is no module parameter for this. `allow_unverified_writes`
+  stays off.
+- No ACPI `cur_state` writes. No fault latch. Curves and the 85 °C
+  true-zero cutoff are unchanged.
+- The module version is 0.1.8 so it is not labeled as stock 0.1.6 or as
+  the loaded 0.1.7.
+- `scripts/ec358-regression` is the EC 3.5.8 check for this delta. With
+  no `DGX_FAN_SUPERVISED=1` it does not touch the host. It stops unless
+  fwupd or a current kernel pin shows EC 3.5.8 and the other source does
+  not show a different version. `floor` is set-state 6 then automatic, and
+  it checks that ACPI Fan `cur_state` does not change. No GPU load.
+
+November rows below use unit-a and unit-b for the two machines. Those ids
+are not firmware versions; each row states the firmware that unit was
+running. Host names and home-directory log paths are omitted. Script and
+log names here are sanitized equivalents of the names used on the machines.
+
+## unit-a script, 6 Nov 2026 23:22 PST
+
+Checkout `0d9b49e` on unit-a, EC 3.5.8. The run was
+`scripts/ec358-regression` with `DGX_FAN_SUPERVISED=1`. The script
+printed `PASS preflight`, `PASS install`, and `PASS floor`. No status
+text, RPM, temperature, or kernel log was supplied with those lines, so
+this row is the script result only. unit-b was not run. No GPU load was
+run. Do not repeat these three cases unless this command or the installed
+module changes, or a regression is being checked.
+
+Older sections below are the record as it stood at `e57001b`, including
+commands this tree no longer provides.
+
+## unit-a direct `_FSL` 110, 7 Nov 2026 about 14:11–14:12 PST
+
+Times in this row are the machine clock stated as PST. unit-a, EC 3.5.8,
+kernel `7.0.0-1024-nvidia`. The controller was fully uninstalled. No GPU
+load. unit-b was not run. No further write follows from this row.
+
+Checkout `ac496545149aa87c413f0eea6224d0480f8918aa`. The temporary module
+is `research/fsl110`. It is not DKMS and it is not the controller. About
+14:11 PST, `build-sign-ec358.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc was
+13.3.0. The signature hash was sha512. `modinfo` signer was `DGX Spark
+local module signing`. The build had no failure. It warned about the
+compiler name only, and it skipped BTF because `vmlinux` was absent.
+
+About 14:12 PST the operator ran `sudo DGX_FSL110=yes bash ./run-once.sh`.
+The script printed `before 2700 4050`, then `loaded`, then status
+`interpreter_ok`. Sample 1 was hwmon0 2700 and hwmon1 4050. Sample 2 was
+hwmon0 4500 and hwmon1 4590. Sample 3 was the same 4500/4590. The module
+was then unloaded.
+
+One direct `\_SB.FAN0._FSL` with argument 110 completed. That argument
+requests 4687 on both channels. The published `acpi_fan` speeds left
+2700/4050 and landed above the earlier level-100 observation of about
+4320/4320, so the downstream read was not hard-clamped at that earlier
+level-100 result. These numbers are not an independently verified physical
+shaft speed on EC 3.5.8. The calculated producer and the readback path are
+still only bounded, not traced into the tachometer.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- single request, evaluation, and readback response: PASS
+- physical RPM: UNVERIFIED
+- sustained behavior: UNRUN
+- reboot cleanup: PASS
+- restored idle baseline: PASS
+
+Unload did not clear the hold. About 14:14 PST the operator rebooted and
+answered yes when asked whether fanwatch showed 2700/4050 again. That
+confirms the idle pair returned. It is not a load sweep and it does not
+make the 4500/4590 reading a verified shaft speed. No further unit-a fan
+write follows from this row.
+
+## unit-b direct `_FSL` 110, 7 Nov 2026 about 14:17 PST
+
+The sample clock is stated as PST. Host-log timestamps that were UTC stay
+UTC. unit-b, EC 3.13.7. The controller was fully uninstalled. No GPU load.
+This does not repeat on unit-a. `build-sign-ec3137.sh` printed `SIGNED` and
+`BUILD_SIGNED_NOT_LOADED`.
+
+`run-once-ec3137.sh` zones before, millidegrees C: 43500, 40800, 41700,
+40800, 41700, 43500, 40800. GPU utilization 0 and 41 °C. Fans 2066 and
+2156. Status `interpreter_ok`. Samples 2066/2156, 2071/2155, 2066/2156.
+Zones after: 43500, 40800, 41600, 40800, 41800, 43500, 40800. The module
+was unloaded.
+
+Before the reboot, about a minute of fanwatch at 42–43 °C stayed near
+2061–2077 and 2148–2162. One sample showed fan 2 at 0 between normal
+samples, and the next second was normal again. That zero is not a verified
+physical stop, and it is not attributed. A kernel log excerpt was saved.
+The full file was not supplied. The posted warnings match startup lines
+also seen on unit-a, plus an unclean FAT mount of `sda1`. `lsblk` showed
+that device as the recovery USB `BOOTME`, not an internal disk. No
+fan-specific error was reported. unit-a's current `-b` log is from after
+its reboot, so it cannot be compared with the trial.
+
+The operator then rebooted. About two minutes of fanwatch at 43 °C stayed
+near 2070/2155 with no zeros, and fanwatch was then stopped. The idle tach
+looks intact. That is not proof that every hold bit was released.
+
+`interpreter_ok` means the interpreter returned. It does not mean the EC
+accepted or rejected argument 110. There was no observed sustained speed
+change. That is not a proven protocol rejection. unit-a's 4500/4590
+reading and unit-b's tach are different readouts. A change in one is not
+physical evidence about the other. Argument 110 is not repeated from this
+record.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- evaluation: PASS
+- sustained speed response: no observed effect
+- protocol rejection: NOT PROVEN
+- physical RPM and the transient zero: UNVERIFIED
+- post-reboot idle tach: recorded, hold release not fully proven
+
+## unit-a ramp through 150, 7 Nov 2026 14:43:51 PST
+
+Host clock `2026-11-07T22:43:51+00:00`, which is 14:43:51 PST. Checkout
+`7fdc6ca`. Kernel `7.0.0-1024-nvidia`. Build and sign passed on the
+enrolled certificate. The ramp module was signed. No zeros and no drops
+were reported. Published numbers are not shaft speeds.
+
+Fifteen baseline samples were all 2700/4050. Each later dwell's first
+sample was still the previous pair. From sample 2 onward the pair was
+stable. Medians of the last five samples:
+
+| Argument | Request | Settled published pair |
+| ---: | ---: | --- |
+| 120 | 5025 | 4950/4994 |
+| 130 | 5362 | 5310/5265 |
+| 140 | 5700 | 5670/5670 |
+| 150 | 6037 | 6030/5670 |
+
+At 150 the second of those channels stayed 5670. The script printed
+`STOP_PLATEAU` and unloaded. That was the single-fan rule, not a measured
+ceiling. Levels 160 and above were not issued. No release write. At about
+14:48 PST a reboot of both units was reported. No unit-a post-reboot
+2700/4050 pair has been supplied, so this sweep's restore is not confirmed.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- arguments 120–150, evaluation and readback: PASS
+- stop at 150: policy abort, not an established maximum
+- physical RPM: UNVERIFIED
+- arguments 160–237: UNRUN
+- reboot after this sweep: PENDING
+
+## unit-a continuation from 160, blocked before any write, 7 Nov 2026 14:55:24 PST
+
+Host clock `2026-11-07T22:55:24+00:00`. The script printed fifteen baseline
+samples, all 2610/3915, then `STOP_NOT_BASELINE raw=2610 3915`. It did not
+print `loaded` or a step write. Zone files were checked and not printed.
+No temperature was supplied for this capture, and none is filled in here. In `research/fsl110/ramp-ec358.sh` that
+exit is in the baseline loop. `insmod` is the next statement after the loop,
+and `stepped=1` is only set inside the step loop. No module was loaded and
+no `_FSL` was issued. The guard is unchanged.
+
+2610/3915 is 29 percent of 9000/13500, and it is also the EC 3.5.8 duty
+formula at percent 29: `1260 + 15/86 * 7740 = 2610` and
+`1890 + 15/86 * 11610 = 3915`. The idle pair 2700/4050 is that same formula
+at percent 30, which is the duty byte on the first step of both stock
+curves. The thermal walk applies that duty byte with no add or subtract.
+The image does not show a step that turns 30 into 29. An older one-percent
+gap, 75 versus measured 74, is the same kind of discrepancy and is still
+unresolved. This pair is also exactly two-thirds, which is the telemetry
+shape. The post-`_FSL` readings in the earlier ramp were near each other
+(4950/4994, then 6030/5670), not two-thirds. That difference is consistent
+with the EC curve publishing, and it is not proof the floor register is
+clear, that the machine was damaged, or that 29 percent is the normal idle
+step.
+
+The 14:48 PST reboot was stated. No unit-a 2700/4050 pair was reported
+after it. This row does not mark that restore PASS. Arguments 160–237 stay
+**UNRUN**. Do not loosen the baseline check and do not retry from this
+sample alone.
+
+A fanwatch log from unit-a then shows fourteen 1-second samples
+from 22:58:02 through 22:58:15 UTC, which is 14:58:02 through 14:58:15 PST.
+Every sample is the reported SoC at 42 °C and fans 2610/3915, with no zeros.
+That label is the fanwatch SoC reading, not a hottest-zone selection. The
+pair is steady. It does not identify a cause, it does not establish 29
+percent as the normal idle step, and it does not close the reboot. The
+sweep stays blocked.
+
+Statuses:
+
+- this attempt: BLOCKED before write
+- BUILD/SIGN for the continuation binary: not a new result
+- arguments 160–237: UNRUN
+- reboot restore after the 150 sweep: still PENDING
+
+## unit-b argument 120, two runs, 7 Nov 2026
+
+Same checkout and kernel. The first build attempt used the unit-a script
+and correctly printed `STOP_HOST`. The unit-b probe then signed and
+printed `BUILD_SIGNED_NOT_LOADED` on the enrolled certificate. Both runs
+were appended to the probe host log. No further unit-b write follows from
+this row. `interpreter_ok` is not an EC acceptance or rejection.
+
+First start 14:44:05 PST, while the unit-a ramp was also running. The two
+machines shared a thermal pad and fan rig, so this run is confounded.
+Drift was already present before the write. The last five
+baseline pairs were 2079/2173, 2076/2177, 2085/2173, 2081/2170, 2081/2171.
+After the call, fifteen samples stayed about 2071–2084 and 2169–2182. No
+zero.
+
+The machine was rebooted and the probe was rerun with unit-a not driving
+the rig. Second start 14:48:30 PST. Fifteen baseline samples stayed about 2068–2079 and
+2149–2165. The last five were 2069/2153, 2070/2159, 2069/2149, 2075/2157,
+2071/2159. After the call, fifteen samples stayed about 2063–2076 and
+2151–2161. The last five were 2076/2155, 2073/2159, 2074/2159, 2072/2161,
+2070/2159. `PROBE_DONE`, then unload. No zeros. No observed sustained
+change. That is not a proven protocol rejection. A reboot after this second
+call was requested and is not yet confirmed. The second run does show that
+unit-b had booted far enough to execute the probe. It is not a unit-a
+post-reboot fan pair.
+
+A later fanwatch, about 17 seconds, SoC 45–47 °C, showed fan 1 at 2064–2079
+and fan 2 at 2156–2168, with no zeros. The operator did not say this sample
+was after the post-probe reboot, so it does not close that reboot. It is the
+same idle tach band as the isolated probe. No further unit-b write follows
+from this row. `interpreter_ok` is still only the AML interpreter. The captured
+`WRB` method does not test the SMC response, and the research caller discards
+it. These tach readings do not separate an EC rejection from a write the EC
+accepted and did not apply.
+
+## unit-b `_FST` package read, 7 Nov 2026 15:11:56 PST
+
+Host clock `2026-11-07T23:11:56+00:00`. Checkout `e989d4f`, then the
+temperature-path fix the machine already had from `5cdf3b9`. Kernel
+`7.0.0-1024-nvidia`. `test-fst-read.sh` printed
+`override_rejected_before_hardware` for all three overrides and
+`fst_read_offline_ok`. Build and sign passed: Secure Boot enabled, enrolled
+MOK, sha512, `BUILD_SIGNED_NOT_LOADED`.
+
+Zones, millidegrees C, type `acpitz`: 42800, 40800, 40800, 40900, 41700,
+42800, 40700. Hottest of those zones 42.800 °C. `temperature.gpu` 41 °C.
+`hwmon0` `fan1_input` 2068, `hwmon1` `fan1_input` 2156. The module printed:
+
+```
+\_SB.FAN0._FST 0 0 2068
+\_SB.FAN1._FST 0 0 2156
+```
+
+Then `FST_READ_DONE` and unload. The three integers are the `_FST` package:
+revision, cached control, speed. Both controls are 0. Both speeds match the
+`fan1_input` values from the same run. This is a successful read only. It
+does not prove the earlier write was rejected, it does not prove an EC floor
+is clear, and it does not confirm the reboot after the second argument-120
+call. This read is not repeated from this record. The unit-a 160
+continuation stays blocked on the 2610/3915 baseline.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- `_FST` read, cached control 0, tach match: PASS
+- write rejection, floor clear, reboot: not shown
+
+fwupd on this machine, transcribed without serial numbers. Embedded
+Controller current `0x03000d07`, minimum `0x02003400`, GUID
+`3d13c989-e6a8-4ead-95ee-921f09868f65`, with a reported successful update
+`0x03000508` to `0x03000d07`, capsule on disk. Two UEFI device-firmware
+entries, both success and capsule on disk: `b488217b-3895-4fc0-b1bf-ab7005a2d45a`
+current `0x02009e0f` minimum `0x02007300`, and
+`dd1a238a-5f8e-46bd-9401-a88da99c5a96` current `0x00000519` minimum
+`0x00000400`. `/boot/efi` is vfat on `/dev/nvme0n1p1`. That node is not to
+be read. `/lib/firmware` contains `nvidia/`, `7.0.0-1019-nvidia/`, and
+`7.0.0-1024-nvidia/` among ordinary Linux firmware. `nvidia_ffa_ec` is
+builtin, `drivers/platform/arm64/nvidia-ffa-ec`, softdep `arm-ffa`.
+
+The EFI listing is now in. `/boot/efi/EFI` has `BOOT`, `ubuntu`, and
+`UpdateCapsule`. `UpdateCapsule` is empty. `ubuntu/fw` is empty. `ubuntu`
+holds `grubaa64.efi`, `grub.cfg`, `shimaa64.efi`, `mmaa64.efi`,
+`BOOTAA64.CSV`, and `fw/`. `BOOT` holds `BOOTAA64.EFI`, `fbaa64.efi`, and
+`mmaa64.efi`. The name filter on the three firmware directories above
+matched GPU microcode and unrelated device-tree board files. It did not
+match a name containing `ffa` or `socfw`. `/usr/src` has no
+`nvidia-ffa-ec*` file. These are filename results, not a content search, so
+they do not prove the SMC handler is missing from the machine. Empty
+capsule directories mean nothing is staged now. They do not identify the
+monitor that answered the earlier SMC. No further listing is part of this
+record. Acceptance of the setpoint remains unshown. The unit-a sweep stays
+blocked.
+
+## Same-boot `_FST` around one unit-b `_FSL`, not prepared
+
+Recorded 7 Nov 2026. A same-boot `_FST` before and after one existing
+request, 110 or 120, would show the cached control before a reboot. No
+module was added and no command is given. In the captured DSDT, `WFCF`
+assigns `FLVL = Arg0` before its four `WRB` calls. The assignment does not
+read the SMC reply. Both fans' `_FST` methods publish that same name. After
+`_FSL` returns success, the control field is the argument for the rest of
+that namespace. Argument 120 leaves 120. Argument 110 leaves 110. The 15:11
+control value 0 is the initializer `Name (FLVL, Zero)`. A reboot rebuilds
+that name. This comparison restates the method. It does not show whether
+the EC kept the setpoint. The unit-a sweep stays blocked.
+
+Statuses:
+
+- this comparison: NOT PREPARED
+- arguments 110 and 120: no new run
+- EC acceptance: still unshown
+
+## unit-a continuation from 160, not yet run
+
+**UNRUN.** The module list now starts at 160 and still ends at 237
+(request 8973). It does not repeat 120–150. The next write requires a fresh
+baseline of 2700/4050. That pair has not been reported since the 14:48 PST
+reboot, so the script must observe it itself. A single fan whose settled
+median does not rise is logged as `PLATEAU_RECORDED` and the sweep
+continues. The sweep stops if both medians fail to rise, if either median
+falls, or on zero, a bad readout, a zone outside 25–60 °C, GPU utilization
+above 0, or a reading above 9500. Settled samples in the 120–150 dwells did
+not jitter, so equality is a plateau and a lower median is a decrease.
+No deadband is added. No release write. Reboot after any step.
+
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
 Both DGX Sparks, previously EC 3.13.7, downgraded to EC 3.5.8 with fwupd and

@@ -655,29 +655,11 @@ before that reboot do not come back by themselves:
   watchdog still reboots only the machine whose fans stopped or whose floor
   is foreign.
 
-## Set the ACPI fan level
+## ACPI fan levels
 
-This does not use the kernel module. It writes every cooling device whose
-type is `Fan`:
-
-```sh
-sudo dgx-fan-control acpi-max
-sudo dgx-fan-control acpi-max --level 40
-```
-
-On success it prints one line per Fan device with the read-back level, for
-example `cooling_device0 (Fan): 100/100`. On EC 3.5.8 the trailing line is
-`check fan RPM`. On EC 3.13.7 telemetry-only, `acpi-max` writes nothing,
-logs that the EC runs its own curve, and exits 0, even when the kernel
-module is loaded. The command exits nonzero when it finds no Fan cooling
-device, a write fails, the kernel module is loaded on firmware that accepts
-floor writes, or the fan service is active.
-
-The module and ACPI `cur_state` write the same EC lower floor. `acpi-max`
-refuses in that case. `--force` overrides the refusal and logs a warning.
-`--level` below 35 is refused and does not write. **Never write a level
-below 35. Level 0 stops both fans and is not a recovery step.** Level 20 has
-stalled one fan. Level 100 is about 4320 RPM, quieter than module state 12
-on EC 3.5.8. The level resets on reboot. If a level below 100 fails partway,
-or the command is interrupted after it has found the devices, it tries to
-write 100 to each of them. It never writes 0 from that path.
+This tree does not write ACPI `cur_state`. There is no `acpi-max` command
+and the floor sweep does not write. Recorded measurements of those levels
+stay research evidence: level 100 read about 4320/4320 RPM, which is not
+module state 12, and on EC 3.5.8 an ACPI write replaces the EC curve until
+reboot. Level 0 stops both fans. The watchdog still reads `acpi_fan`
+tachometers and thermal zones.
