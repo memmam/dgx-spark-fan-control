@@ -142,13 +142,26 @@ Statuses:
 
 ## Next research calls, not yet run
 
-Kensaki ramp and the Atarime level-120 probe are **UNRUN**. Argument 110
-is not part of either. The encoded Kensaki requests are 120, then 130,
-then 140 (5025, 5362, and 5700). The ramp stops there. It does not
-approach the 16-bit wrap near level 1913. The Atarime probe is argument
-120 only (5025). Published Kensaki numbers are still not shaft RPM. The
-EC 3.5.8 telemetry endpoints 9000 and 13500 are not a license to request
-them.
+Both are **UNRUN**. Argument 110 is not repeated. Published Kensaki
+numbers are not shaft RPM, and 9000/13500 are the EC 3.5.8 capability
+endpoints, not a measured maximum. The shared `_FSL` request at level L is
+`975 + (3375 * L) / 100`. Level 237 requests 8973, the greatest request
+that is still at or below 9000. Level 238 requests 9007 and is not in the
+list. The 16-bit wrap near level 1913 is not a stop the sweep is allowed
+to approach.
+
+Kensaki steps, hardcoded: 120, 130, 140, 150, 160, 170, 180, 190, 200,
+210, 220, 225, 230, 232, 234, 236, 237. Steps are 10 levels until 220,
+then 5, then 2, then 1. Each dwell is 15 samples, 2 seconds apart. The
+decision uses the median of the last five samples of each fan path. The
+next step is issued only if both medians are strictly above the previous
+dwell. A drop or a tie on either fan stops the ramp. A zero, a non-numeric
+reading, a reading above 9500, a zone outside 25–60 °C, or GPU utilization
+above 0 also stops it, and the raw value is logged. No release write.
+
+Atarime remains one probe at argument 120, request 5025. Level 110 produced
+no sustained tach change, so 120 is the next single step, not a sweep.
+There is no response slope on Atarime from which to aim at 9000.
 
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 

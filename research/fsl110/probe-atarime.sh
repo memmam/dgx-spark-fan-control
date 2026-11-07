@@ -1,6 +1,7 @@
 #!/bin/bash
 # Atarime only. One argument, 120. No second write.
 # interpreter_ok is not an EC accept or reject.
+# Cleanup only unloads a module this script loaded. It does not write a release.
 set -u
 cd "$(dirname "$0")"
 exec > >(tee -a atarime-probe120-hostlog.txt) 2>&1
@@ -11,8 +12,9 @@ test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
 hn=$(hostname -s 2>/dev/null || hostname); hn=${hn%%.*}
 test "$hn" = atarime || { echo STOP_HOST; exit 1; }
 armed=0
+loaded_by_us=0
 cleanup() {
-  if lsmod | grep -q '^fsl_probe_atarime '; then
+  if [ "$loaded_by_us" = 1 ] && lsmod | grep -q '^fsl_probe_atarime '; then
     rmmod fsl_probe_atarime || true
     echo "unloaded; this did not undo a hold"
   fi
@@ -31,20 +33,41 @@ done
 for p in /proc/fsl110 /proc/fsl_ramp_kensaki /proc/fsl120_atarime; do
   test ! -e "$p" || { echo "STOP_ALREADY_LOADED $p"; exit 1; }
 done
-echo "=== zones ==="
-for z in /sys/class/thermal/thermal_zone*; do
-  t=$(cat "$z/temp") || { echo STOP_TEMP; exit 1; }
-  echo "$z type=$(cat "$z/type" 2>/dev/null || echo unreadable) temp=$t"
-  test "$t" -ge 25000 && test "$t" -le 60000 || { echo "STOP_TEMP $z $t"; exit 1; }
-done
-utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits) || {
-  echo STOP_GPU; exit 1
+zones_ok() {
+  local z t
+  for z in /sys/class/thermal/thermal_zone*; do
+    if ! t=$(cat "$z/temp" 2>/dev/null); then
+      echo "STOP_TEMP unreadable $z"
+      return 1
+    fi
+    if ! [[ "$t" =~ ^-?[0-9]+$ ]]; then
+      echo "STOP_TEMP nonnumeric $z=$t"
+      return 1
+    fi
+    if [ "$t" -lt 25000 ] || [ "$t" -gt 60000 ]; then
+      echo "STOP_TEMP out_of_range $z=$t"
+      return 1
+    fi
+  done
 }
-printf '%s\n' "$utils"
-while IFS=',' read -r util gpu_temp; do
-  util=${util// /}
-  test "$util" = 0 || { echo "STOP_GPU util=$util"; exit 1; }
-done <<< "$utils"
+gpu_idle() {
+  local utils util
+  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null); then
+    echo "STOP_GPU nvidia-smi_failed"
+    return 1
+  fi
+  if [ -z "$utils" ]; then
+    echo "STOP_GPU empty"
+    return 1
+  fi
+  while IFS= read -r util; do
+    util=${util// /}
+    if [ "$util" != 0 ]; then
+      echo "STOP_GPU util=$util raw=$utils"
+      return 1
+    fi
+  done <<< "$utils"
+}
 mapfile -t paths < <(
   for h in /sys/class/hwmon/hwmon*; do
     test "$(cat "$h/name" 2>/dev/null || true)" = acpi_fan || continue
@@ -54,20 +77,49 @@ mapfile -t paths < <(
   done | sort
 )
 test "${#paths[@]}" -eq 2 || { echo "STOP_FAN_COUNT ${#paths[@]}"; exit 1; }
-echo "=== baseline 15 samples ==="
+echo "paths ${paths[0]} ${paths[1]}"
+check_pair() {
+  local when="$1" a b
+  if ! a=$(cat "${paths[0]}" 2>/dev/null); then
+    echo "STOP_READ unreadable $when ${paths[0]}" >&2
+    return 1
+  fi
+  if ! b=$(cat "${paths[1]}" 2>/dev/null); then
+    echo "STOP_READ unreadable $when ${paths[1]} other=${paths[0]}=$a" >&2
+    return 1
+  fi
+  if ! [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+    echo "STOP_READ nonnumeric $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+    return 1
+  fi
+  if [ "$a" -eq 0 ] || [ "$b" -eq 0 ]; then
+    echo "STOP_READ zero $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+    return 1
+  fi
+  if [ "$when" = base ]; then
+    if [ "$a" -gt 4000 ] || [ "$b" -gt 4000 ]; then
+      echo "STOP_NOT_IDLE $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+      return 1
+    fi
+  elif [ "$a" -gt 16000 ] || [ "$b" -gt 16000 ]; then
+    echo "STOP_READ above_16000 $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$a" "$b"
+}
+echo "=== baseline 15 x 2s ==="
 i=1
 while [ "$i" -le 15 ]; do
-  a=$(cat "${paths[0]}") || { echo STOP_READ; exit 1; }
-  b=$(cat "${paths[1]}") || { echo STOP_READ; exit 1; }
-  echo "base $i $a $b"
-  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || { echo STOP_READ; exit 1; }
-  test "$a" -gt 0 && test "$b" -gt 0 || { echo STOP_ZERO; exit 1; }
-  test "$a" -le 4000 && test "$b" -le 4000 || { echo STOP_NOT_IDLE; exit 1; }
+  zones_ok || exit 1
+  gpu_idle || exit 1
+  pair=$(check_pair base) || exit 1
+  echo "base $i $pair"
   test "$i" = 15 || sleep 2
   i=$((i + 1))
 done
 test -f ./fsl_probe_atarime.ko || { echo STOP_NO_MODULE; exit 1; }
 insmod ./fsl_probe_atarime.ko || { echo STOP_INSMOD; exit 1; }
+loaded_by_us=1
 echo "loaded; unload will not restore fans"
 echo "writing run; the write blocks until the interpreter returns"
 armed=1
@@ -75,18 +127,17 @@ printf '%s\n' run > /proc/fsl120_atarime || { echo STOP_WRITE; exit 1; }
 echo -n "status "
 cat /proc/fsl120_atarime || true
 echo
-echo "=== after 15 samples ==="
+echo "=== after 15 x 2s ==="
 i=1
 while [ "$i" -le 15 ]; do
-  a=$(cat "${paths[0]}") || { echo STOP_READ; exit 1; }
-  b=$(cat "${paths[1]}") || { echo STOP_READ; exit 1; }
-  echo "post $i $a $b"
-  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || { echo STOP_READ; exit 1; }
+  zones_ok || exit 1
+  gpu_idle || exit 1
+  pair=$(check_pair post) || exit 1
+  echo "post $i $pair"
   test "$i" = 15 || sleep 2
   i=$((i + 1))
 done
-echo "=== zones after ==="
-for z in /sys/class/thermal/thermal_zone*; do
-  echo "$z type=$(cat "$z/type" 2>/dev/null || echo unreadable) temp=$(cat "$z/temp" 2>/dev/null || echo unreadable)"
-done
+echo "=== final zones ==="
+zones_ok || exit 1
+gpu_idle || exit 1
 echo "PROBE_DONE"

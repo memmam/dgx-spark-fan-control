@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Kensaki research ramp. Three hardcoded \_SB.FAN0._FSL arguments, in order:
- * 120, 130, 140. Requests 5025, 5362, and 5700. Nothing higher is accepted.
+ * Kensaki research ramp. Hardcoded \_SB.FAN0._FSL arguments, in order.
+ * The last is 237, whose request is 8973, the greatest request still at or
+ * below 9000. Level 238 would request 9007 and is not present. Nothing
+ * near the 16-bit wrap is accepted.
  *
  * Write the exact text "step". Any other text is refused before ACPI.
  * A failed evaluation latches; later steps are refused. Load and unload
@@ -15,7 +17,12 @@
 
 #define FSL_RAMP_PATH		"\\_SB.FAN0._FSL"
 
-static const u64 fsl_ramp_arg[] = { 120ULL, 130ULL, 140ULL };
+static const u64 fsl_ramp_arg[] = {
+	120ULL, 130ULL, 140ULL, 150ULL, 160ULL, 170ULL, 180ULL, 190ULL,
+	200ULL, 210ULL, 220ULL, 225ULL, 230ULL, 232ULL, 234ULL, 236ULL,
+	237ULL
+};
+#define FSL_RAMP_N ((int)(sizeof(fsl_ramp_arg) / sizeof(fsl_ramp_arg[0])))
 static struct proc_dir_entry *fsl_ramp_ent;
 static DEFINE_MUTEX(fsl_ramp_lock);
 static int fsl_ramp_next;
@@ -57,7 +64,7 @@ static ssize_t fsl_ramp_write(struct file *file, const char __user *buf,
 		return -EINVAL;
 
 	mutex_lock(&fsl_ramp_lock);
-	if (fsl_ramp_busy || fsl_ramp_latched || fsl_ramp_next >= 3) {
+	if (fsl_ramp_busy || fsl_ramp_latched || fsl_ramp_next >= FSL_RAMP_N) {
 		mutex_unlock(&fsl_ramp_lock);
 		return -EBUSY;
 	}
@@ -111,5 +118,5 @@ module_init(fsl_ramp_init);
 module_exit(fsl_ramp_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Kensaki research ramp for \\_SB.FAN0._FSL arguments 120, 130, 140");
+MODULE_DESCRIPTION("Kensaki research ramp for \\_SB.FAN0._FSL up through argument 237");
 MODULE_AUTHOR("research");
