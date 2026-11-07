@@ -310,6 +310,25 @@ capsule directories mean nothing is staged now. They do not identify the
 monitor that answered the earlier SMC. No further listing is requested.
 Acceptance of the setpoint remains unshown. The Kensaki sweep stays blocked.
 
+## Same-boot `_FST` around one Atarime `_FSL`, not prepared
+
+Asked on 7 Nov 2026: read `_FST` before and after one existing request, 110
+or 120, in the same boot, to see the cached control before a reboot. No
+module was added and no command is given. In the captured DSDT, `WFCF`
+assigns `FLVL = Arg0` before its four `WRB` calls. The assignment does not
+read the SMC reply. Both fans' `_FST` methods publish that same name. After
+`_FSL` returns success, the control field is the argument for the rest of
+that namespace. Argument 120 leaves 120. Argument 110 leaves 110. The 15:11
+control value 0 is the initializer `Name (FLVL, Zero)`. A reboot rebuilds
+that name. This comparison restates the method. It does not show whether
+the EC kept the setpoint. The Kensaki sweep stays blocked.
+
+Statuses:
+
+- this comparison: NOT PREPARED
+- arguments 110 and 120: no new run
+- EC acceptance: still unshown
+
 ## Kensaki continuation from 160, not yet run
 
 **UNRUN.** The module list now starts at 160 and still ends at 237

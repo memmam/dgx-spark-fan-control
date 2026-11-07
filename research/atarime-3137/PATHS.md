@@ -43,7 +43,7 @@ ACPI SMC. They are not in the saved captures.
 
 | Item | Status |
 | --- | --- |
-| Another `_FSL` level, including 110 and 120 | Blocked. No new evidence goal. |
+| Another `_FSL` level, including 110 and 120 | Not prepared. Same-boot `_FST` control is fixed by AML. See below. |
 | kprobe or handler replacement to grab the SMC reply | Not used. Replacing `acpi_ffh_address_space_arch_handler` would affect every fixed-hardware region. |
 | `fst_status_atarime` | PASS as a read, 7 Nov 2026 15:11:56 PST. Package was `0 0 2068` and `0 0 2156`. Cached control is 0. Speeds match `fan1_input`. Not a write acknowledgement, not a clear floor, not a reboot confirmation. Do not repeat. |
 
@@ -123,3 +123,25 @@ listing, and neither is a new fan level.
 
 The Kensaki continuation stays blocked on the 2610/3915 baseline. No new
 module follows from this inventory.
+
+## Same-boot `_FST` control, not prepared
+
+A same-boot `_FST` before and after one `_FSL` of 110 or 120 would read the
+AML name `FLVL`. In the captured DSDT, `WFCF` begins with `FLVL = Arg0` and
+only then calls `WRB` four times. That assignment does not look at `XX0`.
+`FAN0._FSL` and `FAN1._FSL` both call `WFCF`. Both `_FST` methods copy
+`FAN0.FLVL` into the control field. A completed `_FSL(120)` therefore leaves
+both control fields at 120 for the rest of that namespace, including when
+every SMC is ignored. `_FSL(110)` leaves 110. The 15:11 package control 0 is
+the `Name (FLVL, Zero)` initializer. A later 0 is what a rebuilt namespace
+shows. The store itself does not need another setpoint to establish that.
+
+No launcher is added. Do not rerun 110 or 120 for this question.
+
+Keeping the `WRB` reply would be a separate observation. A kretprobe on
+`acpi_ffh_address_space_arch_handler` can read the buffer after the existing
+handler returns and keep `XX0` when the request id is `0xC400008D`. That
+does not replace the handler and does not issue a write. It is not
+implemented here. `XX0 == 0xC400008E` would mean the monitor returned the
+same sentinel the read path already uses. It would still leave the fan-loop
+consumer unshown.
