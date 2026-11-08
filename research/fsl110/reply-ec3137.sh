@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 source ./ec-profile.sh
 # shellcheck source=ramp-temps-lib.sh
 source ./ramp-temps-lib.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 exec > >(tee -a reply-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
@@ -49,37 +51,18 @@ for u in dgx-fan-control dgx-fan-watchdog dgx-fan-manual dgx-fan-health; do
   }
 done
 refuse_loaded_research
-zones_ok() {
-  local z t
-  for z in /sys/class/thermal/thermal_zone*; do
-    if ! t=$(cat "$z/temp" 2>/dev/null); then
-      echo "STOP_TEMP unreadable $z"
-      return 1
-    fi
-    if ! [[ "$t" =~ ^-?[0-9]+$ ]]; then
-      echo "STOP_TEMP nonnumeric $z=$t"
-      return 1
-    fi
-    if [ "$t" -lt 25000 ] || [ "$t" -gt 60000 ]; then
-      echo "STOP_TEMP out_of_range $z=$t"
-      return 1
-    fi
-  done
+log_zones() {
+  zones_ok /sys/class/thermal || return 1
+  echo "zones$ZONE_LINE hottest=$HOTTEST"
 }
 gpu_idle() {
-  local utils util
-  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null); then
+  local utils
+  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null); then
     echo "STOP_GPU nvidia-smi_failed"
     return 1
   fi
-  if [ -z "$utils" ]; then
-    echo "STOP_GPU empty"
-    return 1
-  fi
-  while IFS= read -r util; do
-    util=${util// /}
-    gpu_util_policy "$util" "raw=$utils" || return 1
-  done <<< "$utils"
+  gpu_parse "$utils" || return 1
+  echo "gpu$GPU_LINE"
 }
 mapfile -t paths < <(
   for h in /sys/class/hwmon/hwmon*; do
@@ -114,6 +97,9 @@ check_pair() {
       echo "STOP_NOT_IDLE $when ${paths[0]}=$a ${paths[1]}=$b" >&2
       return 1
     fi
+    if [ "$a" -gt 2500 ] || [ "$b" -gt 2500 ]; then
+      echo "IDLE_ABOVE_USUAL $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+    fi
   elif [ "$a" -gt 16000 ] || [ "$b" -gt 16000 ]; then
     echo "STOP_READ above_16000 $when ${paths[0]}=$a ${paths[1]}=$b" >&2
     return 1
@@ -123,15 +109,15 @@ check_pair() {
 echo "=== baseline 15 x 2s, before the observer ==="
 i=1
 while [ "$i" -le 15 ]; do
-  zones_ok || exit 1
+  log_zones || exit 1
   gpu_idle || exit 1
   pair=$(check_pair base) || exit 1
   echo "base $i $pair"
   test "$i" = 15 || sleep 2
   i=$((i + 1))
 done
-test -f ./fsl_reply.ko || { echo STOP_NO_MODULE; exit 1; }
-test -f ./fsl_probe.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fsl_reply.ko fsl_reply.c
+require_built_module ./fsl_probe.ko fsl_probe.c
 insmod ./fsl_reply.ko || { echo STOP_INSMOD_REPLY; exit 1; }
 loaded_reply=1
 echo "reply observer loaded; no fan write yet"
@@ -161,12 +147,15 @@ echo -n "status "
 cat /proc/fsl_probe || true
 echo
 echo "=== reply buffer, before further fan reads ==="
-cat /proc/fsl_reply || true
+reply_text=$(cat /proc/fsl_reply || true)
+printf '%s\n' "$reply_text"
 echo
+printf '%s\n' "$reply_text" | python3 ./classify-reply.py || echo INCONCLUSIVE classify_failed
+echo "CAPTURE_COMPLETE means the four write records were kept. It does not mean the EC stored the setpoint."
 echo "=== after 15 x 2s ==="
 i=1
 while [ "$i" -le 15 ]; do
-  zones_ok || exit 1
+  log_zones || exit 1
   gpu_idle || exit 1
   pair=$(check_pair post) || exit 1
   echo "post $i $pair"
@@ -174,7 +163,7 @@ while [ "$i" -le 15 ]; do
   i=$((i + 1))
 done
 echo "=== final zones ==="
-zones_ok || exit 1
+log_zones || exit 1
 gpu_idle || exit 1
 echo "REPLY_DONE"
 echo "post_a0 is the first qword left in the handler buffer. The read path publishes a speed only when that qword is c400008e. The same value here is not proof the fan loop stored the bytes."

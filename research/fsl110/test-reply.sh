@@ -15,8 +15,16 @@ case "$src" in
   *'acpi_evaluate_object'*|*'_FSL'*|*'_FST'*) echo "FAIL method call present"; exit 1 ;;
 esac
 case "$src" in
-  *'FSL_REPLY_SLOTS		8'*) ;;
-  *) echo "FAIL slot cap missing"; exit 1 ;;
+  *'FSL_REPLY_WRITES'*'8'*) ;;
+  *) echo "FAIL write slot cap missing"; exit 1 ;;
+esac
+case "$src" in
+  *'FSL_REPLY_READS'*'32'*) ;;
+  *) echo "FAIL read slot cap missing"; exit 1 ;;
+esac
+case "$src" in
+  *'nmissed'*) ;;
+  *) echo "FAIL nmissed not reported"; exit 1 ;;
 esac
 case "$src" in
   *'register_kretprobe'*) ;;
@@ -79,3 +87,47 @@ if ! grep -q 'layout=unverified' reply-ec3137-preflight.sh; then
   exit 1
 fi
 echo "reply_preflight_offline_ok"
+python3 - << 'PY'
+import pathlib, subprocess, sys
+root = pathlib.Path("classify-reply.py")
+def run(text):
+    out = subprocess.check_output([sys.executable, str(root)], input=text.encode())
+    return out.decode().strip()
+good = """state armed
+writes 4
+reads 2
+dropped_writes 0
+dropped_reads 0
+nmissed 0
+W 0 pre_a0=c400008d pre_a4=9 post_a0=c400008e post_a4=9 handler=0 post_ok=1
+W 1 pre_a0=c400008d pre_a4=109 post_a0=c400008e post_a4=109 handler=0 post_ok=1
+W 2 pre_a0=c400008d pre_a4=209 post_a0=c400008e post_a4=209 handler=0 post_ok=1
+W 3 pre_a0=c400008d pre_a4=309 post_a0=c400008e post_a4=309 handler=0 post_ok=1
+truncated 0
+"""
+assert run(good) == "CAPTURE_COMPLETE", run(good)
+lost = good.replace("dropped_writes 0", "dropped_writes 1")
+assert run(lost).startswith("INCONCLUSIVE"), run(lost)
+miss = good.replace("nmissed 0", "nmissed 2")
+assert "nmissed=2" in run(miss)
+short = good.replace("writes 4", "writes 1", 1)
+# listed W lines still 4, so count_mismatch and writes=1
+assert "INCONCLUSIVE" in run(short)
+trunc = good.replace("truncated 0", "truncated 1")
+assert "truncated" in run(trunc)
+blank = "state armed\n"
+assert run(blank).startswith("INCONCLUSIVE malformed")
+print("classify_reply_ok")
+PY
+python3 - << 'PY'
+import pathlib, re
+src = pathlib.Path("fsl_reply.c").read_text()
+text = int(re.search(r"#define FSL_REPLY_TEXT\s+(\d+)", src).group(1))
+writes = int(re.search(r"#define FSL_REPLY_WRITES\s+(\d+)", src).group(1))
+reads = int(re.search(r"#define FSL_REPLY_READS\s+(\d+)", src).group(1))
+# One full line is under 220 bytes. The header is under 200.
+need = 200 + (writes + reads) * 220
+if text <= need:
+    raise SystemExit(f"FAIL reply text {text} <= worst case {need}")
+print("reply_text_fits", text, need)
+PY

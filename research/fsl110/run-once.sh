@@ -10,6 +10,8 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 test "${DGX_FSL_EC358:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
 require_ec 3.5.8
@@ -34,7 +36,7 @@ sorted=$(printf '%s\n' $vals | sort -n | tr '\n' ' ')
 echo "before$sorted"
 test "$sorted" = "2700 4050 " || { echo STOP_NOT_STOCK; exit 1; }
 refuse_loaded_research
-test -f ./fsl110.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fsl110.ko fsl110.c
 insmod ./fsl110.ko
 echo "loaded; unload will not restore fans"
 set +e

@@ -434,10 +434,13 @@ Statuses:
 
 ## unit-a continuation procedure after the partial 160
 
-The module list still starts at 160 and ends at 237 (request 8973). It does
-not repeat 120–150. Argument 160 was issued at 03:35:42 +00:00 and its dwell
-did not finish, so the list has not been retired. The next write, when one
-is authorized, requires a fresh 2700/4050 baseline observed by the launcher
+The module list still starts at 160 and ends at 237 (request 8973). A
+finished 15-sample dwell is followed by the next argument in that list.
+The run does not stop after 160. It does not repeat 120–150. Argument 160
+was issued at 03:35:42 +00:00 and its dwell did not finish, so that step
+has no median and the list has not been retired. The next run, when one is
+authorized, starts at 160 again and continues through 237 if each dwell
+finishes. It requires a fresh 2700/4050 baseline observed by the launcher
 on that run. The report of about 19:42 PST on 7 Nov, idle pair 2700/4050
 after the reboot, does not replace that baseline. A single fan whose settled
 median does not rise
@@ -612,7 +615,7 @@ reproduced as a controlled test here.
 
 ## Version 0.1.4 zero-clamp restore
 
-On **2026-10-29** the signed module was built on **dgx4** with DKMS against
+On **2026-10-29** the signed module was built with DKMS against
 the running kernel **`7.0.0-1019-nvidia-64k`**. EC firmware was **3.5.8**
 (`0x03000508`) and SoC firmware **2.155.11** (`0x02009b0b`). A vLLM worker was
 serving. Hottest zone about **68°C**, fans **9000 / 11205 RPM** at state 10

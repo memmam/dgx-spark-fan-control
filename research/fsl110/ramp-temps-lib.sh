@@ -76,6 +76,10 @@ gpu_parse() {
   while IFS=',' read -r util gtemp; do
     util=${util// /}
     gtemp=${gtemp// /}
+    if ! [[ "$gtemp" =~ ^-?[0-9]+$ ]]; then
+      echo "STOP_GPU temp=$gtemp util=$util raw=$utils"
+      return 1
+    fi
     if ! gpu_util_policy "$util" "nvidia_gpu_temp=${gtemp}C raw=$utils"; then
       return 1
     fi

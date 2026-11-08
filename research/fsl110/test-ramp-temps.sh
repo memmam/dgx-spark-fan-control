@@ -31,6 +31,8 @@ case "$GPU_LINE" in
   *) echo "FAIL note missing $GPU_LINE"; exit 1 ;;
 esac
 if gpu_parse $'5, 38'; then echo "FAIL workload util accepted"; exit 1; fi
+if gpu_parse $'0, N/A'; then echo "FAIL nonnumeric gpu temp accepted"; exit 1; fi
+if gpu_parse $'0,'; then echo "FAIL blank gpu temp accepted"; exit 1; fi
 echo "gpu_policy_ok"
 echo 70000 > "$root/thermal_zone1/temp"
 if zones_ok "$root"; then echo "FAIL accepted hot zone"; exit 1; fi

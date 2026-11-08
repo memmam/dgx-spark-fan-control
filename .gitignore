@@ -15,3 +15,5 @@ __pycache__/
 *.key
 *.der
 .keygen.*/
+# Live launcher transcripts stay on the machine. Do not commit them.
+*-hostlog.txt

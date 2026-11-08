@@ -148,7 +148,11 @@ new observation does not add tach evidence.
 `fsl_reply` is that separate observation, and it has not been run. It
 kretprobes `acpi_ffh_address_space_arch_handler` and copies qwords 0 and
 `0x20` when the request id is `0xC400008D`. It does not replace the handler.
-`reply-ec3137.sh` loads it and checks `state armed` and `count 0` before
-one argument-120 write. `post_a0 == c400008e` would be the sentinel the
-read path already uses. It would still leave the fan-loop consumer unshown.
-No earlier log in this tree contains those qwords.
+`reply-ec3137.sh` loads it and checks `state armed` and that no captured
+qword at offset `0x20` has low byte `0x09` before one argument-120 write.
+That byte is the write opcode in [FAN-WRB.md](FAN-WRB.md). A tach read in
+the same capture uses low byte `0x0C`. Write records are stored apart from
+tach records. `CAPTURE_COMPLETE` means the four write records were kept,
+`nmissed` was 0, and nothing was dropped or truncated. `post_a0 == c400008e`
+would be the sentinel the read path already uses. It would still leave the
+fan-loop consumer unshown. No earlier log in this tree contains those qwords.
