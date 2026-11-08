@@ -2,8 +2,11 @@
 """Run a launcher where host /sys, /proc/modules, and module loading are unreachable.
 
 The process is root only inside a user namespace, so finit_module fails with
-EPERM. enter.sh stays pid 1 and waits for the launcher and for the hostlog
-tee. nssetup mounts the fixture and a private /tmp. When a kdir is planted,
+EPERM. tester/pid1 is pid 1. It runs the launcher and reaps every reparented
+child with wait(2), including the hostlog tee. A child that exits 127 is
+reaped and does not end the wait. nssetup mounts the fixture and a
+private /tmp. A checkout or run state under /tmp is bind-mounted back onto
+that path; the rest of host /tmp stays hidden. When a kdir is planted,
 /lib/modules is created on a tmpfs that covers that parent inside the
 namespace only. LD_PRELOAD covers /proc/fsl* because procfs will not let us
 create those names.
@@ -90,40 +93,26 @@ class Session:
         self.key = key
         self.cert = cert
         nssetup = str(tools / "nssetup")
+        pid1 = str(tools / "pid1")
+        repo = str(self.repo)
+        tool_dir = str(Path(tools))
         enter = self.state / "enter.sh"
         enter.write_text(
             "#!/bin/bash\n"
             "set -u\n"
             'STATE="$1"\n'
             "shift\n"
-            f'"{nssetup}" "$STATE" || exit 125\n'
+            f'"{nssetup}" "$STATE" "{repo}" "{tool_dir}" || exit 125\n'
             'export LD_PRELOAD="$STATE/preload.so"\n'
             'export PATH="$STATE/bin:$PATH"\n'
             'export DGX_TESTER_STATE="$STATE"\n'
             'export DGX_TESTER_SOCK="$STATE/sock"\n'
             'if [ "${DGX_TESTER_NO_CD:-}" != 1 ]; then\n'
-            '  cd "$STATE/work/research/fsl110"\n'
+            '  cd "$STATE/work/research/fsl110" || exit 125\n'
+            "else\n"
+            f'  cd "{repo}" || exit 125\n'
             "fi\n"
-            '"$@" &\n'
-            "child=$!\n"
-            "forward() {\n"
-            '  kill -s "$1" "$child" 2>/dev/null || true\n'
-            "}\n"
-            "trap 'forward TERM' TERM\n"
-            "trap 'forward INT' INT\n"
-            "trap 'forward HUP' HUP\n"
-            "set +e\n"
-            'wait "$child"\n'
-            "status=$?\n"
-            "trap - TERM INT HUP\n"
-            "while true; do\n"
-            "  wait -n\n"
-            "  rc=$?\n"
-            '  if [ "$rc" -eq 127 ]; then\n'
-            "    break\n"
-            "  fi\n"
-            "done\n"
-            'exit "$status"\n',
+            f'exec "{pid1}" "$@"\n',
             encoding="ascii",
         )
         enter.chmod(0o755)

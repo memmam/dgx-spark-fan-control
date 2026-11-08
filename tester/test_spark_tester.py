@@ -91,6 +91,10 @@ def compile_tools(dst: Path) -> None:
         ["gcc", "-static", "-O2", "-Wall", "-o", str(dst / "nssetup"),
          str(ROOT / "tester" / "nssetup.c")],
     )
+    subprocess.check_call(
+        ["gcc", "-static", "-O2", "-Wall", "-o", str(dst / "pid1"),
+         str(ROOT / "tester" / "pid1.c")],
+    )
     finit = dst / "finit.c"
     finit.write_text(textwrap.dedent("""\
         #define _GNU_SOURCE
@@ -358,7 +362,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(out.endswith(b"\n"), out[-80:])
 
     def assert_reply_gpu_stop(self, result, session):
-        self.assert_transcript(result, session, "reply-ec3137-hostlog.txt")
+        LauncherTests.assert_transcript(self, result, session, "reply-ec3137-hostlog.txt")
         self.assertNotEqual(result.returncode, 0, result.stdout[-400:])
         self.assertIn("STOP_GPU nvidia-smi_failed\n", result.stdout)
         self.assertEqual(session.machine.gpu_index, 1)
@@ -886,6 +890,138 @@ class ControllerAndIsolationTests(unittest.TestCase):
         self.assertEqual(host_modules_snapshot(), modules_before)
         leaked_after = leaked.read_bytes() if leaked.exists() else None
         self.assertEqual(leaked_after, leaked_before)
+
+    def test_reaped_child_exit_127_does_not_drop_the_others(self):
+        scenario = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "hold"}
+        session = Session(ROOT, TOOLS, scenario)
+        try:
+            result = session.run(
+                ["bash", "-c",
+                 "(/bin/sleep 0.3; exit 127) &\n"
+                 "(/bin/sleep 0.8; echo LATE) &\n"
+                 "exit 42\n"],
+                extra_env={"DGX_TESTER_NO_CD": "1"},
+            )
+            self.assertIn("LATE\n", result.stdout)
+            self.assertEqual(result.returncode, 42, result.stdout)
+            primary = session.run(
+                ["bash", "-c", "exit 127"],
+                extra_env={"DGX_TESTER_NO_CD": "1"},
+            )
+            self.assertEqual(primary.returncode, 127, primary.stdout)
+            timed = session.run(
+                ["/bin/sleep", "30"],
+                extra_env={"DGX_TESTER_NO_CD": "1"},
+                timeout=1,
+            )
+            self.assertEqual(timed.returncode, 124, timed.stdout)
+            proc = session.popen(
+                ["/bin/sleep", "30"],
+                extra_env={"DGX_TESTER_NO_CD": "1"},
+            )
+            try:
+                pid1 = _pid1(proc)
+                os.kill(pid1, signal.SIGTERM)
+                out, _err = proc.communicate(timeout=5)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 143, out)
+        finally:
+            session.close()
+
+    def test_checkout_under_tmp_keeps_state_and_hides_the_host_directory(self):
+        checkout = Path(tempfile.mkdtemp(prefix="dgx-checkout-", dir="/tmp"))
+        marker = Path("/tmp/dgx-host-tmp-marker")
+        modules_before = host_modules_snapshot()
+        mnt_before = tuple(sorted(path.name for path in Path("/mnt").iterdir()))
+        try:
+            shutil.copytree(
+                ROOT / "research", checkout / "research",
+                ignore=shutil.ignore_patterns("__pycache__", "*.ko", "*.o", "*hostlog*"),
+            )
+            (checkout / "scripts").mkdir()
+            shutil.copy(ROOT / "scripts" / "ec_profile.py", checkout / "scripts" / "ec_profile.py")
+            (checkout / "CHECKOUT_MARKER").write_text("checkout\n", encoding="ascii")
+            tools = checkout / ".tester-run" / "tools"
+            tools.mkdir(parents=True)
+            for name in ("preload.so", "fastshim", "nssetup", "pid1", "reply_harness", "finit"):
+                shutil.copy(TOOLS / name, tools / name, follow_symlinks=True)
+            marker.write_text("host-only\n", encoding="ascii")
+            scenario = {
+                "ec": "3.13.7", "baseline": (2066, 2156), "tach": "hold", "gpu_fail_at": 0,
+            }
+            session = Session(checkout, tools, scenario)
+            try:
+                seen = session.run(
+                    ["bash", "-c",
+                     'test -r "$DGX_TESTER_STATE/preload.so" && echo PRELOAD_OK\n'
+                     'test -d "$DGX_TESTER_STATE/work/research/fsl110" && echo WORK_OK\n'
+                     f'test -f "{checkout}/CHECKOUT_MARKER" && echo CHECKOUT_OK\n'
+                     'if [ -e /tmp/dgx-host-tmp-marker ]; then echo HOST_TMP_VISIBLE; '
+                     "else echo HOST_TMP_HIDDEN; fi\n"],
+                    extra_env={"DGX_TESTER_NO_CD": "1"},
+                )
+                self.assertEqual(seen.returncode, 0, seen.stdout)
+                self.assertIn("PRELOAD_OK\n", seen.stdout)
+                self.assertIn("WORK_OK\n", seen.stdout)
+                self.assertIn("CHECKOUT_OK\n", seen.stdout)
+                self.assertIn("HOST_TMP_HIDDEN\n", seen.stdout)
+                self.assertNotIn("HOST_TMP_VISIBLE", seen.stdout)
+                result = session.run(
+                    ["bash", "reply-ec3137.sh"],
+                    extra_env={"DGX_FSL_REPLY_EC3137": "yes"},
+                )
+                LauncherTests.assert_reply_gpu_stop(self, result, session)
+            finally:
+                session.close()
+        finally:
+            shutil.rmtree(checkout, ignore_errors=True)
+            if marker.exists():
+                marker.unlink()
+        self.assertEqual(host_modules_snapshot(), modules_before)
+        self.assertEqual(tuple(sorted(path.name for path in Path("/mnt").iterdir())), mnt_before)
+        self.assertFalse(marker.exists())
+
+    def test_preserving_all_of_tmp_is_refused(self):
+        modules_before = host_modules_snapshot()
+        marker = Path("/tmp/dgx-host-tmp-marker")
+        marker.write_text("host-only\n", encoding="ascii")
+        mnt_before = tuple(sorted(path.name for path in Path("/mnt").iterdir()))
+        try:
+            proc = subprocess.run(
+                ["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private",
+                 str(TOOLS / "nssetup"), "/tmp", "/tmp"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 125, proc.stderr)
+            self.assertIn("refusing to preserve all of /tmp", proc.stderr)
+            self.assertEqual(marker.read_text(encoding="ascii"), "host-only\n")
+        finally:
+            if marker.exists():
+                marker.unlink()
+        self.assertEqual(host_modules_snapshot(), modules_before)
+        self.assertEqual(tuple(sorted(path.name for path in Path("/mnt").iterdir())), mnt_before)
+
+
+def _pid1(proc: subprocess.Popen) -> int:
+    deadline = time.perf_counter() + 5
+    while time.perf_counter() < deadline:
+        text = Path(f"/proc/{proc.pid}/task/{proc.pid}/children").read_text()
+        kids = text.split()
+        if kids:
+            leader = int(kids[0])
+            child_text = Path(f"/proc/{leader}/task/{leader}/children").read_text()
+            for kid in child_text.split():
+                try:
+                    cmd = Path(f"/proc/{kid}/cmdline").read_bytes()
+                except OSError:
+                    continue
+                if b"sleep" in cmd:
+                    return leader
+        time.sleep(0.05)
+    raise AssertionError(f"unshare {proc.pid} did not reach sleep")
 
 
 if __name__ == "__main__":

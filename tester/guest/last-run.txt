@@ -1,9 +1,13 @@
 GUEST_PASS
 qemu_exit=0
 build_plus_boot=4s
-This rerun reused the existing 6.12.12 Image. Module rebuild, initrd,
-and boot were 4s. The earlier 78s figure included an incremental kernel
-rebuild and is not this run.
+boot_timeout=180s
+This run reused the existing 6.12.12 Image. Module rebuild, initrd, and
+boot were 4s. QEMU was allowed 180s and exited 0. It was not a cold first
+boot. A cold TCG boot can produce an empty serial log for longer than 60s
+(timeout exit 124) and the same Image, initrd, and modules can then boot
+in about 2s. The script does not start QEMU again after a timeout.
+serial.log is left in place.
 
 GUEST_RESULT probe_load=0 reply_load=0 status=interpreter_ok| reply=state armed|writes 0|reads 0|dropped_writes 0|dropped_reads 0|nmissed 0|truncated 0|
 GUEST_OK
@@ -11,6 +15,7 @@ GUEST_OK
 What this boot is:
 - QEMU TCG, machine virt, ACPI on, UEFI firmware, acpi=force
 - Linux 6.12.12 defconfig with kprobes, kretprobes, and CONFIG_ACPI_FFH
+- The kernel tarball is pinned to 6.12.12. Apt package versions are not.
 - synthetic SSDT installed by the kernel from the initrd
 - real fsl_probe.ko evaluated \_SB.FAN0._FSL and ACPICA returned interpreter_ok
 - real fsl_reply.ko registered its kretprobe (state armed, no samples)

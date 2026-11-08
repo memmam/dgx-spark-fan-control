@@ -3,7 +3,9 @@
  * /lib/modules is created on a private tmpfs that covers the parent of that
  * path. The host directory is not created and not written. /sys is two
  * tmpfs layers under the fixture, so one or two umounts still do not show
- * host sysfs. /tmp is a private tmpfs. /etc is a read-only bind.
+ * host sysfs. /tmp is a private tmpfs. A checkout or run state that lives
+ * under /tmp is bind-mounted back onto that same path from a tmpfs on
+ * /mnt; the rest of the host /tmp stays hidden. /etc is a read-only bind.
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -11,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -20,6 +23,12 @@
 static void die(const char *what)
 {
 	fprintf(stderr, "nssetup: %s: %s\n", what, strerror(errno));
+	_exit(125);
+}
+
+static void fail(const char *what)
+{
+	fprintf(stderr, "nssetup: %s\n", what);
 	_exit(125);
 }
 
@@ -184,9 +193,136 @@ static void setup_var(void)
 		die("/var/lib/dgx-fan-control");
 }
 
-static void setup_tmp(void)
+#define MAX_KEEP 8
+
+struct keep {
+	char source[PATH_MAX];
+	char target[PATH_MAX];
+};
+
+static int is_under(const char *path, const char *root)
 {
+	size_t n = strlen(root);
+
+	if (strncmp(path, root, n) != 0)
+		return 0;
+	return path[n] == '\0' || path[n] == '/';
+}
+
+static void mkdir_p(const char *path)
+{
+	char buf[PATH_MAX];
+	size_t len = strlen(path);
+	size_t i;
+
+	if (len == 0 || len >= sizeof(buf))
+		die("path");
+	memcpy(buf, path, len + 1);
+	for (i = 1; i < len; i++) {
+		if (buf[i] != '/')
+			continue;
+		buf[i] = 0;
+		if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+			die(buf);
+		buf[i] = '/';
+	}
+	if (mkdir(buf, 0755) != 0 && errno != EEXIST)
+		die(buf);
+}
+
+static void consider_keep(struct keep *keeps, int *nkeep, const char *path)
+{
+	char resolved[PATH_MAX];
+	const char *target;
+	int i;
+
+	if (path[0] != '/')
+		fail("keep path is not absolute");
+	if (realpath(path, resolved) == NULL)
+		die(path);
+	if (strcmp(path, "/tmp") == 0 || strcmp(resolved, "/tmp") == 0)
+		fail("refusing to preserve all of /tmp. Put the checkout in a subdirectory of /tmp.");
+	target = path;
+	if (strncmp(target, "/tmp/", 5) != 0) {
+		if (strncmp(resolved, "/tmp/", 5) != 0)
+			return;
+		target = resolved;
+	}
+	for (i = 0; i < *nkeep; i++) {
+		if (keeps[i].target[0] == 0)
+			continue;
+		if (is_under(target, keeps[i].target))
+			return;
+	}
+	for (i = 0; i < *nkeep; i++) {
+		if (keeps[i].target[0] == 0)
+			continue;
+		if (strcmp(keeps[i].target, target) != 0 &&
+		    is_under(keeps[i].target, target))
+			keeps[i].target[0] = 0;
+	}
+	for (i = 0; i < *nkeep; i++) {
+		if (keeps[i].target[0] != 0)
+			continue;
+		if (snprintf(keeps[i].source, sizeof(keeps[i].source), "%s", resolved) >=
+		    (int)sizeof(keeps[i].source))
+			die("path");
+		if (snprintf(keeps[i].target, sizeof(keeps[i].target), "%s", target) >=
+		    (int)sizeof(keeps[i].target))
+			die("path");
+		return;
+	}
+	if (*nkeep >= MAX_KEEP)
+		fail("too many directories under /tmp to preserve");
+	if (snprintf(keeps[*nkeep].source, sizeof(keeps[*nkeep].source), "%s", resolved) >=
+	    (int)sizeof(keeps[*nkeep].source))
+		die("path");
+	if (snprintf(keeps[*nkeep].target, sizeof(keeps[*nkeep].target), "%s", target) >=
+	    (int)sizeof(keeps[*nkeep].target))
+		die("path");
+	(*nkeep)++;
+}
+
+static void setup_private_tmp(struct keep *keeps, int nkeep)
+{
+	struct stat st;
+	char hold[PATH_MAX];
+	int i;
+	int slot = 0;
+
+	for (i = 0; i < nkeep; i++) {
+		if (keeps[i].target[0] != 0)
+			slot++;
+	}
+	if (slot == 0) {
+		xmount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777");
+		return;
+	}
+	slot = 0;
+	if (lstat("/mnt", &st) != 0 || !S_ISDIR(st.st_mode))
+		fail("/mnt is missing, so a checkout under /tmp cannot be preserved without writing the host");
+	xmount("tmpfs", "/mnt", "tmpfs", 0, "mode=755");
+	for (i = 0; i < nkeep; i++) {
+		if (keeps[i].target[0] == 0)
+			continue;
+		if (snprintf(hold, sizeof(hold), "/mnt/dgx-hold-%d", slot) >= (int)sizeof(hold))
+			die("path");
+		if (mkdir(hold, 0755) != 0)
+			die(hold);
+		xmount(keeps[i].source, hold, NULL, MS_BIND, NULL);
+		slot++;
+	}
 	xmount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777");
+	slot = 0;
+	for (i = 0; i < nkeep; i++) {
+		if (keeps[i].target[0] == 0)
+			continue;
+		if (snprintf(hold, sizeof(hold), "/mnt/dgx-hold-%d", slot) >= (int)sizeof(hold))
+			die("path");
+		mkdir_p(keeps[i].target);
+		xmount(hold, keeps[i].target, NULL, MS_BIND, NULL);
+		slot++;
+	}
 }
 
 static void setup_etc(void)
@@ -197,17 +333,24 @@ static void setup_etc(void)
 
 int main(int argc, char **argv)
 {
-	if (argc != 2) {
-		fprintf(stderr, "nssetup: usage: nssetup STATE\n");
+	struct keep keeps[MAX_KEEP];
+	int nkeep = 0;
+	int i;
+
+	memset(keeps, 0, sizeof(keeps));
+	if (argc < 3) {
+		fprintf(stderr, "nssetup: usage: nssetup STATE REPO [KEEP...]\n");
 		return 125;
 	}
+	for (i = 1; i < argc; i++)
+		consider_keep(keeps, &nkeep, argv[i]);
 	if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
 		die("private /");
 	setup_sys(argv[1]);
 	setup_proc(argv[1]);
 	setup_var();
-	setup_tmp();
 	setup_etc();
 	setup_modules(argv[1]);
+	setup_private_tmp(keeps, nkeep);
 	return 0;
 }

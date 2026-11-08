@@ -12,11 +12,25 @@
 #   QEMU_EFI.fd -append 'acpi=force'. Without the firmware, acpi=force
 #   produced no console. Without acpi=force the interpreter stayed off.
 # The SSDT only stores FLVL. It raises no FFH event, so reply writes stay 0.
+#
+# Apt package versions are not pinned. The kernel tarball is 6.12.12 unless
+# DGX_GUEST_KVER overrides it. DGX_GUEST_BOOT_TIMEOUT bounds the QEMU process
+# and defaults to 180 seconds. A cold TCG boot can sit with an empty serial
+# log for more than 60 seconds. A later start of the same Image, initrd, and
+# modules can finish in about 2 seconds. A timeout keeps serial.log and
+# exits non-zero. The script does not start QEMU a second time.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 work="${DGX_GUEST_WORK:-/tmp/dgx-guest}"
 kver="${DGX_GUEST_KVER:-6.12.12}"
+boot_timeout="${DGX_GUEST_BOOT_TIMEOUT:-180}"
 jobs="$(nproc)"
+case "$boot_timeout" in
+  ''|*[!0-9]*)
+    echo "GUEST_BOOT_TIMEOUT_INVALID ${boot_timeout}"
+    exit 1
+    ;;
+esac
 mkdir -p "$work"
 exec > >(tee "$work/guest.log") 2>&1
 echo "GUEST_BUILD_START $(date -Is)"
@@ -89,9 +103,9 @@ cp "$moddir/fsl_probe.ko" "$moddir/fsl_reply.ko" "$stage/"
 # build has no -acpitable flag for aarch64.
 cp "$ssdt" "$stage/kernel/firmware/acpi/ssdt.aml"
 (cd "$stage" && find . | cpio -o -H newc) > "$work/initrd"
-echo "GUEST_BOOT_START elapsed_build=$((SECONDS - seconds))s"
+echo "GUEST_BOOT_START elapsed_build=$((SECONDS - seconds))s boot_timeout=${boot_timeout}s"
 set +e
-timeout 60 qemu-system-aarch64 \
+timeout "$boot_timeout" qemu-system-aarch64 \
   -machine virt,acpi=on \
   -cpu cortex-a57 \
   -m 512 \
@@ -112,4 +126,7 @@ if grep -q GUEST_OK "$work/serial.log"; then
 fi
 echo "GUEST_BOOT_FAIL"
 grep -E 'GUEST_|Kernel panic|not syncing' "$work/serial.log" | tail -40 || true
+if [ "$qrc" -eq 124 ]; then
+  exit 124
+fi
 exit 1

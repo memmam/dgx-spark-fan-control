@@ -13,10 +13,14 @@ The launcher cases also run as `python3 -m unittest discover -s tester -v`.
 
 Each launcher starts in a user and mount namespace (`unshare --user
 --map-root-user --mount --propagation private --pid --fork`). `enter.sh`
-stays pid 1. It runs the launcher as a child, forwards TERM, INT, and HUP,
-and waits for that child and then for every reparented child. The hostlog
-`tee` is one of those children. The namespace is not torn down until `tee`
-has exited, so the last line is flushed to the hostlog and to stdout.
+sets up the mounts and then execs `tester/pid1`, which stays pid 1. It
+forks the launcher and reaps every child with `wait(2)` until none remain.
+TERM, INT, and HUP are forwarded to the launcher. Bash `wait` cannot reap
+a process the launcher reparents, including the hostlog `tee`: that process
+is not a bash job, and `wait -n` returns 127 whether the child exited 127
+or no child is left. `pid1` keeps reaping after a 127. The namespace stays
+up until `tee` has exited, so the last line is flushed. The status of the
+namespace is the launcher's, including a signal exit such as 143.
 
 `tester/nssetup` then:
 
@@ -25,8 +29,12 @@ has exited, so the last line is flushed to the hostlog and to stdout.
   do not unmount `/sys`.
 - Bind-mounts a fixture file on `/proc/modules`. `finit_module` returns
   `EPERM`. Nothing here writes a host kernel module.
-- Mounts a private tmpfs on `/tmp` and on `/var/lib`. The run state is not
-  under `/tmp`.
+- Mounts a private tmpfs on `/tmp` and on `/var/lib`. Host files in `/tmp`
+  are not visible and are not written. If the checkout, the tool directory,
+  or the run state is a subdirectory of `/tmp`, that directory is
+  bind-mounted back onto the same path from a private tmpfs on `/mnt`.
+  Preserving all of `/tmp` is refused. The refusal is
+  `refusing to preserve all of /tmp`.
 - Bind-mounts `/etc` read-only.
 - When a signing test plants a kdir, covers the parent of `/lib/modules`
   with a private tmpfs, binds the other children back, and creates
@@ -86,17 +94,25 @@ bash tester/guest/run-guest.sh
 ```
 
 This is not part of `./scripts/check`. On a machine that is missing them,
-the script installs:
+the script installs whatever versions the distro currently provides of:
 
 `qemu-system-arm`, `qemu-efi-aarch64`, `gcc-aarch64-linux-gnu`,
 `acpica-tools`, `flex`, `bison`, `bc`, `libssl-dev`, `libelf-dev`,
 `cpio`, `xz-utils`, `wget`, `ca-certificates`, and `make`.
 
-It downloads Linux 6.12.12 and boots an ARM64 `virt` machine with TCG,
-not nested KVM. The firmware file is
+Those package versions are not pinned. The kernel tarball is pinned to
+Linux 6.12.12 unless `DGX_GUEST_KVER` is set. The boot is an ARM64 `virt`
+machine with TCG, not nested KVM. The firmware file is
 `/usr/share/qemu-efi-aarch64/QEMU_EFI.fd`. The kernel command line uses
 `acpi=force`. Without that firmware, `acpi=force` produced no console.
 Without `acpi=force`, the interpreter stayed off.
+
+`DGX_GUEST_BOOT_TIMEOUT` bounds QEMU, default 180 seconds. A cold TCG
+boot can produce an empty serial log for longer than 60 seconds and then
+still come up. A later start of the same Image, initrd, and modules can
+finish in about 2 seconds. Hitting the budget is a failure: the serial
+log is left in place and the script exits non-zero. It does not start
+QEMU again.
 
 The SSDT in `tester/guest/ssdt.asl` is labeled synthetic. It only stores
 `FLVL`. It does not raise an FFH operation, so the reply log shows
