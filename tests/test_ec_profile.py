@@ -2,6 +2,8 @@
 import importlib.machinery
 import importlib.util
 import json
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -50,6 +52,34 @@ class Profile(unittest.TestCase):
             "pinned EC 3.13.7 capabilities\n"
         )
         self.assertEqual(EC.classify("", log, "3.5.8"), "STOP_EC_MISMATCH")
+
+    def test_esrt_decimal_counts_when_fwupd_is_hidden(self):
+        self.assertEqual(EC.u32_release("50332936"), "3.5.8")
+        self.assertEqual(EC.u32_release("50334983"), "3.13.7")
+        self.assertEqual(EC.classify("{}", "", "3.5.8", "50332936"), "OK")
+        self.assertEqual(
+            EC.explain("{}", "", "50332936", "3.5.8"),
+            "fwupd=absent pin=absent esrt=3.5.8 verdict=OK",
+        )
+
+    def test_esrt_disagreement_still_stops(self):
+        self.assertEqual(
+            EC.classify(devices("0x03000d07"), "", "3.5.8", "50332936"),
+            "STOP_EC_MISMATCH",
+        )
+
+    def test_esrt_directory_reads_only_the_ec_class(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            other = root / "entry0"
+            match = root / "entry1"
+            other.mkdir()
+            match.mkdir()
+            (other / "fw_class").write_text("b488217b-3895-4fc0-b1bf-ab7005a2d45a\n")
+            (other / "fw_version").write_text("1\n")
+            (match / "fw_class").write_text(GUID + "\n")
+            (match / "fw_version").write_text("50332936\n")
+            self.assertEqual(EC.esrt_versions(root), "50332936")
 
 
 if __name__ == "__main__":

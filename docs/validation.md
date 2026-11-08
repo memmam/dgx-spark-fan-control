@@ -230,6 +230,41 @@ continuation prepared in `e19bef7`, now `research/fsl110/ramp-ec358.sh`,
 still requires fifteen of its own 2700/4050 baseline samples before it
 loads a module. A reported idle pair does not skip that gate.
 
+## unit-a ramp build passed, run blocked, 8 Nov 2026 03:28:56 +00:00
+
+`date -Is` printed `2026-11-08T03:28:56+00:00`. The offset is the machine
+zone. That instant is 19:28:56 on 7 Nov in Pacific Standard Time. The
+launcher's old sentence said the clock was not labeled PST. The offset on
+`HOST_DATE` is the label.
+
+Kernel `7.0.0-1024-nvidia`, checkout `cursor/acpi-reply-ramp-e2ec`.
+`build-sign-ramp.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc 13 matched the
+kernel. The build warned about the compiler name and skipped BTF because
+`vmlinux` was absent. The same build compiled the other research modules.
+`fsl_reply_read` warned that its stack frame was 1520 bytes, above 1024.
+
+`DGX_FSL_RAMP_EC358=yes bash ramp-ec358.sh` then printed the date, the clock
+sentence, and the zone legend, and stopped with `STOP_EC_UNVERIFIED`. No
+module was loaded and no `_FSL` was issued.
+
+That stop is what the checker had to do. fwupd `get-devices` omits an
+Embedded Controller whose updates are blocked, and this unit's EC 3.5.8
+updates were blocked. The kernel pin is logged only after
+`dgx_ec_fan_control` probes, and this launcher stops while that controller
+is installed. Neither source could show a version. This is not a ramp pass.
+Arguments 160–237 stay **UNRUN**.
+
+The checker now also reads the EFI system resource table `fw_version` for
+the same EC class. A missing table stays unverified. A version that
+disagrees with fwupd or the kernel pin still stops. The reply reader's
+1024-byte buffer is no longer on the stack.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- this run: BLOCKED before write
+- arguments 160–237: UNRUN
+
 ## unit-b argument 120, two runs, 7 Nov 2026
 
 Same checkout and kernel. The first build attempt used the unit-a script
@@ -349,7 +384,8 @@ Statuses:
 (request 8973). It does not repeat 120–150. The next write requires a fresh
 baseline of 2700/4050 observed by `ramp-ec358.sh` on that run. The 18:31 PST
 report says that pair returned after reboot; the script does not trust the
-report in place of its own samples. A single fan whose settled
+report in place of its own samples. The 8 Nov attempt recorded above stopped
+before that baseline. A single fan whose settled
 median does not rise is logged as `PLATEAU_RECORDED` and the sweep
 continues. The sweep stops if both medians fail to rise, if either median
 falls, or on zero, a bad readout, a zone outside 25–60 °C, GPU utilization

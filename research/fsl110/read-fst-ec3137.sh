@@ -13,7 +13,7 @@ source ./ramp-temps-lib.sh
 source ./ec-profile.sh
 exec > >(tee -a fst-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
+echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
 echo "nvidia_gpu_temp is temperature.gpu, not an SoC reading"
 test "${DGX_FST_READ_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }

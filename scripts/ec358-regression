@@ -71,9 +71,11 @@ def confirm_ec(runner, expect: str = "3.5.8") -> None:
     fw_text = (fw.stdout or "") if fw.returncode == 0 else ""
     kern = runner(["dmesg"])
     kern_text = (kern.stdout or "") if kern.returncode == 0 else ""
-    verdict = _ec_profile().classify(fw_text, kern_text, expect)
+    profile = _ec_profile()
+    esrt_text = profile.esrt_versions()
+    verdict = profile.classify(fw_text, kern_text, expect, esrt_text)
     if verdict != "OK":
-        raise Stop(verdict)
+        raise Stop(profile.explain(fw_text, kern_text, esrt_text, expect))
 
 
 def parse_status(text: str) -> None:

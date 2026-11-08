@@ -10,6 +10,7 @@
  * the EC kept a fan setpoint.
  */
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/kprobes.h>
 #include <linux/module.h>
@@ -107,23 +108,31 @@ static struct kretprobe fsl_reply_kp = {
 static ssize_t fsl_reply_read(struct file *file, char __user *buf, size_t len,
 			      loff_t *off)
 {
-	char tmp[1024];
+	struct fsl_reply_slot *slots;
+	char *tmp;
 	int n = 0;
 	int i;
 	unsigned long flags;
 	int count, dropped;
-	struct fsl_reply_slot slots[FSL_REPLY_SLOTS];
+	ssize_t copied;
 
+	slots = kmalloc_array(FSL_REPLY_SLOTS, sizeof(*slots), GFP_KERNEL);
+	tmp = kmalloc(1024, GFP_KERNEL);
+	if (!slots || !tmp) {
+		kfree(slots);
+		kfree(tmp);
+		return -ENOMEM;
+	}
 	spin_lock_irqsave(&fsl_reply_lock, flags);
 	count = fsl_reply_count;
 	dropped = fsl_reply_dropped;
-	memcpy(slots, fsl_reply_slots, sizeof(slots));
+	memcpy(slots, fsl_reply_slots, sizeof(*slots) * FSL_REPLY_SLOTS);
 	spin_unlock_irqrestore(&fsl_reply_lock, flags);
 
-	n = scnprintf(tmp, sizeof(tmp), "state %s\ncount %d\ndropped %d\n",
+	n = scnprintf(tmp, 1024, "state %s\ncount %d\ndropped %d\n",
 		      fsl_reply_armed ? "armed" : "idle", count, dropped);
-	for (i = 0; i < count && n < (int)sizeof(tmp); i++) {
-		n += scnprintf(tmp + n, sizeof(tmp) - n,
+	for (i = 0; i < count && n < 1024; i++) {
+		n += scnprintf(tmp + n, 1024 - n,
 			       "%d pre_a0=%llx pre_a4=%llx post_a0=%llx post_a4=%llx handler=%ld post_ok=%u\n",
 			       i,
 			       (unsigned long long)slots[i].pre_a0,
@@ -132,7 +141,10 @@ static ssize_t fsl_reply_read(struct file *file, char __user *buf, size_t len,
 			       (unsigned long long)slots[i].post_a4,
 			       slots[i].handler, slots[i].post_ok ? 1 : 0);
 	}
-	return simple_read_from_buffer(buf, len, off, tmp, n);
+	copied = simple_read_from_buffer(buf, len, off, tmp, n);
+	kfree(slots);
+	kfree(tmp);
+	return copied;
 }
 
 static ssize_t fsl_reply_write(struct file *file, const char __user *buf,

@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,10 @@ _loader = importlib.machinery.SourceFileLoader(
 _spec = importlib.util.spec_from_loader("ec358_regression", _loader)
 REG = importlib.util.module_from_spec(_spec)
 _loader.exec_module(REG)
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+import ec_profile as _ec_mod
+_ec_mod.esrt_versions = lambda root=None: ""
 
 GUID = "3d13c989-e6a8-4ead-95ee-921f09868f65"
 

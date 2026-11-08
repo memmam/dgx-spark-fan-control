@@ -61,3 +61,9 @@ for label in THERMAL_ROOT NVIDIA_SMI_STUB RAMP_SOURCE_ONLY; do
   echo "override_rejected_before_hardware $label"
 done
 echo "reply_offline_ok"
+bash -n ec-profile-status.sh
+if grep -q insmod ec-profile-status.sh; then
+  echo "FAIL status script loads a module"
+  exit 1
+fi
+echo "ec_status_offline_ok"

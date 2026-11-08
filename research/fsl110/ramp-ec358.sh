@@ -20,7 +20,7 @@ source ./ramp-temps-lib.sh
 source ./ec-profile.sh
 exec > >(tee -a ramp-ec358-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
+echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
 echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
 test "${DGX_FSL_RAMP_EC358:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
