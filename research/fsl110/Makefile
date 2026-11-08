@@ -4,6 +4,7 @@ obj-m += fsl110.o
 obj-m += fsl_ramp.o
 obj-m += fsl_probe.o
 obj-m += fst_status.o
+obj-m += fsl_reply.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

@@ -47,7 +47,7 @@ ACPI SMC. They are not in the saved captures.
 | Item | Status |
 | --- | --- |
 | Another `_FSL` level, including 110 and 120 | Not prepared. Same-boot `_FST` control is fixed by AML. See below. |
-| kprobe or handler replacement to grab the SMC reply | Not used. Replacing `acpi_ffh_address_space_arch_handler` would affect every fixed-hardware region. |
+| `fsl_reply` kretprobe | Prepared, **UNRUN**. Observes the existing handler's buffer for SMC `0xC400008D`. Does not replace the handler and does not issue a write. |
 | `fst_status` | PASS as a read, 7 Nov 2026 15:11:56 PST. Package was `0 0 2068` and `0 0 2156`. Cached control is 0. Speeds match `fan1_input`. Not a write acknowledgement, not a clear floor, not a reboot confirmation. Not repeated from this record. |
 
 ## What unit-b's fwupd report adds
@@ -109,8 +109,8 @@ check. The write is opcode `0x09` on `0x06000790` through `0x06000793`.
 `WRB` does not make that comparison, and the research caller drops the
 buffer. The read result does not transfer to the write.
 
-Two later observations would move it. Neither is requested from this
-listing, and neither is a new fan level.
+Two later observations would move it. Neither is a new fan level. The
+first is prepared below and has not been run.
 
 1. The result registers of one existing `WRB` call, and whether `XX0` is
    `0xC400008E`. That is the sentinel the read path already returned. It is
@@ -124,8 +124,11 @@ listing, and neither is a new fan level.
    above. Until one of those images is available, static inspection cannot
    show a consumer of `0x06000790`.
 
-The unit-a continuation stays blocked on the 2610/3915 baseline. No new
-module follows from this inventory.
+Argument 160 on unit-a was issued at 2026-11-08T03:35:42+00:00. Nine tach
+samples were recorded and the dwell did not finish, so there is no settled
+median. Arguments 170–237 were not issued. The reboot printed by that run
+is unconfirmed. A later median comparison has to issue 160 again after a
+new 2700/4050 baseline. That repeat is not authorized by this note.
 
 ## Same-boot `_FST` control, not prepared
 
@@ -139,13 +142,20 @@ every SMC is ignored. `_FSL(110)` leaves 110. The 15:11 package control 0 is
 the `Name (FLVL, Zero)` initializer. A later 0 is what a rebuilt namespace
 shows. The store itself does not need another setpoint to establish that.
 
-No launcher was added for that comparison. Arguments 110 and 120 are not
-repeated from this record.
+No launcher was added for that comparison. Repeating 110 or 120 without a
+new observation does not add tach evidence.
 
-Keeping the `WRB` reply would be a separate observation. A kretprobe on
-`acpi_ffh_address_space_arch_handler` can read the buffer after the existing
-handler returns and keep `XX0` when the request id is `0xC400008D`. That
-does not replace the handler and does not issue a write. It is not
-implemented here. `XX0 == 0xC400008E` would mean the monitor returned the
-same sentinel the read path already uses. It would still leave the fan-loop
-consumer unshown.
+`fsl_reply` is that separate observation, and it has not been run. It
+kretprobes `acpi_ffh_address_space_arch_handler` and copies qwords 0 and
+`0x20` when the request id is `0xC400008D`. It does not replace the handler.
+`reply-ec3137.sh` loads it and checks `state armed` and that no captured
+qword at offset `0x20` has low byte `0x09` before one argument-120 write.
+That byte is the write opcode in [FAN-WRB.md](FAN-WRB.md). A tach read in
+the same capture uses low byte `0x0C`. Write records are stored apart from
+tach records. `CAPTURE_COMPLETE` means four `W` lines were copied with `post_ok=1` and
+opcode `0x09`, `nmissed` was 0, and nothing was dropped or truncated.
+`post_ok=0` is a failed copy and is inconclusive. `REPLY_DONE` is not
+printed for an inconclusive capture. The reboot after a write still
+happens. `post_a0 == c400008e`
+would be the sentinel the read path already uses. It would still leave the
+fan-loop consumer unshown. No earlier log in this tree contains those qwords.

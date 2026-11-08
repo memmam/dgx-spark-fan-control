@@ -63,15 +63,20 @@ resolve_signing_material() {
   SIGN_CERT=$cert
 }
 
-sign_named_module() {
-  local ko="$1" kdir hash
-  kdir="/lib/modules/$(uname -r)/build"
+# One make, then sign every research module. Signing only one .ko after make
+# leaves the others unsigned, because make relinks them.
+sign_research_modules() {
+  local kdir hash ko
+  kdir="${1:-/lib/modules/$(uname -r)/build}"
   [ -d "$kdir" ] || { echo "STOP_NO_HEADERS"; exit 1; }
   hash=$(sed -n 's/^CONFIG_MODULE_SIG_HASH="\(.*\)"$/\1/p' "$kdir/.config")
   [ -n "$hash" ] || { echo STOP_NO_SIG_HASH; exit 1; }
   make -C "$kdir" M="$PWD" modules
-  "$kdir/scripts/sign-file" "$hash" "$SIGN_KEY" "$SIGN_CERT" "$PWD/$ko"
-  echo "SIGNED hash=$hash"
-  modinfo -F signer "$PWD/$ko" || true
+  for ko in fsl110.ko fsl_ramp.ko fsl_probe.ko fst_status.ko fsl_reply.ko; do
+    [ -f "$PWD/$ko" ] || { echo "STOP_NO_MODULE $ko"; exit 1; }
+    "$kdir/scripts/sign-file" "$hash" "$SIGN_KEY" "$SIGN_CERT" "$PWD/$ko"
+    echo "SIGNED $ko hash=$hash"
+    modinfo -F signer "$PWD/$ko" || true
+  done
   echo BUILD_SIGNED_NOT_LOADED
 }

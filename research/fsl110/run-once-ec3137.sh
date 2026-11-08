@@ -10,6 +10,8 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 test "${DGX_FSL_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
 require_ec 3.13.7
@@ -49,7 +51,7 @@ for h in /sys/class/hwmon/hwmon*; do
 done
 test "${#fans[@]}" -eq 2 || { echo "STOP_FAN_COUNT ${#fans[@]}"; exit 1; }
 refuse_loaded_research
-test -f ./fsl110.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fsl110.ko fsl110.c
 insmod ./fsl110.ko
 echo "loaded; unload will not restore fans"
 set +e

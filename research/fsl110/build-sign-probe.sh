@@ -1,8 +1,9 @@
 #!/bin/bash
-# Build and sign fsl_probe.ko. Does not insmod. Does not print key paths.
+# Build every research module and sign each one. Does not insmod.
+# Does not print key paths.
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=signing.sh
 source ./signing.sh
 resolve_signing_material
-sign_named_module fsl_probe.ko
+sign_research_modules

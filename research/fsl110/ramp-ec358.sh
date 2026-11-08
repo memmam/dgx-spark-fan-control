@@ -4,6 +4,10 @@
 # Does not insmod until the baseline is clean. Does not wrap the ACPI write
 # in a timeout.
 # Killing the shell does not cancel an SMC already entered in the kernel.
+# test-log-flush.sh shows bash 5.2 echo through this tee is already in the
+# file before a later sleep. If the proc write does not return, reboot.
+# Do not kill the shell and do not load the module again on that boot.
+# A completed dwell is followed by the next argument through 237.
 # Cleanup only unloads a module this script loaded. It does not write a
 # fan release. Reboot after any step.
 set -u
@@ -18,9 +22,11 @@ cd "$(dirname "$0")"
 source ./ramp-temps-lib.sh
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 exec > >(tee -a ramp-ec358-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
+echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
 echo "zone types are logged as read; nvidia_gpu_temp is temperature.gpu, not an SoC reading"
 test "${DGX_FSL_RAMP_EC358:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
@@ -94,9 +100,16 @@ sample_ok() {
   samples_b=()
   i=1
   while [ "$i" -le 15 ]; do
-    zones_ok /sys/class/thermal || return 1
-    gpu_idle || return 1
+    if ! zones_ok /sys/class/thermal; then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
+      return 1
+    fi
+    if ! gpu_idle; then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
+      return 1
+    fi
     if ! pair=$(read_pair); then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
       return 1
     fi
     zone_snap[$i]=$(date -Is)$ZONE_LINE" hottest=$HOTTEST$GPU_LINE"
@@ -125,7 +138,7 @@ done
 pre_a=$(med5 "${samples_a[@]:10:5}")
 pre_b=$(med5 "${samples_b[@]:10:5}")
 echo "baseline_median_last5 $pre_a $pre_b"
-test -f ./fsl_ramp.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fsl_ramp.ko fsl_ramp.c
 insmod ./fsl_ramp.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
 echo "loaded; unload will not restore fans"

@@ -11,9 +11,11 @@ cd "$(dirname "$0")"
 source ./ramp-temps-lib.sh
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 exec > >(tee -a fst-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
+echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
 echo "nvidia_gpu_temp is temperature.gpu, not an SoC reading"
 test "${DGX_FST_READ_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
@@ -55,7 +57,7 @@ b=$(cat "${paths[1]}") || { echo "STOP_READ unreadable ${paths[1]}"; exit 1; }
 echo "fans ${paths[0]}=$a ${paths[1]}=$b"
 [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || { echo "STOP_READ nonnumeric $a $b"; exit 1; }
 test "$a" -gt 0 && test "$b" -gt 0 || { echo "STOP_READ zero $a $b"; exit 1; }
-test -f ./fst_status.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fst_status.ko fst_status.c
 insmod ./fst_status.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
 printf '%s\n' read > /proc/fst_status || { echo STOP_WRITE; exit 1; }

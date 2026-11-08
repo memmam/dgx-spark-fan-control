@@ -10,9 +10,13 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=ramp-temps-lib.sh
+source ./ramp-temps-lib.sh
+# shellcheck source=module-fresh.sh
+source ./module-fresh.sh
 exec > >(tee -a probe-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
-echo "host local clock, not labeled PST"
+echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
 test "${DGX_FSL_PROBE_EC3137:-}" = yes || { echo STOP_NO_OPTIN; exit 1; }
 test "$(id -u)" -eq 0 || { echo STOP_NOT_ROOT; exit 1; }
 require_ec 3.13.7
@@ -54,22 +58,13 @@ zones_ok() {
   done
 }
 gpu_idle() {
-  local utils util
-  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null); then
+  local utils
+  if ! utils=$(nvidia-smi --query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits 2>/dev/null); then
     echo "STOP_GPU nvidia-smi_failed"
     return 1
   fi
-  if [ -z "$utils" ]; then
-    echo "STOP_GPU empty"
-    return 1
-  fi
-  while IFS= read -r util; do
-    util=${util// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util raw=$utils"
-      return 1
-    fi
-  done <<< "$utils"
+  gpu_parse "$utils" || return 1
+  echo "gpu$GPU_LINE"
 }
 mapfile -t paths < <(
   for h in /sys/class/hwmon/hwmon*; do
@@ -104,6 +99,9 @@ check_pair() {
       echo "STOP_NOT_IDLE $when ${paths[0]}=$a ${paths[1]}=$b" >&2
       return 1
     fi
+    if [ "$a" -gt 2500 ] || [ "$b" -gt 2500 ]; then
+      echo "IDLE_ABOVE_USUAL $when ${paths[0]}=$a ${paths[1]}=$b" >&2
+    fi
   elif [ "$a" -gt 16000 ] || [ "$b" -gt 16000 ]; then
     echo "STOP_READ above_16000 $when ${paths[0]}=$a ${paths[1]}=$b" >&2
     return 1
@@ -120,7 +118,7 @@ while [ "$i" -le 15 ]; do
   test "$i" = 15 || sleep 2
   i=$((i + 1))
 done
-test -f ./fsl_probe.ko || { echo STOP_NO_MODULE; exit 1; }
+require_built_module ./fsl_probe.ko fsl_probe.c
 insmod ./fsl_probe.ko || { echo STOP_INSMOD; exit 1; }
 loaded_by_us=1
 echo "loaded; unload will not restore fans"

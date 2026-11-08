@@ -29,13 +29,27 @@ with no pin stops the launcher. The scripts do not change fwupd's block and
 do not infer a profile from the machine name.
 
 `fsl_ramp` accepts only `step`, from argument 160 through 237 (request
-8973). Levels 120–150 are not in this binary. `fsl_probe` accepts one `run`
-and only argument 120. A failed ramp step latches and refuses the rest.
-`fst_status` only reads `_FST`.
+8973). A finished dwell is followed by the next argument in that list.
+Levels 120–150 are not in this binary. `fsl_probe` accepts one `run` and
+only argument 120. A failed ramp step latches and refuses the rest.
+`fst_status` only reads `_FST`. `fsl_reply` registers a kretprobe on
+`acpi_ffh_address_space_arch_handler` and copies two qwords from that
+handler's existing buffer when the request id is `0xC400008D`. A low byte
+of `0x09` at offset `0x20` is kept in the write list. Other matches are
+kept in the read list and cannot evict a write. It does not evaluate ACPI.
+`reply-ec3137.sh` loads that observer, requires `state armed` and no write
+record yet, and only then runs the argument-120 probe once. `CAPTURE_COMPLETE`
+means four `W` lines were copied (`post_ok=1`), each with opcode `0x09`, and
+nothing was dropped, missed, or truncated. `REPLY_DONE` follows only that
+line. An inconclusive capture does not print `REPLY_DONE`. Neither result
+means the EC stored the bytes. A write still reboots.
 
-Signing uses `DGX_MOK_KEY` and `DGX_MOK_CERT` when both are set, otherwise
-the single DKMS mok path. The scripts do not print those paths, create a
-key, or enroll one.
+Every `build-sign-*.sh` runs one `make` and then signs `fsl110.ko`,
+`fsl_ramp.ko`, `fsl_probe.ko`, `fst_status.ko`, and `fsl_reply.ko`. Signing
+uses `DGX_MOK_KEY` and `DGX_MOK_CERT` when both are set, otherwise the
+single DKMS mok path. The scripts do not print those paths, create a key,
+or enroll one. Launchers refuse a module older than its source, built for
+another kernel, or with an empty signer.
 
 ## Cleanup
 

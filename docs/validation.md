@@ -202,10 +202,9 @@ with the EC curve publishing, and it is not proof the floor register is
 clear, that the machine was damaged, or that 29 percent is the normal idle
 step.
 
-The 14:48 PST reboot was stated. No unit-a 2700/4050 pair was reported
-after it. This row does not mark that restore PASS. Arguments 160–237 stay
-**UNRUN**. Do not loosen the baseline check and do not retry from this
-sample alone.
+The 14:48 PST reboot was stated. This row does not mark that restore PASS.
+Arguments 160–237 stay **UNRUN**. Do not loosen the baseline check and do
+not retry from the 2610/3915 sample alone.
 
 A fanwatch log from unit-a then shows fourteen 1-second samples
 from 22:58:02 through 22:58:15 UTC, which is 14:58:02 through 14:58:15 PST.
@@ -220,7 +219,105 @@ Statuses:
 - this attempt: BLOCKED before write
 - BUILD/SIGN for the continuation binary: not a new result
 - arguments 160–237: UNRUN
-- reboot restore after the 150 sweep: still PENDING
+- reboot restore after the 150 sweep: still PENDING in this capture
+
+## unit-a idle pair after the 2610 hold, reported 7 Nov 2026 about 18:31 PST
+
+Reported, not sampled by `ramp-ec358.sh`: the 2610/3915 pair persisted until
+a reboot, and after that reboot the idle pair was 2700/4050. The 14:55
+attempt remains a blocked run. Arguments 160–237 remain **UNRUN**. The
+continuation prepared in `e19bef7`, now `research/fsl110/ramp-ec358.sh`,
+still requires fifteen of its own 2700/4050 baseline samples before it
+loads a module. A reported idle pair does not skip that gate.
+
+## unit-a ramp build passed, run blocked, 8 Nov 2026 03:28:56 +00:00
+
+`date -Is` printed `2026-11-08T03:28:56+00:00`. The offset is the machine
+zone. That instant is 19:28:56 on 7 Nov in Pacific Standard Time. The
+launcher's old sentence said the clock was not labeled PST. The offset on
+`HOST_DATE` is the label.
+
+Kernel `7.0.0-1024-nvidia`, checkout `cursor/acpi-reply-ramp-e2ec`.
+`build-sign-ramp.sh` printed `BUILD_SIGNED_NOT_LOADED`. gcc 13 matched the
+kernel. The build warned about the compiler name and skipped BTF because
+`vmlinux` was absent. The same build compiled the other research modules.
+`fsl_reply_read` warned that its stack frame was 1520 bytes, above 1024.
+
+`DGX_FSL_RAMP_EC358=yes bash ramp-ec358.sh` then printed the date, the clock
+sentence, and the zone legend, and stopped with `STOP_EC_UNVERIFIED`. No
+module was loaded and no `_FSL` was issued.
+
+That stop is what the checker had to do. fwupd `get-devices` omits an
+Embedded Controller whose updates are blocked, and this unit's EC 3.5.8
+updates were blocked. The kernel pin is logged only after
+`dgx_ec_fan_control` probes, and this launcher stops while that controller
+is installed. Neither source could show a version. This is not a ramp pass.
+Arguments 160–237 stay **UNRUN**.
+
+The checker now also reads the EFI system resource table `fw_version` for
+the same EC class. A missing table stays unverified. A version that
+disagrees with fwupd or the kernel pin still stops. The reply reader's
+1024-byte buffer is no longer on the stack.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- this run: BLOCKED before write
+- arguments 160–237: UNRUN
+
+## unit-a argument 160, partial dwell, 8 Nov 2026 03:35:42 +00:00
+
+`date -Is` printed `2026-11-08T03:35:42+00:00`. That instant is 19:35:42 on
+7 Nov in Pacific Standard Time. Kernel `7.0.0-1024-nvidia`. The profile
+line was `fwupd=absent pin=absent esrt=3.5.8 verdict=OK`. The earlier
+`fsl_reply_read` frame-size warning was absent from this build.
+`BUILD_SIGNED_NOT_LOADED` had already passed.
+
+Fifteen baseline samples were 2700/4050. Hottest zone 41.7 °C. GPU
+temperature 39 °C. The module loaded and the status was `ok 160`. Argument
+160 requests 6375. The reported tach after the call:
+
+| Sample | Reported pair |
+| ---: | --- |
+| 1 | 2700/4050 |
+| 2 | 4500/6345 |
+| 3–9 | 6300/6345 |
+
+The hottest zone moved from 41.7 °C to 40.8 °C. GPU temperature moved from
+39 °C to 38 °C. Sample 10 was not a fan pair. The script stopped with
+`STOP_GPU util=1 nvidia_gpu_temp=38C raw=1, 38`, unloaded, and printed
+`REBOOT_NOW`. The operator was told to reboot immediately.
+
+Nine samples are not the dwell. The plateau rule uses the median of samples
+11–15. Those samples were not taken, so argument 160 has no settled median
+and is not a dwell pass. The reported pairs are not a measured shaft speed.
+Arguments 170–237 were not issued. The operator reported that after the
+reboot the idle pair was 2700/4050, at about 19:42 PST on 7 Nov. That is a
+firsthand report, not a timestamp from the host log and not a sample from
+the launcher. It does not finish the dwell.
+
+The exact-zero GPU check that stopped this run is a policy rule. One percent
+on `utilization.gpu` is one percent of the driver's sample window. Zone and
+GPU temperatures were falling, so this sample is not evidence of a heating
+workload. It is also not evidence that every non-zero reading is harmless.
+A later code change records 1–4 and stops at 5 or more. Five is a policy
+cutoff, not a measured fan-demand limit. This run remains a stop under the
+rule that was loaded.
+
+A later sweep that still compares settled medians has to issue 160 again
+after a confirmed idle baseline of 2700/4050. Skipping to 170 would compare
+the next dwell with the baseline, not with a 160 median this run never
+finished. That repeat is not authorized in this record.
+
+Statuses:
+
+- BUILD/SIGN: PASS
+- profile line: PASS as `esrt=3.5.8` with the other two sources absent
+- argument 160 evaluation: PASS
+- argument 160 dwell: INCOMPLETE, 9 samples, no median
+- physical RPM: UNVERIFIED
+- arguments 170–237: UNRUN
+- reboot after this write: reported, idle pair 2700/4050 about 19:42 PST on 7 Nov. Not a script sample. The dwell stays incomplete.
 
 ## unit-b argument 120, two runs, 7 Nov 2026
 
@@ -326,7 +423,8 @@ read the SMC reply. Both fans' `_FST` methods publish that same name. After
 that namespace. Argument 120 leaves 120. Argument 110 leaves 110. The 15:11
 control value 0 is the initializer `Name (FLVL, Zero)`. A reboot rebuilds
 that name. This comparison restates the method. It does not show whether
-the EC kept the setpoint. The unit-a sweep stays blocked.
+the EC kept the setpoint. The unit-a continuation remains UNRUN until
+`ramp-ec358.sh` sees 2700/4050 itself.
 
 Statuses:
 
@@ -334,18 +432,74 @@ Statuses:
 - arguments 110 and 120: no new run
 - EC acceptance: still unshown
 
-## unit-a continuation from 160, not yet run
+## unit-a continuation procedure after the partial 160
 
-**UNRUN.** The module list now starts at 160 and still ends at 237
-(request 8973). It does not repeat 120–150. The next write requires a fresh
-baseline of 2700/4050. That pair has not been reported since the 14:48 PST
-reboot, so the script must observe it itself. A single fan whose settled
-median does not rise is logged as `PLATEAU_RECORDED` and the sweep
-continues. The sweep stops if both medians fail to rise, if either median
-falls, or on zero, a bad readout, a zone outside 25–60 °C, GPU utilization
-above 0, or a reading above 9500. Settled samples in the 120–150 dwells did
-not jitter, so equality is a plateau and a lower median is a decrease.
-No deadband is added. No release write. Reboot after any step.
+The module list still starts at 160 and ends at 237 (request 8973). A
+finished 15-sample dwell is followed by the next argument in that list.
+The run does not stop after 160. It does not repeat 120–150. Argument 160
+was issued at 03:35:42 +00:00 and its dwell did not finish, so that step
+has no median and the list has not been retired. The next run, when one is
+authorized, starts at 160 again and continues through 237 if each dwell
+finishes. It requires a fresh 2700/4050 baseline observed by the launcher
+on that run. The report of about 19:42 PST on 7 Nov, idle pair 2700/4050
+after the reboot, does not replace that baseline. A single fan whose settled
+median does not rise
+is logged as `PLATEAU_RECORDED` and the sweep continues. The sweep stops if
+both medians fail to rise, if either median falls, or on zero, a bad
+readout, a zone outside 25–60 °C, GPU utilization of 5 or more, or a reading
+above 9500. Utilization of 1–4 is logged and does not stop. Settled samples
+in the 120–150 dwells did not jitter, so equality is a plateau and a lower
+median is a decrease. No deadband is added. No release write. Reboot after
+any step. The reboot recovery is already reported and is not an open
+question. `ramp-ec358-preflight.sh` only reads. It does not load a module.
+
+## unit-b write-reply capture, not yet run
+
+**UNRUN.** `research/fsl110/fsl_reply.c` registers a kretprobe on
+`acpi_ffh_address_space_arch_handler`. It does not replace that function
+and it does not evaluate ACPI. For a buffer whose first qword is
+`0xC400008D`, it keeps that qword and the qword at offset `0x20` from
+before the call, and the same two qwords after the call returns. On
+mainline arm64 those qwords are SMCCC `a0` and `a4` for the 64-bit FFH
+region. This repository does not contain the running kernel's `ffh.c`, so
+the printed numbers are the evidence. No saved capture contains them.
+
+`reply-ec3137.sh` samples fans first, then loads the observer, and refuses
+the write unless the proc file says `state armed` and no captured `pre_a4`
+has low byte `0x09`. A tach read uses low byte `0x0C` and does not by itself
+block the write. It then issues one `_FSL` argument 120 and prints the proc
+file before it reads the fans again. `CAPTURE_COMPLETE` requires four `W`
+lines, each with `post_ok=1` and a `pre_a4` low byte of `0x09`, and zeros for
+`dropped_writes`, `dropped_reads`, `nmissed`, and `truncated`. A failed copy
+stores the write with `post_ok=0` and is `INCONCLUSIVE`, not a complete
+capture. `dropped_writes` or `nmissed` means calls were discarded, which is
+not the same as the observer never seeing them. Fewer than four `W` lines
+with those counters at zero means the capture does not show four kept
+writes. `post_a0` of `c400008e` is the sentinel the read path already
+requires before it publishes a speed. That sentinel would still not prove
+the fan loop stored the bytes. `REPLY_DONE` is printed only after
+`CAPTURE_COMPLETE`. An inconclusive capture still reboots if the write was
+issued, and it does not print `REPLY_DONE`. Confidentiality lockdown stops
+the script before either module is loaded. A failed `insmod` of the
+observer does not load the probe.
+
+The module compiled on kernel `7.0.0-1024-nvidia` when the ramp was built,
+including the kprobe helpers in that kernel's headers. Compilation does not
+show that the handler's first argument is the FFH buffer, or that offsets 0
+and `0x20` are SMCCC `a0` and `a4`, on that kernel. Those offsets are the
+mainline arm64 FFH offset-1 layout. This tree does not contain that
+kernel's `ffh.c`. `reply-ec3137-preflight.sh` only reads the profile, the
+lockdown mode, and whether `/proc/kallsyms` lists the handler. A present
+symbol does not verify the layout and does not authorize the write. The
+return probe copies the buffer before the caller continues; if this kernel's
+handler does not leave the result there, `post_ok=0` or a nonsense qword is
+the result, not an acceptance.
+
+Statuses:
+
+- this capture: UNRUN
+- argument 120 with a reply buffer: not a new result
+- EC acceptance: still unshown
 
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
@@ -468,7 +622,7 @@ reproduced as a controlled test here.
 
 ## Version 0.1.4 zero-clamp restore
 
-On **2026-10-29** the signed module was built on **dgx4** with DKMS against
+On **2026-10-29** the signed module was built with DKMS against
 the running kernel **`7.0.0-1019-nvidia-64k`**. EC firmware was **3.5.8**
 (`0x03000508`) and SoC firmware **2.155.11** (`0x02009b0b`). A vLLM worker was
 serving. Hottest zone about **68°C**, fans **9000 / 11205 RPM** at state 10

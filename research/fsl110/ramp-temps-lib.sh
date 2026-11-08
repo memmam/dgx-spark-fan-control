@@ -42,6 +42,30 @@ zones_ok() {
   frac=$(printf '%03d' $((hottest_t % 1000)))
   HOTTEST="${hottest_name}=${hottest_t}mC ($((hottest_t / 1000)).${frac}C)"
 }
+# utilization.gpu is an integer percent over the driver's sample window.
+# 5 or more stops the procedure. 1 through 4 is recorded and does not stop.
+# That split is policy. It is not a measured point where fan demand changes.
+# On 8 Nov 2026 a dwell stopped at 1 while zone and GPU temperatures fell.
+GPU_UTIL_STOP=5
+
+gpu_util_policy() {
+  local util="$1" extra="${2:-}"
+  GPU_NOTE=""
+  if ! [[ "$util" =~ ^[0-9]+$ ]]; then
+    echo "STOP_GPU nonnumeric util=$util ${extra}"
+    return 1
+  fi
+  if [ "$util" -ge "$GPU_UTIL_STOP" ]; then
+    echo "STOP_GPU util=$util ${extra}"
+    return 1
+  fi
+  if [ "$util" -gt 0 ]; then
+    GPU_NOTE="nvidia_gpu_util=${util} noted"
+    echo "GPU_NOTED util=$util ${extra}"
+  fi
+  return 0
+}
+
 gpu_parse() {
   local utils="$1" util gtemp
   GPU_LINE=""
@@ -52,10 +76,16 @@ gpu_parse() {
   while IFS=',' read -r util gtemp; do
     util=${util// /}
     gtemp=${gtemp// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util nvidia_gpu_temp=${gtemp}C raw=$utils"
+    if ! [[ "$gtemp" =~ ^-?[0-9]+$ ]]; then
+      echo "STOP_GPU temp=$gtemp util=$util raw=$utils"
+      return 1
+    fi
+    if ! gpu_util_policy "$util" "nvidia_gpu_temp=${gtemp}C raw=$utils"; then
       return 1
     fi
     GPU_LINE="$GPU_LINE nvidia_gpu_temp=${gtemp}C"
+    if [ -n "$GPU_NOTE" ]; then
+      GPU_LINE="$GPU_LINE $GPU_NOTE"
+    fi
   done <<< "$utils"
 }
