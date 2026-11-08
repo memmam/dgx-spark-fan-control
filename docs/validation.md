@@ -286,13 +286,15 @@ temperature 39 °C. The module loaded and the status was `ok 160`. Argument
 The hottest zone moved from 41.7 °C to 40.8 °C. GPU temperature moved from
 39 °C to 38 °C. Sample 10 was not a fan pair. The script stopped with
 `STOP_GPU util=1 nvidia_gpu_temp=38C raw=1, 38`, unloaded, and printed
-`REBOOT_NOW`. The operator was told to reboot immediately. This record does
-not contain the result of that reboot.
+`REBOOT_NOW`. The operator was told to reboot immediately.
 
 Nine samples are not the dwell. The plateau rule uses the median of samples
 11–15. Those samples were not taken, so argument 160 has no settled median
 and is not a dwell pass. The reported pairs are not a measured shaft speed.
-Arguments 170–237 were not issued.
+Arguments 170–237 were not issued. The operator reported that after the
+reboot the idle pair was 2700/4050, at about 19:42 PST on 7 Nov. That is a
+firsthand report, not a timestamp from the host log and not a sample from
+the launcher. It does not finish the dwell.
 
 The exact-zero GPU check that stopped this run is a policy rule. One percent
 on `utilization.gpu` is one percent of the driver's sample window. Zone and
@@ -305,8 +307,7 @@ rule that was loaded.
 A later sweep that still compares settled medians has to issue 160 again
 after a confirmed idle baseline of 2700/4050. Skipping to 170 would compare
 the next dwell with the baseline, not with a 160 median this run never
-finished. That repeat is not authorized in this record. The reboot is
-**UNCONFIRMED**.
+finished. That repeat is not authorized in this record.
 
 Statuses:
 
@@ -316,7 +317,7 @@ Statuses:
 - argument 160 dwell: INCOMPLETE, 9 samples, no median
 - physical RPM: UNVERIFIED
 - arguments 170–237: UNRUN
-- reboot after this write: UNCONFIRMED
+- reboot after this write: reported, idle pair 2700/4050 about 19:42 PST on 7 Nov. Not a script sample. The dwell stays incomplete.
 
 ## unit-b argument 120, two runs, 7 Nov 2026
 
@@ -437,16 +438,17 @@ The module list still starts at 160 and ends at 237 (request 8973). It does
 not repeat 120–150. Argument 160 was issued at 03:35:42 +00:00 and its dwell
 did not finish, so the list has not been retired. The next write, when one
 is authorized, requires a fresh 2700/4050 baseline observed by the launcher
-on that run. The 18:31 PST report and the unconfirmed reboot after 160 do
-not replace that baseline. A single fan whose settled median does not rise
+on that run. The report of about 19:42 PST on 7 Nov, idle pair 2700/4050
+after the reboot, does not replace that baseline. A single fan whose settled
+median does not rise
 is logged as `PLATEAU_RECORDED` and the sweep continues. The sweep stops if
 both medians fail to rise, if either median falls, or on zero, a bad
 readout, a zone outside 25–60 °C, GPU utilization of 5 or more, or a reading
 above 9500. Utilization of 1–4 is logged and does not stop. Settled samples
 in the 120–150 dwells did not jitter, so equality is a plateau and a lower
 median is a decrease. No deadband is added. No release write. Reboot after
-any step. No such step is authorized until the reboot after the partial 160
-is known. `ramp-ec358-preflight.sh` only reads. It does not load a module.
+any step. The reboot recovery is already reported and is not an open
+question. `ramp-ec358-preflight.sh` only reads. It does not load a module.
 
 ## unit-b write-reply capture, not yet run
 
