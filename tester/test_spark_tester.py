@@ -20,6 +20,10 @@ from tester.machine import EVIDENCE, RAMP_LEVELS
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = None
+RUN_ROOT = ROOT / ".tester-run"
+GPU_STRESS = 32
+BASELINE_STRESS = 8
+RAMP_STRESS = 4
 
 W_LINE = re.compile(
     r"^W (\d+) pre_a0=([0-9a-fA-F]+) pre_a4=([0-9a-fA-F]+) "
@@ -83,6 +87,10 @@ def compile_tools(dst: Path) -> None:
             "-pthread",
         ],
     )
+    subprocess.check_call(
+        ["gcc", "-static", "-O2", "-Wall", "-o", str(dst / "nssetup"),
+         str(ROOT / "tester" / "nssetup.c")],
+    )
     finit = dst / "finit.c"
     finit.write_text(textwrap.dedent("""\
         #define _GNU_SOURCE
@@ -103,7 +111,8 @@ def compile_tools(dst: Path) -> None:
 
 def setUpModule():
     global TOOLS
-    TOOLS = Path(tempfile.mkdtemp(prefix="dgx-tester-"))
+    RUN_ROOT.mkdir(exist_ok=True)
+    TOOLS = Path(tempfile.mkdtemp(prefix="tools-", dir=RUN_ROOT))
     compile_tools(TOOLS)
 
 
@@ -314,6 +323,15 @@ class ReplyBufferTests(unittest.TestCase):
         self.assertNotEqual(classify(text), "CAPTURE_COMPLETE")
 
 
+def host_modules_snapshot():
+    path = Path("/lib/modules")
+    if not path.exists():
+        return ("absent",)
+    st = path.lstat()
+    listing = tuple(sorted(os.listdir(path))) if path.is_dir() else ()
+    return ("present", st.st_dev, st.st_ino, st.st_mode, st.st_mtime_ns, listing)
+
+
 class LauncherTests(unittest.TestCase):
     def run_script(self, script, scenario, extra, mutate=None, timeout=180, signed=True, signing=False):
         session = Session(ROOT, TOOLS, scenario, mutate=mutate, signed=signed, signing=signing)
@@ -329,6 +347,53 @@ class LauncherTests(unittest.TestCase):
     def close(self, session):
         session.close()
 
+    def assert_transcript(self, result, session, name):
+        host = (session.state / "work/research/fsl110" / name).read_bytes()
+        out = result.stdout.encode()
+        if out != host:
+            self.fail(
+                f"stdout {len(out)} bytes, hostlog {len(host)} bytes, "
+                f"stdout_tail={out[-160:]!r} host_tail={host[-160:]!r}"
+            )
+        self.assertTrue(out.endswith(b"\n"), out[-80:])
+
+    def assert_reply_gpu_stop(self, result, session):
+        self.assert_transcript(result, session, "reply-ec3137-hostlog.txt")
+        self.assertNotEqual(result.returncode, 0, result.stdout[-400:])
+        self.assertIn("STOP_GPU nvidia-smi_failed\n", result.stdout)
+        self.assertEqual(session.machine.gpu_index, 1)
+        self.assertEqual(session.machine.modules, set())
+        self.assertEqual(session.machine.attempts, [])
+        self.assertEqual(session.machine.completed_writes, [])
+        self.assertNotIn("insmod", result.stdout)
+        self.assertNotIn("writing ", result.stdout)
+
+    def assert_not_baseline_stop(self, result, session):
+        self.assert_transcript(result, session, "ramp-ec358-hostlog.txt")
+        self.assertNotEqual(result.returncode, 0, result.stdout[-400:])
+        self.assertRegex(result.stdout, r"(?m)^STOP_NOT_BASELINE raw=2610 3915 .+\n")
+        self.assertEqual(session.machine.samples[0], (2610, 3915))
+        self.assertEqual(len(session.machine.samples), 15)
+        self.assertIsNone(session.machine.aml_requested)
+        self.assertEqual(session.machine.modules, set())
+        self.assertEqual(session.machine.attempts, [])
+        self.assertEqual(session.machine.completed_writes, [])
+
+    def assert_ramp_banners(self, result, session):
+        self.assert_transcript(result, session, "ramp-ec358-hostlog.txt")
+        self.assertEqual(result.returncode, 0, result.stdout[-800:])
+        for line in (
+            "RAMP_STEPS_DONE\n",
+            "REBOOT_NOW. Do not write 0. Do not run this again.\n",
+            "unloaded; this did not undo a hold\n",
+        ):
+            self.assertIn(line, result.stdout)
+        self.assertEqual(len(completed(session.machine, "/proc/fsl_ramp")), len(RAMP_LEVELS))
+        self.assertEqual(session.machine.aml_requested, 237)
+        self.assertEqual(session.machine.firmware_accepted, 237)
+        self.assertEqual(session.machine.accept_log[-1]["effect"], "staged")
+        self.assertNotEqual(tuple(session.machine.reported), (2700, 4050))
+
     def test_full_ramp_median_hold_and_observed_reboot(self):
         scenario = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "rise"}
         session, result, elapsed = self.run_script(
@@ -336,10 +401,8 @@ class LauncherTests(unittest.TestCase):
         )
         try:
             out = result.stdout
+            self.assert_ramp_banners(result, session)
             self.assertEqual(result.returncode, 0, out[-2000:])
-            self.assertIn("RAMP_STEPS_DONE", out)
-            self.assertIn("REBOOT_NOW", out)
-            self.assertIn("unloaded; this did not undo a hold", out)
             self.assertIn("acpitz=42000mC", out)
             self.assertEqual(median_problems(out, session.machine), [], out[-1500:])
             writes = completed(session.machine, "/proc/fsl_ramp")
@@ -449,7 +512,10 @@ class LauncherTests(unittest.TestCase):
                     "ramp-ec358.sh", scenario, {"DGX_FSL_RAMP_EC358": "yes"},
                 )
                 try:
+                    self.assert_transcript(result, session, "ramp-ec358-hostlog.txt")
                     self.assertIn(marker, result.stdout)
+                    if marker == "STOP_NOT_BASELINE":
+                        self.assert_not_baseline_stop(result, session)
                     self.assertEqual(session.machine.modules, set(), result.stdout[-800:])
                     self.assertEqual(session.machine.completed_writes, [])
                     self.assertEqual(session.machine.attempts, [])
@@ -554,9 +620,7 @@ class LauncherTests(unittest.TestCase):
             "reply-ec3137.sh", scenario, {"DGX_FSL_REPLY_EC3137": "yes"},
         )
         try:
-            self.assertIn("STOP_GPU", result.stdout)
-            self.assertEqual(session.machine.modules, set())
-            self.assertEqual(session.machine.attempts, [])
+            self.assert_reply_gpu_stop(result, session)
         finally:
             self.close(session)
 
@@ -572,38 +636,94 @@ class LauncherTests(unittest.TestCase):
             self.close(session)
 
     def test_sign_all_research_modules_and_the_missing_probe_mutation(self):
+        before = host_modules_snapshot()
         scenario = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "hold"}
-        session, result, _elapsed = self.run_script(
-            "build-sign-reply.sh", scenario, {}, signing=True,
+        twice = (
+            "set -euo pipefail\n"
+            'test -d "/lib/modules/$(uname -r)/build"\n'
+            'test -f "/lib/modules/$(uname -r)/build/.config"\n'
+            ". ./signing.sh\n"
+            "resolve_signing_material\n"
+            "sign_research_modules\n"
+            "sign_research_modules\n"
+            "echo SIGN_TWICE_DONE\n"
         )
+        session = Session(ROOT, TOOLS, scenario, signing=True)
         try:
+            result = session.run(["bash", "-c", twice])
             self.assertEqual(result.returncode, 0, result.stdout[-1500:])
-            names = {Path(line).name for line in (session.state / "sign-calls").read_text().splitlines()}
-            self.assertEqual(names, set(MODULES) if False else {
-                "fsl110.ko", "fsl_ramp.ko", "fsl_probe.ko", "fst_status.ko", "fsl_reply.ko",
-            })
-            self.assertEqual(len((session.state / "make-calls").read_text().splitlines()), 1)
-            for name in names:
-                self.assertIn(f"SIGNED {name} hash=sha512", result.stdout)
+            self.assertIn("SIGN_TWICE_DONE\n", result.stdout)
+            calls = (session.state / "sign-calls").read_text().splitlines()
+            self.assertEqual(len(calls), 10, calls)
+            names = [Path(line).name for line in calls]
+            self.assertEqual(names, list(MODULES) + list(MODULES))
+            self.assertEqual(len((session.state / "make-calls").read_text().splitlines()), 2)
+            for name in MODULES:
+                self.assertEqual(result.stdout.count(f"SIGNED {name} hash=sha512"), 2)
         finally:
-            self.close(session)
+            session.close()
+        self.assertEqual(host_modules_snapshot(), before)
 
         def drop_probe(work: Path) -> None:
             path = work / "research" / "fsl110" / "signing.sh"
             text = path.read_text(encoding="utf-8")
-            path.write_text(text.replace("fsl_probe.ko ", ""), encoding="utf-8")
+            old = "for ko in fsl110.ko fsl_ramp.ko fsl_probe.ko fst_status.ko fsl_reply.ko; do\n"
+            new = "for ko in fsl110.ko fsl_ramp.ko fst_status.ko fsl_reply.ko; do\n"
+            if old not in text:
+                raise AssertionError("module list moved")
+            path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
         session, result, _elapsed = self.run_script(
             "build-sign-reply.sh", scenario, {}, mutate=drop_probe, signing=True,
         )
         try:
-            names = {Path(line).name for line in (session.state / "sign-calls").read_text().splitlines()}
+            names = [Path(line).name for line in (session.state / "sign-calls").read_text().splitlines()]
+            self.assertEqual(names, ["fsl110.ko", "fsl_ramp.ko", "fst_status.ko", "fsl_reply.ko"])
             self.assertNotIn("fsl_probe.ko", names)
-            self.assertNotEqual(names, {
-                "fsl110.ko", "fsl_ramp.ko", "fsl_probe.ko", "fst_status.ko", "fsl_reply.ko",
-            })
         finally:
             self.close(session)
+        self.assertEqual(host_modules_snapshot(), before)
+
+    def test_early_gpu_fail_and_final_banners_stay_complete(self):
+        gpu = {
+            "ec": "3.13.7", "baseline": (2066, 2156), "tach": "hold", "gpu_fail_at": 0,
+        }
+        for index in range(GPU_STRESS):
+            session, result, _elapsed = self.run_script(
+                "reply-ec3137.sh", gpu, {"DGX_FSL_REPLY_EC3137": "yes"},
+            )
+            try:
+                self.assert_reply_gpu_stop(result, session)
+            except AssertionError as exc:
+                raise AssertionError(f"gpu stress {index + 1}/{GPU_STRESS}") from exc
+            finally:
+                self.close(session)
+        baseline = {"ec": "3.5.8", "baseline": (2610, 3915), "tach": "rise"}
+        for index in range(BASELINE_STRESS):
+            session, result, _elapsed = self.run_script(
+                "ramp-ec358.sh", baseline, {"DGX_FSL_RAMP_EC358": "yes"},
+            )
+            try:
+                self.assert_not_baseline_stop(result, session)
+            except AssertionError as exc:
+                raise AssertionError(f"baseline stress {index + 1}/{BASELINE_STRESS}") from exc
+            finally:
+                self.close(session)
+        ramp = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "rise"}
+        for index in range(RAMP_STRESS):
+            session, result, _elapsed = self.run_script(
+                "ramp-ec358.sh", ramp, {"DGX_FSL_RAMP_EC358": "yes"},
+            )
+            try:
+                self.assert_ramp_banners(result, session)
+            except AssertionError as exc:
+                raise AssertionError(f"banner stress {index + 1}/{RAMP_STRESS}") from exc
+            finally:
+                self.close(session)
+        print(
+            f"stress gpu_fail={GPU_STRESS} baseline={BASELINE_STRESS} "
+            f"ramp_banners={RAMP_STRESS}"
+        )
 
     def test_median_and_plateau_and_retry_mutations_fail_the_oracle(self):
         def med5(work: Path) -> None:
@@ -710,18 +830,52 @@ class ControllerAndIsolationTests(unittest.TestCase):
         finally:
             session.close()
 
-    def test_sandbox_cannot_see_host_sysfs_or_load_a_module(self):
-        host_net = sorted(path.name for path in Path("/sys/class/net").iterdir())
-        host_thermal = sorted(path.name for path in Path("/sys/class/thermal").iterdir())
+    def test_systemctl_unknown_command_fails(self):
         scenario = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "hold"}
         session = Session(ROOT, TOOLS, scenario)
         try:
             result = session.run(
-                ["bash", "-c", "ls /sys/class/net >/tmp/net.out 2>&1; echo NET:$?; cat /proc/modules; echo ---; " + str(TOOLS / "finit")],
+                ["bash", "-c",
+                 "systemctl is-active unit; echo A:$?; "
+                 "systemctl is-enabled unit; echo E:$?; "
+                 "systemctl enable unit; echo N:$?; "
+                 "systemctl disable --now unit; echo D:$?; "
+                 "systemctl show -p ActiveState unit; echo S:$?; "
+                 "systemctl definitely-not-a-verb; echo U:$?"],
+                extra_env={"DGX_TESTER_NO_CD": "1"},
+            )
+            text = result.stdout
+            self.assertIn("inactive\nA:0\n", text)
+            self.assertIn("disabled\nE:0\n", text)
+            self.assertIn("\nN:0\n", text)
+            self.assertIn("\nD:0\n", text)
+            self.assertIn("\nS:0\n", text)
+            self.assertIn("systemctl: unknown command definitely-not-a-verb\n", text)
+            self.assertIn("\nU:1\n", text)
+            shown = text.split("D:0\n", 1)[1].split("S:0\n", 1)[0]
+            self.assertNotIn("=", shown)
+        finally:
+            session.close()
+
+    def test_sandbox_cannot_see_host_sysfs_or_load_a_module(self):
+        host_net = sorted(path.name for path in Path("/sys/class/net").iterdir())
+        host_thermal = sorted(path.name for path in Path("/sys/class/thermal").iterdir())
+        modules_before = host_modules_snapshot()
+        leaked = Path("/tmp/net.out")
+        leaked_before = leaked.read_bytes() if leaked.exists() else None
+        scenario = {"ec": "3.5.8", "baseline": (2700, 4050), "tach": "hold"}
+        session = Session(ROOT, TOOLS, scenario)
+        try:
+            result = session.run(
+                ["bash", "-c",
+                 "ls /sys/class/net >/tmp/net.out 2>&1; echo NET:$?; "
+                 "umount /sys; ls /sys/class/net >/tmp/net2.out 2>&1; echo NET2:$?; "
+                 "cat /proc/modules; echo ---; " + str(TOOLS / "finit")],
                 extra_env={"DGX_TESTER_NO_CD": "1"},
             )
             self.assertEqual(result.returncode, 0, result.stdout)
             self.assertIn("NET:2", result.stdout.replace(" ", ""))
+            self.assertIn("NET2:2", result.stdout.replace(" ", ""))
             self.assertIn("fixture_modules", result.stdout)
             self.assertIn("rc=-1 errno=1", result.stdout)
             self.assertNotIn("lo", result.stdout.split("fixture_modules")[0])
@@ -729,6 +883,9 @@ class ControllerAndIsolationTests(unittest.TestCase):
             session.close()
         self.assertEqual(sorted(path.name for path in Path("/sys/class/net").iterdir()), host_net)
         self.assertEqual(sorted(path.name for path in Path("/sys/class/thermal").iterdir()), host_thermal)
+        self.assertEqual(host_modules_snapshot(), modules_before)
+        leaked_after = leaked.read_bytes() if leaked.exists() else None
+        self.assertEqual(leaked_after, leaked_before)
 
 
 if __name__ == "__main__":

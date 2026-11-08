@@ -2,8 +2,11 @@
 """Run a launcher where host /sys, /proc/modules, and module loading are unreachable.
 
 The process is root only inside a user namespace, so finit_module fails with
-EPERM. /sys is a bind mount of the fixture. LD_PRELOAD covers /proc/fsl*
-because procfs will not let us create those names.
+EPERM. enter.sh stays pid 1 and waits for the launcher and for the hostlog
+tee. nssetup mounts the fixture and a private /tmp. When a kdir is planted,
+/lib/modules is created on a tmpfs that covers that parent inside the
+namespace only. LD_PRELOAD covers /proc/fsl* because procfs will not let us
+create those names.
 """
 import os
 import shutil
@@ -86,25 +89,14 @@ class Session:
         cert.write_text("not-a-real-cert\n", encoding="ascii")
         self.key = key
         self.cert = cert
+        nssetup = str(tools / "nssetup")
         enter = self.state / "enter.sh"
         enter.write_text(
             "#!/bin/bash\n"
-            "set -euo pipefail\n"
+            "set -u\n"
             'STATE="$1"\n'
             "shift\n"
-            'mount --bind "$STATE/sys" /sys\n'
-            'mount --bind "$STATE/proc_modules" /proc/modules\n'
-            "mount -t tmpfs tmpfs /var/lib\n"
-            "mkdir -p /var/lib/dgx-fan-control\n"
-            'if [ -d "$STATE/kdir" ]; then\n'
-            '  if [ ! -d /lib/modules ]; then\n'
-            '    echo "sandbox: /lib/modules is missing" >&2\n'
-            "    exit 1\n"
-            "  fi\n"
-            "  mount -t tmpfs tmpfs /lib/modules\n"
-            '  mkdir -p "/lib/modules/$(uname -r)/build"\n'
-            '  mount --bind "$STATE/kdir" "/lib/modules/$(uname -r)/build"\n'
-            "fi\n"
+            f'"{nssetup}" "$STATE" || exit 125\n'
             'export LD_PRELOAD="$STATE/preload.so"\n'
             'export PATH="$STATE/bin:$PATH"\n'
             'export DGX_TESTER_STATE="$STATE"\n'
@@ -112,7 +104,26 @@ class Session:
             'if [ "${DGX_TESTER_NO_CD:-}" != 1 ]; then\n'
             '  cd "$STATE/work/research/fsl110"\n'
             "fi\n"
-            'exec "$@"\n',
+            '"$@" &\n'
+            "child=$!\n"
+            "forward() {\n"
+            '  kill -s "$1" "$child" 2>/dev/null || true\n'
+            "}\n"
+            "trap 'forward TERM' TERM\n"
+            "trap 'forward INT' INT\n"
+            "trap 'forward HUP' HUP\n"
+            "set +e\n"
+            'wait "$child"\n'
+            "status=$?\n"
+            "trap - TERM INT HUP\n"
+            "while true; do\n"
+            "  wait -n\n"
+            "  rc=$?\n"
+            '  if [ "$rc" -eq 127 ]; then\n'
+            "    break\n"
+            "  fi\n"
+            "done\n"
+            'exit "$status"\n',
             encoding="ascii",
         )
         enter.chmod(0o755)
@@ -127,8 +138,8 @@ class Session:
         if extra_env:
             env.update(extra_env)
         return subprocess.Popen(
-            ["unshare", "--user", "--map-root-user", "--mount", "--pid", "--fork",
-             "--mount-proc", "bash", str(self.enter), str(self.state), *argv],
+            ["unshare", "--user", "--map-root-user", "--mount", "--propagation", "private",
+             "--pid", "--fork", "--mount-proc", "bash", str(self.enter), str(self.state), *argv],
             cwd=self.repo,
             env=env,
             text=True,
@@ -142,9 +153,15 @@ class Session:
         try:
             out, _err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _err = proc.communicate()
-            return subprocess.CompletedProcess(argv, 124, out, "")
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                proc.kill()
+            try:
+                out, _err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                out = ""
+            return subprocess.CompletedProcess(argv, 124, out or "", "")
         return subprocess.CompletedProcess(argv, proc.returncode, out, "")
 
     def close(self) -> None:

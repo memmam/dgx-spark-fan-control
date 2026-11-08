@@ -210,6 +210,10 @@ static ssize_t fsl_reply_read(struct file *file, char __user *buf, size_t len,
 			      reads[i].post_a0, reads[i].post_a4,
 			      reads[i].handler, reads[i].post_ok ? 1 : 0,
 			      i, 'R');
+	/* Fewer than 32 bytes left: the footer is omitted. A reader that
+	 * requires "truncated N" then fails closed. This does not prove
+	 * that every buffer size emits a complete record.
+	 */
 	if (n < FSL_REPLY_TEXT - 32)
 		n += snprintf(tmp + n, FSL_REPLY_TEXT - n,
 			      "truncated %d\n", truncated);

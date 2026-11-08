@@ -1,7 +1,17 @@
 #!/bin/bash
 # Optional ARM64 virt guest under QEMU TCG. Not part of ./scripts/check.
-# Builds a small kernel, a labeled SSDT, and the research modules, then
-# boots them. It does not emulate the EC, the GPU, or SMC 0xC400008D.
+# Not nested KVM. Not a Spark, an EC, or a GPU.
+#
+# Packages installed when the commands or the UEFI firmware are missing:
+#   qemu-system-arm qemu-efi-aarch64 gcc-aarch64-linux-gnu acpica-tools
+#   flex bison bc libssl-dev libelf-dev cpio xz-utils wget ca-certificates
+#   make
+# Firmware: /usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+# Kernel: Linux 6.12.12, defconfig, ACPI, ACPI_FFH, kprobes, kretprobes.
+# Boot: qemu-system-aarch64 -machine virt,acpi=on -cpu cortex-a57 -bios
+#   QEMU_EFI.fd -append 'acpi=force'. Without the firmware, acpi=force
+#   produced no console. Without acpi=force the interpreter stayed off.
+# The SSDT only stores FLVL. It raises no FFH event, so reply writes stay 0.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 work="${DGX_GUEST_WORK:-/tmp/dgx-guest}"
@@ -12,11 +22,11 @@ exec > >(tee "$work/guest.log") 2>&1
 echo "GUEST_BUILD_START $(date -Is)"
 seconds=$SECONDS
 
-if ! command -v qemu-system-aarch64 >/dev/null || ! command -v aarch64-linux-gnu-gcc >/dev/null || ! command -v iasl >/dev/null; then
+if ! command -v qemu-system-aarch64 >/dev/null || ! command -v aarch64-linux-gnu-gcc >/dev/null || ! command -v iasl >/dev/null || [ ! -f /usr/share/qemu-efi-aarch64/QEMU_EFI.fd ]; then
   sudo apt-get update
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    qemu-system-arm gcc-aarch64-linux-gnu acpica-tools flex bison bc \
-    libssl-dev libelf-dev cpio xz-utils wget ca-certificates make
+    qemu-system-arm qemu-efi-aarch64 gcc-aarch64-linux-gnu acpica-tools \
+    flex bison bc libssl-dev libelf-dev cpio xz-utils wget ca-certificates make
 fi
 
 if [ ! -d "$work/linux-$kver" ]; then

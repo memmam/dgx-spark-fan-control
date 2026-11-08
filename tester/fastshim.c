@@ -154,18 +154,35 @@ int main(int argc, char **argv)
 	}
 	if (strcmp(name, "systemctl") == 0) {
 		int i;
+		const char *verb = NULL;
 
 		for (i = 1; i < argc; i++) {
-			if (strcmp(argv[i], "is-active") == 0) {
-				puts("inactive");
-				return 0;
-			}
-			if (strcmp(argv[i], "is-enabled") == 0) {
-				puts("disabled");
-				return 0;
-			}
+			if (argv[i][0] == '-')
+				continue;
+			verb = argv[i];
+			break;
 		}
-		return 0;
+		if (verb == NULL) {
+			fprintf(stderr, "systemctl: missing command\n");
+			return 1;
+		}
+		if (strcmp(verb, "is-active") == 0) {
+			puts("inactive");
+			return 0;
+		}
+		if (strcmp(verb, "is-enabled") == 0) {
+			puts("disabled");
+			return 0;
+		}
+		/* enable and disable are the verbs set-state and module use.
+		 * show is what the daemon reads. Empty show output means the
+		 * property is unknown, which is not a fabricated value.
+		 */
+		if (strcmp(verb, "enable") == 0 || strcmp(verb, "disable") == 0 ||
+		    strcmp(verb, "show") == 0)
+			return 0;
+		fprintf(stderr, "systemctl: unknown command %s\n", verb);
+		return 1;
 	}
 	if (strcmp(name, "fwupdmgr") == 0) {
 		char path[PATH_MAX];
