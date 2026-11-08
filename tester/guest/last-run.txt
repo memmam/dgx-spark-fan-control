@@ -1,0 +1,23 @@
+GUEST_PASS
+qemu_exit=0
+build_plus_boot=78s
+The 78s includes an incremental arm64 kernel rebuild. The boot itself
+returned in about 2s once Image and the modules already existed.
+
+GUEST_RESULT probe_load=0 reply_load=0 status=interpreter_ok reply=state armed|writes 0|reads 0|dropped_writes 0|dropped_reads 0|nmissed 0|truncated 0
+GUEST_OK
+
+What this boot is:
+- QEMU TCG, machine virt, ACPI on, UEFI firmware, acpi=force
+- Linux 6.12.12 defconfig with kprobes, kretprobes, and CONFIG_ACPI_FFH
+- synthetic SSDT installed by the kernel from the initrd
+- real fsl_probe.ko evaluated \_SB.FAN0._FSL and ACPICA returned interpreter_ok
+- real fsl_reply.ko registered its kretprobe (state armed, no samples)
+
+writes 0 is expected. The synthetic method only stores FLVL. It does not
+touch Fixed Hardware, so the kretprobe has nothing to copy. This is not an
+EC, a GPU, or SMC 0xC400008D.
+
+Without the UEFI firmware, acpi=force produced no console output. Without
+acpi=force the same kernel disabled the ACPI interpreter and the probe
+returned error_handle 0x3 (AE_NO_NAMESPACE).
