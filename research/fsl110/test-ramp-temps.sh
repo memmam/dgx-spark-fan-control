@@ -75,6 +75,14 @@ if grep -q insmod ramp-ec358-preflight.sh; then
   echo "FAIL ramp preflight loads a module"
   exit 1
 fi
+if grep -q 'not decided here' ramp-ec358-preflight.sh; then
+  echo "FAIL preflight reopens the reported reboot"
+  exit 1
+fi
+if ! grep -q 'fifteen-sample baseline' ramp-ec358-preflight.sh; then
+  echo "FAIL preflight dropped its own baseline requirement"
+  exit 1
+fi
 out=$(env THERMAL_ROOT=/tmp ./ramp-ec358-preflight.sh 2>&1 || true)
 test "$out" = "STOP_TEST_ENV"
 echo "ramp_temps_ok"

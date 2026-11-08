@@ -117,6 +117,16 @@ trunc = good.replace("truncated 0", "truncated 1")
 assert "truncated" in run(trunc)
 blank = "state armed\n"
 assert run(blank).startswith("INCONCLUSIVE malformed")
+failed_copy = good.replace("post_ok=1", "post_ok=0")
+assert run(failed_copy).startswith("INCONCLUSIVE") and "post_ok" in run(failed_copy)
+assert "CAPTURE_COMPLETE" not in run(failed_copy)
+read_as_write = good.replace("pre_a4=9", "pre_a4=c").replace("pre_a4=109", "pre_a4=10c").replace("pre_a4=209", "pre_a4=20c").replace("pre_a4=309", "pre_a4=30c")
+assert "opcode" in run(read_as_write)
+broken = good.replace(
+    "W 0 pre_a0=c400008d pre_a4=9 post_a0=c400008e post_a4=9 handler=0 post_ok=1",
+    "W 0 not-a-record",
+)
+assert "record_format" in run(broken)
 print("classify_reply_ok")
 PY
 python3 - << 'PY'

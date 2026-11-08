@@ -468,12 +468,19 @@ the printed numbers are the evidence. No saved capture contains them.
 the write unless the proc file says `state armed` and no captured `pre_a4`
 has low byte `0x09`. A tach read uses low byte `0x0C` and does not by itself
 block the write. It then issues one `_FSL` argument 120 and prints the proc
-file before it reads the fans again. Four records whose low byte is `0x09`
-would be the four `WRB` writes from one call. `post_a0` of `c400008e` is the
-sentinel the read path already requires before it publishes a speed. That
-sentinel would still not prove the fan loop stored the bytes. Zero write
-records means the observer did not see the call. Confidentiality lockdown
-stops the script before either module is loaded. A failed `insmod` of the
+file before it reads the fans again. `CAPTURE_COMPLETE` requires four `W`
+lines, each with `post_ok=1` and a `pre_a4` low byte of `0x09`, and zeros for
+`dropped_writes`, `dropped_reads`, `nmissed`, and `truncated`. A failed copy
+stores the write with `post_ok=0` and is `INCONCLUSIVE`, not a complete
+capture. `dropped_writes` or `nmissed` means calls were discarded, which is
+not the same as the observer never seeing them. Fewer than four `W` lines
+with those counters at zero means the capture does not show four kept
+writes. `post_a0` of `c400008e` is the sentinel the read path already
+requires before it publishes a speed. That sentinel would still not prove
+the fan loop stored the bytes. `REPLY_DONE` is printed only after
+`CAPTURE_COMPLETE`. An inconclusive capture still reboots if the write was
+issued, and it does not print `REPLY_DONE`. Confidentiality lockdown stops
+the script before either module is loaded. A failed `insmod` of the
 observer does not load the probe.
 
 The module compiled on kernel `7.0.0-1024-nvidia` when the ramp was built,

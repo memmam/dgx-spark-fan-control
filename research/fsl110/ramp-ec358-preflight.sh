@@ -47,4 +47,4 @@ a=$(cat "${paths[0]}") || { echo STOP_READ; exit 1; }
 b=$(cat "${paths[1]}") || { echo STOP_READ; exit 1; }
 echo "fans ${paths[0]}=$a ${paths[1]}=$b"
 echo "PREFLIGHT_DONE no module loaded. One fan pair is not the fifteen-sample baseline."
-echo "Reboot after the partial argument 160 is a separate fact and is not decided here."
+echo "The idle pair after the partial 160 reboot is already reported. This reading does not replace the launcher's own fifteen samples."

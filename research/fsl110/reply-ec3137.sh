@@ -150,8 +150,9 @@ echo "=== reply buffer, before further fan reads ==="
 reply_text=$(cat /proc/fsl_reply || true)
 printf '%s\n' "$reply_text"
 echo
-printf '%s\n' "$reply_text" | python3 ./classify-reply.py || echo INCONCLUSIVE classify_failed
-echo "CAPTURE_COMPLETE means the four write records were kept. It does not mean the EC stored the setpoint."
+classify_line=$(printf '%s\n' "$reply_text" | python3 ./classify-reply.py || echo "INCONCLUSIVE classify_failed")
+printf '%s\n' "$classify_line"
+echo "CAPTURE_COMPLETE means four write records were copied with post_ok=1 and opcode 0x09. It does not mean the EC stored the setpoint."
 echo "=== after 15 x 2s ==="
 i=1
 while [ "$i" -le 15 ]; do
@@ -165,5 +166,13 @@ done
 echo "=== final zones ==="
 log_zones || exit 1
 gpu_idle || exit 1
-echo "REPLY_DONE"
-echo "post_a0 is the first qword left in the handler buffer. The read path publishes a speed only when that qword is c400008e. The same value here is not proof the fan loop stored the bytes."
+case "$classify_line" in
+  CAPTURE_COMPLETE)
+    echo "REPLY_DONE"
+    echo "post_a0 is the first qword left in the handler buffer. The read path publishes a speed only when that qword is c400008e. The same value here is not proof the fan loop stored the bytes."
+    ;;
+  *)
+    echo "REPLY_INCONCLUSIVE"
+    echo "The capture is not a result. Reboot still applies if a write was issued. Unload did not clear a hold."
+    ;;
+esac

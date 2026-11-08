@@ -39,7 +39,10 @@ of `0x09` at offset `0x20` is kept in the write list. Other matches are
 kept in the read list and cannot evict a write. It does not evaluate ACPI.
 `reply-ec3137.sh` loads that observer, requires `state armed` and no write
 record yet, and only then runs the argument-120 probe once. `CAPTURE_COMPLETE`
-means four write records were kept. It does not mean the EC stored them.
+means four `W` lines were copied (`post_ok=1`), each with opcode `0x09`, and
+nothing was dropped, missed, or truncated. `REPLY_DONE` follows only that
+line. An inconclusive capture does not print `REPLY_DONE`. Neither result
+means the EC stored the bytes. A write still reboots.
 
 Every `build-sign-*.sh` runs one `make` and then signs `fsl110.ko`,
 `fsl_ramp.ko`, `fsl_probe.ko`, `fst_status.ko`, and `fsl_reply.ko`. Signing

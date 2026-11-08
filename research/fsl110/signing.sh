@@ -67,7 +67,7 @@ resolve_signing_material() {
 # leaves the others unsigned, because make relinks them.
 sign_research_modules() {
   local kdir hash ko
-  kdir="/lib/modules/$(uname -r)/build"
+  kdir="${1:-/lib/modules/$(uname -r)/build}"
   [ -d "$kdir" ] || { echo "STOP_NO_HEADERS"; exit 1; }
   hash=$(sed -n 's/^CONFIG_MODULE_SIG_HASH="\(.*\)"$/\1/p' "$kdir/.config")
   [ -n "$hash" ] || { echo STOP_NO_SIG_HASH; exit 1; }

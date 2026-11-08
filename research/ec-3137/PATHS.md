@@ -152,7 +152,10 @@ kretprobes `acpi_ffh_address_space_arch_handler` and copies qwords 0 and
 qword at offset `0x20` has low byte `0x09` before one argument-120 write.
 That byte is the write opcode in [FAN-WRB.md](FAN-WRB.md). A tach read in
 the same capture uses low byte `0x0C`. Write records are stored apart from
-tach records. `CAPTURE_COMPLETE` means the four write records were kept,
-`nmissed` was 0, and nothing was dropped or truncated. `post_a0 == c400008e`
+tach records. `CAPTURE_COMPLETE` means four `W` lines were copied with `post_ok=1` and
+opcode `0x09`, `nmissed` was 0, and nothing was dropped or truncated.
+`post_ok=0` is a failed copy and is inconclusive. `REPLY_DONE` is not
+printed for an inconclusive capture. The reboot after a write still
+happens. `post_a0 == c400008e`
 would be the sentinel the read path already uses. It would still leave the
 fan-loop consumer unshown. No earlier log in this tree contains those qwords.
