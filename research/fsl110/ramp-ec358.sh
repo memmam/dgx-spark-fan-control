@@ -94,9 +94,16 @@ sample_ok() {
   samples_b=()
   i=1
   while [ "$i" -le 15 ]; do
-    zones_ok /sys/class/thermal || return 1
-    gpu_idle || return 1
+    if ! zones_ok /sys/class/thermal; then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
+      return 1
+    fi
+    if ! gpu_idle; then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
+      return 1
+    fi
     if ! pair=$(read_pair); then
+      echo "DWELL_INCOMPLETE tag=$tag kept=$((i - 1))"
       return 1
     fi
     zone_snap[$i]=$(date -Is)$ZONE_LINE" hottest=$HOTTEST$GPU_LINE"

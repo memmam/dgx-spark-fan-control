@@ -25,6 +25,13 @@ case "$GPU_LINE" in
   *"nvidia_gpu_temp=41C"*) ;;
   *) echo "FAIL gpu $GPU_LINE"; exit 1 ;;
 esac
+gpu_parse $'1, 38' || { echo "FAIL noted util stopped"; exit 1; }
+case "$GPU_LINE" in
+  *"nvidia_gpu_util=1 noted"*) ;;
+  *) echo "FAIL note missing $GPU_LINE"; exit 1 ;;
+esac
+if gpu_parse $'5, 38'; then echo "FAIL workload util accepted"; exit 1; fi
+echo "gpu_policy_ok"
 echo 70000 > "$root/thermal_zone1/temp"
 if zones_ok "$root"; then echo "FAIL accepted hot zone"; exit 1; fi
 rm -f "$root/thermal_zone0/temp"
@@ -61,4 +68,11 @@ reject_live THERMAL_ROOT env THERMAL_ROOT=/tmp
 reject_live NVIDIA_SMI_STUB env NVIDIA_SMI_STUB='0, 41'
 reject_live RAMP_SOURCE_ONLY env RAMP_SOURCE_ONLY=1
 grep -q 'none is filled in here' ../../docs/validation.md
+bash -n ramp-ec358-preflight.sh
+if grep -q insmod ramp-ec358-preflight.sh; then
+  echo "FAIL ramp preflight loads a module"
+  exit 1
+fi
+out=$(env THERMAL_ROOT=/tmp ./ramp-ec358-preflight.sh 2>&1 || true)
+test "$out" = "STOP_TEST_ENV"
 echo "ramp_temps_ok"

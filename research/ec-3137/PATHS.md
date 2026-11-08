@@ -124,8 +124,11 @@ first is prepared below and has not been run.
    above. Until one of those images is available, static inspection cannot
    show a consumer of `0x06000790`.
 
-The unit-a continuation remains UNRUN. A later report says 2700/4050
-returned after reboot. `ramp-ec358.sh` still has to see that pair itself.
+Argument 160 on unit-a was issued at 2026-11-08T03:35:42+00:00. Nine tach
+samples were recorded and the dwell did not finish, so there is no settled
+median. Arguments 170–237 were not issued. The reboot printed by that run
+is unconfirmed. A later median comparison has to issue 160 again after a
+new 2700/4050 baseline. That repeat is not authorized by this note.
 
 ## Same-boot `_FST` control, not prepared
 

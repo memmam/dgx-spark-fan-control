@@ -67,3 +67,15 @@ if grep -q insmod ec-profile-status.sh; then
   exit 1
 fi
 echo "ec_status_offline_ok"
+bash -n reply-ec3137-preflight.sh
+out=$(env RAMP_SOURCE_ONLY=1 ./reply-ec3137-preflight.sh 2>&1 || true)
+test "$out" = "STOP_TEST_ENV"
+if grep -q insmod reply-ec3137-preflight.sh; then
+  echo "FAIL reply preflight loads a module"
+  exit 1
+fi
+if ! grep -q 'layout=unverified' reply-ec3137-preflight.sh; then
+  echo "FAIL preflight claims the buffer layout"
+  exit 1
+fi
+echo "reply_preflight_offline_ok"

@@ -6,8 +6,9 @@
  * On entry, qword 0 of the handler's value pointer is compared with
  * 0xC400008D. Other calls are ignored. On return, qwords at offsets 0 and
  * 0x20 are copied out. Mainline arm64 FFH offset 1 leaves the SMCCC result
- * in that buffer before it returns. This module does not decide whether
- * the EC kept a fan setpoint.
+ * in that buffer before it returns. Building against a kernel's headers
+ * does not prove that kernel uses that layout. This module does not decide
+ * whether the EC kept a fan setpoint.
  */
 #include <linux/kernel.h>
 #include <linux/slab.h>

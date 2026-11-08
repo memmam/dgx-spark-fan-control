@@ -10,6 +10,8 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=ramp-temps-lib.sh
+source ./ramp-temps-lib.sh
 exec > >(tee -a probe-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
@@ -65,10 +67,7 @@ gpu_idle() {
   fi
   while IFS= read -r util; do
     util=${util// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util raw=$utils"
-      return 1
-    fi
+    gpu_util_policy "$util" "raw=$utils" || return 1
   done <<< "$utils"
 }
 mapfile -t paths < <(

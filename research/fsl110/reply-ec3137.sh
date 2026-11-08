@@ -11,6 +11,8 @@ fi
 cd "$(dirname "$0")"
 # shellcheck source=ec-profile.sh
 source ./ec-profile.sh
+# shellcheck source=ramp-temps-lib.sh
+source ./ramp-temps-lib.sh
 exec > >(tee -a reply-ec3137-hostlog.txt) 2>&1
 echo "HOST_DATE $(date -Is)"
 echo "HOST_DATE is date -Is with this machine's offset. Do not relabel that offset as PST."
@@ -76,10 +78,7 @@ gpu_idle() {
   fi
   while IFS= read -r util; do
     util=${util// /}
-    if [ "$util" != 0 ]; then
-      echo "STOP_GPU util=$util raw=$utils"
-      return 1
-    fi
+    gpu_util_policy "$util" "raw=$utils" || return 1
   done <<< "$utils"
 }
 mapfile -t paths < <(
@@ -142,10 +141,16 @@ printf '%s\n' "$snap" | head -n 1 | grep -qx 'state armed' || {
   echo STOP_REPLY_NOT_ARMED
   exit 1
 }
-printf '%s\n' "$snap" | sed -n '2p' | grep -qx 'count 0' || {
-  echo STOP_REPLY_NOT_EMPTY
-  exit 1
-}
+# Opcode 0x09 is the write. A tach read uses 0x0C and must not block the write.
+prior_writes=$(printf '%s\n' "$snap" | python3 -c '
+import re, sys
+n = 0
+for match in re.finditer(r"pre_a4=([0-9a-fA-F]+)", sys.stdin.read()):
+    if int(match.group(1), 16) & 0xFF == 0x09:
+        n += 1
+print(n)
+') || { echo STOP_REPLY_PARSE; exit 1; }
+test "$prior_writes" = 0 || { echo "STOP_REPLY_WRITE_ALREADY $prior_writes"; exit 1; }
 insmod ./fsl_probe.ko || { echo STOP_INSMOD; exit 1; }
 loaded_probe=1
 echo "loaded probe; unload will not restore fans"
