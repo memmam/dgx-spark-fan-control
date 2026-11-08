@@ -31,7 +31,11 @@ do not infer a profile from the machine name.
 `fsl_ramp` accepts only `step`, from argument 160 through 237 (request
 8973). Levels 120–150 are not in this binary. `fsl_probe` accepts one `run`
 and only argument 120. A failed ramp step latches and refuses the rest.
-`fst_status` only reads `_FST`.
+`fst_status` only reads `_FST`. `fsl_reply` registers a kretprobe on
+`acpi_ffh_address_space_arch_handler` and copies two qwords from that
+handler's existing buffer when the request id is `0xC400008D`. It does not
+evaluate ACPI. `reply-ec3137.sh` loads that observer, requires `state armed`
+and `count 0`, and only then runs the argument-120 probe once.
 
 Signing uses `DGX_MOK_KEY` and `DGX_MOK_CERT` when both are set, otherwise
 the single DKMS mok path. The scripts do not print those paths, create a

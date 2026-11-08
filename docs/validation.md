@@ -202,10 +202,9 @@ with the EC curve publishing, and it is not proof the floor register is
 clear, that the machine was damaged, or that 29 percent is the normal idle
 step.
 
-The 14:48 PST reboot was stated. No unit-a 2700/4050 pair was reported
-after it. This row does not mark that restore PASS. Arguments 160–237 stay
-**UNRUN**. Do not loosen the baseline check and do not retry from this
-sample alone.
+The 14:48 PST reboot was stated. This row does not mark that restore PASS.
+Arguments 160–237 stay **UNRUN**. Do not loosen the baseline check and do
+not retry from the 2610/3915 sample alone.
 
 A fanwatch log from unit-a then shows fourteen 1-second samples
 from 22:58:02 through 22:58:15 UTC, which is 14:58:02 through 14:58:15 PST.
@@ -220,7 +219,16 @@ Statuses:
 - this attempt: BLOCKED before write
 - BUILD/SIGN for the continuation binary: not a new result
 - arguments 160–237: UNRUN
-- reboot restore after the 150 sweep: still PENDING
+- reboot restore after the 150 sweep: still PENDING in this capture
+
+## unit-a idle pair after the 2610 hold, reported 7 Nov 2026 about 18:31 PST
+
+Reported, not sampled by `ramp-ec358.sh`: the 2610/3915 pair persisted until
+a reboot, and after that reboot the idle pair was 2700/4050. The 14:55
+attempt remains a blocked run. Arguments 160–237 remain **UNRUN**. The
+continuation prepared in `e19bef7`, now `research/fsl110/ramp-ec358.sh`,
+still requires fifteen of its own 2700/4050 baseline samples before it
+loads a module. A reported idle pair does not skip that gate.
 
 ## unit-b argument 120, two runs, 7 Nov 2026
 
@@ -326,7 +334,8 @@ read the SMC reply. Both fans' `_FST` methods publish that same name. After
 that namespace. Argument 120 leaves 120. Argument 110 leaves 110. The 15:11
 control value 0 is the initializer `Name (FLVL, Zero)`. A reboot rebuilds
 that name. This comparison restates the method. It does not show whether
-the EC kept the setpoint. The unit-a sweep stays blocked.
+the EC kept the setpoint. The unit-a continuation remains UNRUN until
+`ramp-ec358.sh` sees 2700/4050 itself.
 
 Statuses:
 
@@ -338,14 +347,43 @@ Statuses:
 
 **UNRUN.** The module list now starts at 160 and still ends at 237
 (request 8973). It does not repeat 120–150. The next write requires a fresh
-baseline of 2700/4050. That pair has not been reported since the 14:48 PST
-reboot, so the script must observe it itself. A single fan whose settled
+baseline of 2700/4050 observed by `ramp-ec358.sh` on that run. The 18:31 PST
+report says that pair returned after reboot; the script does not trust the
+report in place of its own samples. A single fan whose settled
 median does not rise is logged as `PLATEAU_RECORDED` and the sweep
 continues. The sweep stops if both medians fail to rise, if either median
 falls, or on zero, a bad readout, a zone outside 25–60 °C, GPU utilization
 above 0, or a reading above 9500. Settled samples in the 120–150 dwells did
 not jitter, so equality is a plateau and a lower median is a decrease.
 No deadband is added. No release write. Reboot after any step.
+
+## unit-b write-reply capture, not yet run
+
+**UNRUN.** `research/fsl110/fsl_reply.c` registers a kretprobe on
+`acpi_ffh_address_space_arch_handler`. It does not replace that function
+and it does not evaluate ACPI. For a buffer whose first qword is
+`0xC400008D`, it keeps that qword and the qword at offset `0x20` from
+before the call, and the same two qwords after the call returns. On
+mainline arm64 those qwords are SMCCC `a0` and `a4` for the 64-bit FFH
+region. This repository does not contain the running kernel's `ffh.c`, so
+the printed numbers are the evidence. No saved capture contains them.
+
+`reply-ec3137.sh` samples fans first, then loads the observer, and refuses
+the write unless the proc file says `state armed` and `count 0`. It then
+issues one `_FSL` argument 120 through the existing probe and prints the
+proc file before it reads the fans again. Four records whose `pre_a4` low
+byte is `0x09` would be the four `WRB` writes from one call. `post_a0` of
+`c400008e` is the sentinel the read path already requires before it
+publishes a speed. That sentinel would still not prove the fan loop stored
+the bytes. Zero write records means the observer did not see the call.
+Confidentiality lockdown stops the script before either module is loaded.
+A failed `insmod` of the observer does not load the probe.
+
+Statuses:
+
+- this capture: UNRUN
+- argument 120 with a reply buffer: not a new result
+- EC acceptance: still unshown
 
 ## Version 0.1.5 on EC 3.5.8 with October SoC, 6 Nov 2026
 
