@@ -1,0 +1,22 @@
+GLIBC_2.2.5 {
+  global:
+    open;
+    open64;
+    write;
+    close;
+    dup;
+    dup2;
+    fwrite;
+    fputc;
+    putc;
+    fflush;
+};
+GLIBC_2.3.4 {
+  global:
+    __printf_chk;
+} GLIBC_2.2.5;
+GLIBC_2.4 {
+  global:
+    openat;
+    openat64;
+} GLIBC_2.3.4;

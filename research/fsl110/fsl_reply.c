@@ -25,7 +25,10 @@
 #define FSL_REPLY_WRITE_OP	0x09ULL
 #define FSL_REPLY_WRITES	8
 #define FSL_REPLY_READS		32
+/* Overridable so a userspace build can force the short-buffer path. */
+#ifndef FSL_REPLY_TEXT
 #define FSL_REPLY_TEXT		16384
+#endif
 
 struct fsl_reply_ctx {
 	bool match;
@@ -140,9 +143,12 @@ static int fsl_reply_add(char *tmp, int *n, int *truncated,
 		*truncated = 1;
 		return 0;
 	}
-	wrote = scnprintf(tmp + *n, room,
-			  "%c %d pre_a0=%llx pre_a4=%llx post_a0=%llx post_a4=%llx handler=%ld post_ok=%u\n",
-			  kind, index, a, b, c, d, handler, ok);
+	/* snprintf, not scnprintf: the return is the untruncated length, so
+	 * wrote >= room means the line did not fit. A clipped line is not stored.
+	 */
+	wrote = snprintf(tmp + *n, room,
+			 "%c %d pre_a0=%llx pre_a4=%llx post_a0=%llx post_a4=%llx handler=%ld post_ok=%u\n",
+			 kind, index, a, b, c, d, handler, ok);
 	if (wrote < 0 || wrote >= room) {
 		*truncated = 1;
 		return 0;
@@ -184,8 +190,8 @@ static ssize_t fsl_reply_read(struct file *file, char __user *buf, size_t len,
 	spin_unlock_irqrestore(&fsl_reply_lock, flags);
 	missed = fsl_reply_kp.nmissed;
 
-	wrote = scnprintf(tmp, FSL_REPLY_TEXT,
-			  "state %s\nwrites %d\nreads %d\ndropped_writes %d\ndropped_reads %d\nnmissed %lu\n",
+	wrote = snprintf(tmp, FSL_REPLY_TEXT,
+			 "state %s\nwrites %d\nreads %d\ndropped_writes %d\ndropped_reads %d\nnmissed %lu\n",
 			  fsl_reply_armed ? "armed" : "idle",
 			  nwrites, nreads, drop_w, drop_r, missed);
 	if (wrote < 0 || wrote >= FSL_REPLY_TEXT)
@@ -204,9 +210,13 @@ static ssize_t fsl_reply_read(struct file *file, char __user *buf, size_t len,
 			      reads[i].post_a0, reads[i].post_a4,
 			      reads[i].handler, reads[i].post_ok ? 1 : 0,
 			      i, 'R');
+	/* Fewer than 32 bytes left: the footer is omitted. A reader that
+	 * requires "truncated N" then fails closed. This does not prove
+	 * that every buffer size emits a complete record.
+	 */
 	if (n < FSL_REPLY_TEXT - 32)
-		n += scnprintf(tmp + n, FSL_REPLY_TEXT - n,
-			       "truncated %d\n", truncated);
+		n += snprintf(tmp + n, FSL_REPLY_TEXT - n,
+			      "truncated %d\n", truncated);
 	copied = simple_read_from_buffer(buf, len, off, tmp, n);
 	kfree(writes);
 	kfree(reads);

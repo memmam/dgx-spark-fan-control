@@ -3,8 +3,11 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 -m unittest discover -s "${root}/tests" -v
+python3 -m unittest discover -s "${root}/tester" -v
+python3 "${root}/research/fsl110/test-bounds.py"
 bash -n "${root}/scripts/check" "${root}/scripts/build-sign" \
   "${root}/scripts/generate-signing-key" "${root}/scripts/install-userland" \
   "${root}/scripts/uninstall-userland" "${root}/dkms.conf"
 python3 -m py_compile "${root}/scripts/acpi-floor-sweep" \
   "${root}/scripts/ec_profile.py" "${root}/scripts/ec358-regression"
+bash -n "${root}/tester/guest/run-guest.sh"
